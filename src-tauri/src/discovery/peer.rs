@@ -11,10 +11,15 @@ pub struct Peer {
     pub ip: IpAddr,
     pub port: u16,
     pub online: bool,
+    pub last_seen: i64,
 }
 
 impl Peer {
     pub fn new(id: String, username: String, department: String, ip: IpAddr, port: u16) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
         Self {
             id,
             username,
@@ -22,7 +27,12 @@ impl Peer {
             ip,
             port,
             online: true,
+            last_seen: now,
         }
+    }
+
+    pub fn with_online(id: String, username: String, department: String, ip: IpAddr, port: u16, online: bool, last_seen: i64) -> Self {
+        Self { id, username, department, ip, port, online, last_seen }
     }
 
     pub fn address(&self) -> String {

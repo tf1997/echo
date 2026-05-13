@@ -232,15 +232,11 @@ impl Database {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub async fn mark_peer_offline(&self, peer_id: &str) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        sqlx::query("UPDATE peers SET is_online = 0, last_seen_at = ? WHERE peer_id = ?")
-            .bind(now)
-            .bind(peer_id)
+    pub async fn mark_all_peers_offline(&self) -> Result<()> {
+        sqlx::query("UPDATE peers SET is_online = 0")
             .execute(&self.pool)
             .await
-            .context("Failed to mark peer offline")?;
+            .context("Failed to mark all peers offline")?;
         Ok(())
     }
 
@@ -371,6 +367,42 @@ impl Database {
             .collect();
 
         Ok(messages)
+    }
+
+    pub async fn search_messages(&self, my_id: &str, query: &str) -> Result<Vec<ChatMessage>> {
+        let pattern = format!("%{}%", query);
+        let rows = sqlx::query(
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read
+             FROM messages
+             WHERE (sender_id = ? OR receiver_id = ?)
+               AND (content LIKE ? OR file_name LIKE ?)
+             ORDER BY id DESC
+             LIMIT 100",
+        )
+        .bind(my_id)
+        .bind(my_id)
+        .bind(&pattern)
+        .bind(&pattern)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to search messages")?;
+
+        Ok(rows
+            .iter()
+            .map(|row| ChatMessage {
+                id: row.get("id"),
+                sender_id: row.get("sender_id"),
+                sender_name: row.get("sender_name"),
+                receiver_id: row.get("receiver_id"),
+                content: row.get("content"),
+                msg_type: row.get("msg_type"),
+                file_path: row.get("file_path"),
+                file_name: row.get("file_name"),
+                file_size: row.get("file_size"),
+                timestamp: row.get("timestamp"),
+                is_read: row.get::<bool, _>("is_read"),
+            })
+            .collect())
     }
 
     pub async fn mark_read(&self, sender_id: &str, receiver_id: &str) -> Result<()> {

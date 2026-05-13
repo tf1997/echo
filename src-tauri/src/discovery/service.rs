@@ -68,6 +68,12 @@ impl DiscoveryService {
             .cloned()
     }
 
+    pub fn set_online(&self, peer_id: &str, online: bool) {
+        if let Some(peer) = self.peers.write().expect("peers lock poisoned").get_mut(peer_id) {
+            peer.online = online;
+        }
+    }
+
     pub fn my_id(&self) -> &str {
         &self.config.peer_id
     }
@@ -234,6 +240,11 @@ impl DiscoveryService {
         let peer = Peer::new(peer_id.clone(), username.clone(), department, ip, port);
 
         let mut peers_map = peers.write().expect("peers lock poisoned");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
         let changed = peers_map
             .get(&peer_id)
             .map(|existing| {
@@ -245,7 +256,18 @@ impl DiscoveryService {
             })
             .unwrap_or(true);
 
-        peers_map.insert(peer_id, peer.clone());
+        peers_map.insert(
+            peer_id.clone(),
+            Peer {
+                id: peer.id.clone(),
+                username: peer.username.clone(),
+                department: peer.department.clone(),
+                ip: peer.ip,
+                port: peer.port,
+                online: true,
+                last_seen: now,
+            },
+        );
 
         if changed {
             info!("Peer updated: {}", peer);

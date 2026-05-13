@@ -9,6 +9,7 @@ import {
   sendMessage,
   sendFile,
   markRead,
+  checkPeerOnline,
   getDepartments,
   saveProfile,
   listStoredPeers,
@@ -135,9 +136,17 @@ function App() {
   const handleSelectPeer = useCallback(async (peer: Peer) => {
     setSelectedPeer(peer);
     try {
-      const conv = await getConversation(peer.id);
+      const [conv] = await Promise.all([
+        getConversation(peer.id),
+        markRead(peer.id),
+      ]);
       setMessages(conv);
-      await markRead(peer.id);
+      // Immediately check if peer is online
+      checkPeerOnline(peer.ip, peer.port).then((online) => {
+        setPeers((prev) =>
+          prev.map((p) => (p.id === peer.id ? { ...p, online } : p))
+        );
+      });
     } catch (err) {
       console.error("Failed to load conversation:", err);
       setMessages([]);
@@ -145,23 +154,17 @@ function App() {
   }, []);
 
   const handleSendMessage = useCallback(async (content: string) => {
-    if (!selectedPeer) return;
-    try {
-      const sent = await sendMessage(selectedPeer.id, content);
-      setMessages((prev) => [...prev, sent]);
-    } catch (err) {
-      console.error("Failed to send message:", err);
-    }
+    if (!selectedPeer) throw new Error("未选择联系人");
+    const sent = await sendMessage(selectedPeer.id, content);
+    setMessages((prev) => [...prev, sent]);
+    return sent;
   }, [selectedPeer]);
 
   const handleSendFile = useCallback(async (filePath: string) => {
-    if (!selectedPeer) return;
-    try {
-      const sent = await sendFile(selectedPeer.id, filePath);
-      setMessages((prev) => [...prev, sent]);
-    } catch (err) {
-      console.error("Failed to send file:", err);
-    }
+    if (!selectedPeer) throw new Error("未选择联系人");
+    const sent = await sendFile(selectedPeer.id, filePath);
+    setMessages((prev) => [...prev, sent]);
+    return sent;
   }, [selectedPeer]);
 
   const handleSaveProfile = useCallback(async () => {
@@ -244,6 +247,10 @@ function App() {
         peers={peers}
         selectedPeerId={selectedPeer?.id ?? null}
         onSelectPeer={handleSelectPeer}
+        onJumpToSearchHit={(peerId: string) => {
+          const peer = peers.find((p) => p.id === peerId);
+          if (peer) handleSelectPeer(peer);
+        }}
         myId={appInfo.peer_id}
         myName={appInfo.username}
         myDepartment={appInfo.department}

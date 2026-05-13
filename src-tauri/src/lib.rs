@@ -6,8 +6,11 @@ mod state;
 
 use db::Database;
 use log::info;
+use crate::discovery::Peer;
 use std::sync::Arc;
-use tauri::Manager;
+use std::time::Duration;
+use tauri::{Emitter, Manager};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use state::AppState;
@@ -62,9 +65,66 @@ pub fn run() {
             };
 
             app.manage(AppState {
-                db,
+                db: db.clone(),
                 profile: Mutex::new(profile),
                 runtime: Mutex::new(runtime_services),
+            });
+
+            // Mark all stored peers as offline at startup
+            let db_for_offline = db.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = db_for_offline.mark_all_peers_offline().await;
+            });
+
+            // Continuous TCP health check + discovery sync, every 5 seconds
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        if let Some(runtime) = state.runtime.lock().await.as_ref() {
+                            let discovery = runtime.discovery.lock().await;
+                            let peers = discovery.get_peers();
+                            drop(discovery);
+
+                            for peer in &peers {
+                                let addr = format!("{}:{}", peer.ip, peer.port);
+                                let online = tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    TcpStream::connect(&addr),
+                                )
+                                .await
+                                .map(|r| r.is_ok())
+                                .unwrap_or(false);
+
+                                runtime.discovery.lock().await.set_online(&peer.id, online);
+
+                                let _ = state
+                                    .db
+                                    .upsert_peer(
+                                        &peer.id,
+                                        &peer.username,
+                                        &peer.department,
+                                        &peer.ip.to_string(),
+                                        peer.port,
+                                        online,
+                                    )
+                                    .await;
+
+                                let updated = Peer::with_online(
+                                    peer.id.clone(),
+                                    peer.username.clone(),
+                                    peer.department.clone(),
+                                    peer.ip,
+                                    peer.port,
+                                    online,
+                                    peer.last_seen,
+                                );
+                                let _ = app_handle.emit("peer-discovered", &updated);
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
             });
 
             Ok(())
@@ -83,6 +143,9 @@ pub fn run() {
             commands::save_temp_file,
             commands::read_file_base64,
             commands::open_file,
+            commands::open_folder,
+            commands::search_messages,
+            commands::check_peer_online,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Echo");

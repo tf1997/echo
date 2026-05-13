@@ -58,4 +58,36 @@ export async function openFile(filePath: string): Promise<void> {
   return await invoke("open_file", { path: filePath });
 }
 
+export async function openFolder(filePath: string): Promise<void> {
+  return await invoke("open_folder", { path: filePath });
+}
+
+export interface SearchHit {
+  id: number;
+  sender_id: string;
+  sender_name: string;
+  receiver_id: string;
+  content: string;
+  msg_type: string;
+  file_name: string | null;
+  file_path: string | null;
+  timestamp: string;
+}
+
+export interface SearchResult {
+  peer_id: string;
+  peer_name: string;
+  messages: SearchHit[];
+}
+
+export async function searchMessages(query: string): Promise<SearchResult[]> {
+  return await invoke("search_messages", { query });
+}
+
+export async function checkPeerOnline(ip: string, port: number): Promise<boolean> {
+  return await invoke("check_peer_online", { ip, port });
+}
+
+
+
 

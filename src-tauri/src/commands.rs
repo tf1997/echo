@@ -220,6 +220,22 @@ pub async fn send_file(
 }
 
 #[tauri::command]
+pub async fn check_peer_online(
+    ip: String,
+    port: u16,
+) -> Result<bool, String> {
+    let addr = format!("{}:{}", ip, port);
+    let online = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+    Ok(online)
+}
+
+#[tauri::command]
 pub async fn get_conversation(
     state: State<'_, AppState>,
     peer_id: String,
@@ -322,6 +338,109 @@ pub fn open_file(path: String) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn open_folder(path: String) -> Result<(), String> {
+    let parent = std::path::Path::new(&path)
+        .parent()
+        .unwrap_or(std::path::Path::new(&path));
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct SearchResult {
+    pub peer_id: String,
+    pub peer_name: String,
+    pub messages: Vec<SearchHit>,
+}
+
+#[derive(Serialize)]
+pub struct SearchHit {
+    pub id: i64,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub receiver_id: String,
+    pub content: String,
+    pub msg_type: String,
+    pub file_name: Option<String>,
+    pub file_path: Option<String>,
+    pub timestamp: String,
+}
+
+#[tauri::command]
+pub async fn search_messages(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<Vec<SearchResult>, String> {
+    let runtime = state.runtime.lock().await;
+    let Some(runtime) = runtime.as_ref() else {
+        return Ok(vec![]);
+    };
+
+    let rows = state
+        .db
+        .search_messages(&runtime.my_id, &query)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut groups: std::collections::BTreeMap<String, SearchResult> = std::collections::BTreeMap::new();
+    for row in rows {
+        let peer_id = if row.sender_id == runtime.my_id {
+            row.receiver_id.clone()
+        } else {
+            row.sender_id.clone()
+        };
+        let peer_name = if row.sender_id == runtime.my_id {
+            "我发往".to_string()
+        } else {
+            row.sender_name.clone()
+        };
+
+        groups
+            .entry(peer_id.clone())
+            .or_insert_with(|| SearchResult {
+                peer_id: peer_id.clone(),
+                peer_name,
+                messages: vec![],
+            })
+            .messages
+            .push(SearchHit {
+                id: row.id,
+                sender_id: row.sender_id,
+                sender_name: row.sender_name,
+                receiver_id: row.receiver_id,
+                content: row.content,
+                msg_type: row.msg_type,
+                file_name: row.file_name,
+                file_path: row.file_path,
+                timestamp: row.timestamp,
+            });
+    }
+
+    Ok(groups.into_values().collect())
 }
 
 fn path_mime(path: &str) -> &'static str {

@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import type { ChatMessage } from "../types";
-import { readFileBase64, openFile } from "../api";
+import { readFileBase64, openFile, openFolder } from "../api";
 
 const MAX_PREVIEW_BYTES = 2 * 1024 * 1024; // 2MB
 
@@ -27,6 +27,12 @@ function isImageFile(name: string | null): boolean {
 function handleOpenFile(filePath: string | null) {
   if (filePath) {
     openFile(filePath).catch(console.error);
+  }
+}
+
+function handleOpenFolder(filePath: string | null) {
+  if (filePath) {
+    openFolder(filePath).catch(console.error);
   }
 }
 
@@ -81,31 +87,53 @@ export function MessageBubble({ message, isOwn }: MessageBubbleProps) {
           {showPreview ? (
             <div className="max-w-[260px]">
               <ImagePreview filePath={message.file_path!} fileSize={message.file_size} />
-              <div
-                className="px-3 py-2 cursor-pointer hover:opacity-80"
-                onClick={() => handleOpenFile(message.file_path)}
-              >
-                <p className="text-xs font-medium truncate">{message.file_name}</p>
-                {message.file_size ? (
-                  <p className="text-[10px] opacity-70">{formatFileSize(message.file_size)}</p>
-                ) : null}
+              <div className="flex items-center gap-1 px-3 py-2">
+                <div
+                  className="flex-1 min-w-0 cursor-pointer hover:opacity-80"
+                  onClick={() => handleOpenFile(message.file_path)}
+                >
+                  <p className="text-xs font-medium truncate">{message.file_name}</p>
+                  {message.file_size ? (
+                    <p className="text-[10px] opacity-70">{formatFileSize(message.file_size)}</p>
+                  ) : null}
+                </div>
+                <button
+                  onClick={(e) => { e.stopPropagation(); handleOpenFolder(message.file_path); }}
+                  className="flex-shrink-0 w-6 h-6 rounded flex items-center justify-center hover:bg-white/10"
+                  title="在文件夹中显示"
+                >
+                  <svg className="w-3.5 h-3.5 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                  </svg>
+                </button>
               </div>
             </div>
           ) : isFile ? (
-            <div
-              className="flex items-center gap-2 cursor-pointer hover:opacity-80"
-              onClick={() => handleOpenFile(message.file_path)}
-              title="点击打开文件"
-            >
-              <svg className="w-5 h-5 flex-shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-              </svg>
-              <div className="min-w-0">
-                <p className="text-sm font-medium truncate">{message.file_name || "文件"}</p>
-                {message.file_size ? (
-                  <p className="text-xs opacity-70">{formatFileSize(message.file_size)}</p>
-                ) : null}
+            <div className="flex items-center gap-2">
+              <div
+                className="flex items-center gap-2 flex-1 min-w-0 cursor-pointer hover:opacity-80"
+                onClick={() => handleOpenFile(message.file_path)}
+                title="点击打开文件"
+              >
+                <svg className="w-5 h-5 flex-shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                <div className="min-w-0">
+                  <p className="text-sm font-medium truncate">{message.file_name || "文件"}</p>
+                  {message.file_size ? (
+                    <p className="text-xs opacity-70">{formatFileSize(message.file_size)}</p>
+                  ) : null}
+                </div>
               </div>
+              <button
+                onClick={(e) => { e.stopPropagation(); handleOpenFolder(message.file_path); }}
+                className="flex-shrink-0 w-6 h-6 rounded flex items-center justify-center hover:bg-white/10"
+                title="在文件夹中显示"
+              >
+                <svg className="w-3.5 h-3.5 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                </svg>
+              </button>
             </div>
           ) : (
             <p className="text-sm whitespace-pre-wrap break-words">{message.content}</p>
