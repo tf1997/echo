@@ -113,12 +113,16 @@ impl ChatServer {
         let (reader, _writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
+        let mut file_buffer: Vec<u8> = Vec::new();
+        let mut file_sender_id: Option<String> = None;
+        let mut file_sender_name: Option<String> = None;
+
         while let Some(line) = lines.next_line().await? {
             match serde_json::from_str::<WireMessage>(&line) {
                 Ok(msg) => {
-                    info!("Received message from {}: {}", msg.sender_name, msg.content);
+                    let msg_type = msg.msg_type.as_str();
 
-                    // Save to database
+                    // Register the sender as a peer
                     if let Err(e) = db
                         .upsert_peer(
                             &msg.sender_id,
@@ -133,33 +137,92 @@ impl ChatServer {
                         error!("Failed to upsert sender peer: {}", e);
                     }
 
-                    if let Err(e) = db
-                        .save_message(
-                            &msg.sender_id,
-                            &msg.sender_name,
-                            &msg.receiver_id,
-                            &msg.content,
-                            &msg.msg_type,
-                            msg.file_name.as_deref(),
-                            None,
-                            msg.file_size.map(|s| s as i64),
-                        )
-                        .await
-                    {
-                        error!("Failed to save incoming message: {}", e);
-                    }
+                    match msg_type {
+                        "file_chunk" => {
+                            if file_buffer.is_empty() {
+                                file_sender_id = Some(msg.sender_id.clone());
+                                file_sender_name = Some(msg.sender_name.clone());
+                            }
+                            let decoded = base64_decode(&msg.content)
+                                .unwrap_or_default();
+                            file_buffer.extend_from_slice(&decoded);
+                        }
+                        "file_end" => {
+                            if file_sender_id.is_none() {
+                                file_sender_id = Some(msg.sender_id.clone());
+                                file_sender_name = Some(msg.sender_name.clone());
+                            }
+                            let decoded = base64_decode(&msg.content)
+                                .unwrap_or_default();
+                            file_buffer.extend_from_slice(&decoded);
 
-                    // Forward to frontend
-                    let incoming = IncomingMessage {
-                        sender_id: msg.sender_id,
-                        sender_name: msg.sender_name,
-                        content: msg.content,
-                        msg_type: msg.msg_type,
-                        file_name: msg.file_name,
-                        file_size: msg.file_size,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                    };
-                    let _ = incoming_tx.send(incoming);
+                            let file_name_display = msg.file_name.as_deref().unwrap_or("unknown");
+                            let saved_path = save_received_file(&file_buffer, file_name_display)?;
+
+                            let sender_id = file_sender_id.as_deref().unwrap_or(&msg.sender_id);
+                            let sender_name = file_sender_name.as_deref().unwrap_or(&msg.sender_name);
+                            let receiver_id = &msg.receiver_id;
+                            if let Err(e) = db
+                                .save_message(
+                                    sender_id,
+                                    sender_name,
+                                    receiver_id,
+                                    &format!("📎 {}", file_name_display),
+                                    "file",
+                                    Some(&saved_path),
+                                    Some(file_name_display),
+                                    msg.file_size.map(|s| s as i64),
+                                )
+                                .await
+                            {
+                                error!("Failed to save incoming file message: {}", e);
+                            }
+
+                            let _ = incoming_tx.send(IncomingMessage {
+                                sender_id: sender_id.to_string(),
+                                sender_name: sender_name.to_string(),
+                                content: format!("📎 {}", file_name_display),
+                                msg_type: "file".to_string(),
+                                file_name: Some(file_name_display.to_string()),
+                                file_size: msg.file_size,
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            });
+
+                            file_buffer.clear();
+                            file_sender_id = None;
+                            file_sender_name = None;
+                        }
+                        _ => {
+                            // Text or other message types
+                            info!("Received message from {}: {}", msg.sender_name, msg.content);
+
+                            if let Err(e) = db
+                                .save_message(
+                                    &msg.sender_id,
+                                    &msg.sender_name,
+                                    &msg.receiver_id,
+                                    &msg.content,
+                                    &msg.msg_type,
+                                    msg.file_name.as_deref(),
+                                    None,
+                                    msg.file_size.map(|s| s as i64),
+                                )
+                                .await
+                            {
+                                error!("Failed to save incoming message: {}", e);
+                            }
+
+                            let _ = incoming_tx.send(IncomingMessage {
+                                sender_id: msg.sender_id,
+                                sender_name: msg.sender_name,
+                                content: msg.content,
+                                msg_type: msg.msg_type,
+                                file_name: msg.file_name,
+                                file_size: msg.file_size,
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            });
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to parse incoming message: {}", e);
@@ -204,7 +267,7 @@ impl ChatServer {
         Ok(saved)
     }
 
-    /// Send a file to a peer (reads file and sends as base64 in JSON).
+    /// Send a file to a peer (reads file and sends as base64 in JSON over single connection).
     pub async fn send_file(&self, peer: &Peer, file_path: &str) -> Result<crate::db::ChatMessage> {
         use tokio::fs;
 
@@ -220,9 +283,13 @@ impl ChatServer {
 
         let file_size = data.len() as u64;
 
-        // Split into chunks if file is large
         const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
         let total_chunks = (data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+        // Open a single TCP connection for all chunks
+        let mut stream = TcpStream::connect(peer.address())
+            .await
+            .with_context(|| format!("Failed to connect to peer {}", peer.address()))?;
 
         for i in 0..total_chunks {
             let start = i * CHUNK_SIZE;
@@ -246,8 +313,11 @@ impl ChatServer {
                 file_data: None,
             };
 
-            self.send_wire_message(peer, &msg).await?;
+            let json = serde_json::to_string(&msg).context("Failed to serialize message")?;
+            stream.write_all(json.as_bytes()).await?;
+            stream.write_all(b"\n").await?;
         }
+        stream.flush().await?;
 
         // Save outgoing file message to DB
         let saved = self.db
@@ -307,4 +377,62 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     result
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>> {
+    const DECODE: [i8; 128] = {
+        let mut table = [-1i8; 128];
+        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut i = 0;
+        while i < chars.len() {
+            table[chars[i] as usize] = i as i8;
+            i += 1;
+        }
+        table
+    };
+
+    let input = input.trim_end_matches('=');
+    let mut result = Vec::with_capacity(input.len() * 3 / 4);
+    let bytes: Vec<u8> = input.bytes().collect();
+
+    for chunk in bytes.chunks(4) {
+        let b0 = DECODE.get(chunk[0] as usize).copied().unwrap_or(-1);
+        let b1 = DECODE.get(chunk.get(1).copied().unwrap_or(b'A') as usize).copied().unwrap_or(-1);
+        let b2 = DECODE.get(chunk.get(2).copied().unwrap_or(b'A') as usize).copied().unwrap_or(-1);
+        let b3 = DECODE.get(chunk.get(3).copied().unwrap_or(b'A') as usize).copied().unwrap_or(-1);
+
+        if b0 < 0 || b1 < 0 {
+            anyhow::bail!("invalid base64 character");
+        }
+
+        let triple = ((b0 as u32) << 18)
+            | ((b1 as u32) << 12)
+            | ((b2.max(0) as u32) << 6)
+            | (b3.max(0) as u32);
+
+        result.push((triple >> 16) as u8);
+
+        if chunk.len() > 2 && b2 >= 0 {
+            result.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if chunk.len() > 3 && b3 >= 0 {
+            result.push((triple & 0xFF) as u8);
+        }
+    }
+
+    Ok(result)
+}
+
+fn save_received_file(data: &[u8], filename: &str) -> Result<String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    let files_dir = std::path::PathBuf::from(home).join("Echo").join("files");
+    std::fs::create_dir_all(&files_dir)?;
+
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let file_path = files_dir.join(format!("{}_{}", timestamp, filename));
+
+    std::fs::write(&file_path, data)?;
+    Ok(file_path.to_string_lossy().to_string())
 }

@@ -24,6 +24,12 @@ pub struct StoredPeer {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnreadCount {
+    pub peer_id: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: i64,
     pub sender_id: String,
@@ -375,5 +381,26 @@ impl Database {
             .await
             .context("Failed to mark messages as read")?;
         Ok(())
+    }
+
+    pub async fn get_unread_counts(&self, my_id: &str) -> Result<Vec<UnreadCount>> {
+        let rows = sqlx::query(
+            "SELECT sender_id, COUNT(*) as cnt
+             FROM messages
+             WHERE receiver_id = ? AND is_read = 0
+             GROUP BY sender_id",
+        )
+        .bind(my_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to get unread counts")?;
+
+        Ok(rows
+            .iter()
+            .map(|row| UnreadCount {
+                peer_id: row.get("sender_id"),
+                count: row.get::<i64, _>("cnt") as u32,
+            })
+            .collect())
     }
 }

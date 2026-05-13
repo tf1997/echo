@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::db::{ChatMessage, StoredPeer, UserProfile};
+use crate::db::{ChatMessage, StoredPeer, UnreadCount, UserProfile};
 use crate::discovery::Peer;
 use crate::state::{AppState, RuntimeServices};
 
@@ -237,6 +237,20 @@ pub async fn get_conversation(
 }
 
 #[tauri::command]
+pub async fn get_unread_counts(state: State<'_, AppState>) -> Result<Vec<UnreadCount>, String> {
+    let runtime = state.runtime.lock().await;
+    let Some(runtime) = runtime.as_ref() else {
+        return Ok(vec![]);
+    };
+
+    state
+        .db
+        .get_unread_counts(&runtime.my_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn mark_read(
     state: State<'_, AppState>,
     peer_id: String,
@@ -251,4 +265,93 @@ pub async fn mark_read(
         .mark_read(&peer_id, &runtime.my_id)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn save_temp_file(data: Vec<u8>, filename: String) -> Result<String, String> {
+    let files_dir = echo_files_dir();
+    std::fs::create_dir_all(&files_dir).map_err(|e| e.to_string())?;
+
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let file_path = files_dir.join(format!("{}_{}", timestamp, filename));
+
+    std::fs::write(&file_path, &data).map_err(|e| e.to_string())?;
+
+    Ok(file_path.to_string_lossy().to_string())
+}
+
+#[derive(Serialize)]
+pub struct FileData {
+    pub base64: String,
+    pub mime: String,
+}
+
+#[tauri::command]
+pub fn read_file_base64(file_path: String) -> Result<FileData, String> {
+    let bytes = std::fs::read(&file_path).map_err(|e| e.to_string())?;
+
+    let mime = path_mime(&file_path).to_string();
+
+    Ok(FileData {
+        base64: base64_encode_std(&bytes),
+        mime,
+    })
+}
+
+#[tauri::command]
+pub fn open_file(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn path_mime(path: &str) -> &'static str {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("zip") => "application/zip",
+        Some("txt") | Some("md") | Some("rs") | Some("ts") | Some("js") | Some("json") | Some("html") | Some("css") => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+fn base64_encode_std(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+fn echo_files_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home).join("Echo").join("files")
 }

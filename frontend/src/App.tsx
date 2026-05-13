@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import type { Peer, ChatMessage, AppInfo, StoredPeer } from "./types";
+import type { Peer, ChatMessage, AppInfo, StoredPeer, UnreadCount } from "./types";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
 import {
@@ -12,6 +12,7 @@ import {
   getDepartments,
   saveProfile,
   listStoredPeers,
+  getUnreadCounts,
 } from "./api";
 
 function App() {
@@ -20,6 +21,7 @@ function App() {
   const [selectedPeer, setSelectedPeer] = useState<Peer | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(true);
+  const [unreadCounts, setUnreadCounts] = useState<UnreadCount[]>([]);
 
   const [username, setUsername] = useState("");
   const [department, setDepartment] = useState("");
@@ -65,9 +67,14 @@ function App() {
   }, []);
 
   const loadPeerState = useCallback(async () => {
-    const [onlinePeers, storedPeers] = await Promise.all([getPeers(), listStoredPeers()]);
+    const [onlinePeers, storedPeers, unread] = await Promise.all([
+      getPeers(),
+      listStoredPeers(),
+      getUnreadCounts(),
+    ]);
     const mergedPeers = mergePeers(onlinePeers, storedPeers);
     setPeers(mergedPeers);
+    setUnreadCounts(unread);
     setSelectedPeer((current) => {
       if (!current) return current;
       const canonicalPeer = mergedPeers.find(
@@ -241,6 +248,7 @@ function App() {
         myName={appInfo.username}
         myDepartment={appInfo.department}
         onEditProfile={openEditProfile}
+        unreadCounts={unreadCounts}
       />
       <ChatWindow
         peer={selectedPeer}

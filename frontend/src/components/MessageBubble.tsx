@@ -1,4 +1,8 @@
+import { useState, useEffect } from "react";
 import type { ChatMessage } from "../types";
+import { readFileBase64, openFile } from "../api";
+
+const MAX_PREVIEW_BYTES = 2 * 1024 * 1024; // 2MB
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -14,35 +18,93 @@ function formatTime(ts: string): string {
   }
 }
 
+function isImageFile(name: string | null): boolean {
+  if (!name) return false;
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  return ["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext);
+}
+
+function handleOpenFile(filePath: string | null) {
+  if (filePath) {
+    openFile(filePath).catch(console.error);
+  }
+}
+
+function ImagePreview({ filePath, fileSize }: { filePath: string; fileSize: number | null }) {
+  const [src, setSrc] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (fileSize !== null && fileSize > MAX_PREVIEW_BYTES) {
+      setFailed(true);
+      return;
+    }
+
+    readFileBase64(filePath)
+      .then((data) => setSrc(`data:${data.mime};base64,${data.base64}`))
+      .catch(() => setFailed(true));
+  }, [filePath, fileSize]);
+
+  if (failed || !src) {
+    return null;
+  }
+
+  return (
+    <img
+      src={src}
+      alt=""
+      className="w-full max-h-[320px] object-cover cursor-pointer"
+      onClick={() => handleOpenFile(filePath)}
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
 export function MessageBubble({ message, isOwn }: MessageBubbleProps) {
   const isFile = message.msg_type === "file";
+  const showPreview = isFile && isImageFile(message.file_name) && message.file_path;
 
   return (
     <div className={`flex ${isOwn ? "justify-end" : "justify-start"} mb-3 px-4`}>
       <div className={`max-w-[70%] ${isOwn ? "items-end" : "items-start"} flex flex-col`}>
-        {/* Sender name (for received messages) */}
         {!isOwn && (
           <span className="text-xs text-gray-400 mb-1 ml-1">{message.sender_name}</span>
         )}
 
-        {/* Message bubble */}
         <div
-          className={`rounded-2xl px-4 py-2.5 ${
+          className={`rounded-2xl overflow-hidden ${
             isOwn
               ? "bg-indigo-600 text-white rounded-br-md"
               : "bg-gray-700 text-gray-100 rounded-bl-md"
-          }`}
+          } ${!showPreview ? "px-4 py-2.5" : ""}`}
         >
-          {isFile ? (
-            <div className="flex items-center gap-2">
+          {showPreview ? (
+            <div className="max-w-[260px]">
+              <ImagePreview filePath={message.file_path!} fileSize={message.file_size} />
+              <div
+                className="px-3 py-2 cursor-pointer hover:opacity-80"
+                onClick={() => handleOpenFile(message.file_path)}
+              >
+                <p className="text-xs font-medium truncate">{message.file_name}</p>
+                {message.file_size ? (
+                  <p className="text-[10px] opacity-70">{formatFileSize(message.file_size)}</p>
+                ) : null}
+              </div>
+            </div>
+          ) : isFile ? (
+            <div
+              className="flex items-center gap-2 cursor-pointer hover:opacity-80"
+              onClick={() => handleOpenFile(message.file_path)}
+              title="点击打开文件"
+            >
               <svg className="w-5 h-5 flex-shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
               </svg>
               <div className="min-w-0">
                 <p className="text-sm font-medium truncate">{message.file_name || "文件"}</p>
-                {message.file_size && (
+                {message.file_size ? (
                   <p className="text-xs opacity-70">{formatFileSize(message.file_size)}</p>
-                )}
+                ) : null}
               </div>
             </div>
           ) : (
@@ -50,7 +112,6 @@ export function MessageBubble({ message, isOwn }: MessageBubbleProps) {
           )}
         </div>
 
-        {/* Timestamp */}
         <span className={`text-[10px] text-gray-500 mt-1 ${isOwn ? "mr-1" : "ml-1"}`}>
           {formatTime(message.timestamp)}
           {isOwn && (

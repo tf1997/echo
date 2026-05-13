@@ -79,6 +79,10 @@ pub fn run() {
             commands::send_file,
             commands::get_conversation,
             commands::mark_read,
+            commands::get_unread_counts,
+            commands::save_temp_file,
+            commands::read_file_base64,
+            commands::open_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Echo");

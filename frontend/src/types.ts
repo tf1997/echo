@@ -44,3 +44,8 @@ export interface SaveProfilePayload {
   username: string;
   department: string;
 }
+
+export interface UnreadCount {
+  peer_id: string;
+  count: number;
+}

@@ -1,4 +1,4 @@
-import type { Peer } from "../types";
+import type { Peer, UnreadCount } from "../types";
 
 interface SidebarProps {
   peers: Peer[];
@@ -8,11 +8,17 @@ interface SidebarProps {
   myName: string;
   myDepartment: string;
   onEditProfile: () => void;
+  unreadCounts: UnreadCount[];
 }
 
-export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, onEditProfile }: SidebarProps) {
+export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, onEditProfile, unreadCounts }: SidebarProps) {
   const onlinePeers = peers.filter((p) => p.online);
   const offlinePeers = peers.filter((p) => !p.online);
+
+  const unreadMap = new Map<string, number>();
+  for (const uc of unreadCounts) {
+    unreadMap.set(uc.peer_id, uc.count);
+  }
 
   return (
     <div className="flex flex-col w-72 bg-gray-900 text-white h-full border-r border-gray-700">
@@ -40,7 +46,13 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
           <div>
             <p className="px-4 py-2 text-xs text-gray-400 font-medium uppercase tracking-wider">在线 — {onlinePeers.length}</p>
             {onlinePeers.map((peer) => (
-              <PeerItem key={peer.id} peer={peer} isSelected={selectedPeerId === peer.id} onClick={() => onSelectPeer(peer)} />
+              <PeerItem
+                key={peer.id}
+                peer={peer}
+                isSelected={selectedPeerId === peer.id}
+                unread={unreadMap.get(peer.id) ?? 0}
+                onClick={() => onSelectPeer(peer)}
+              />
             ))}
           </div>
         )}
@@ -49,7 +61,13 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
           <div>
             <p className="px-4 py-2 text-xs text-gray-400 font-medium uppercase tracking-wider">离线/历史 — {offlinePeers.length}</p>
             {offlinePeers.map((peer) => (
-              <PeerItem key={peer.id} peer={peer} isSelected={selectedPeerId === peer.id} onClick={() => onSelectPeer(peer)} />
+              <PeerItem
+                key={peer.id}
+                peer={peer}
+                isSelected={selectedPeerId === peer.id}
+                unread={unreadMap.get(peer.id) ?? 0}
+                onClick={() => onSelectPeer(peer)}
+              />
             ))}
           </div>
         )}
@@ -60,7 +78,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   );
 }
 
-function PeerItem({ peer, isSelected, onClick }: { peer: Peer; isSelected: boolean; onClick: () => void }) {
+function PeerItem({ peer, isSelected, unread, onClick }: { peer: Peer; isSelected: boolean; unread: number; onClick: () => void }) {
   return (
     <button
       onClick={onClick}
@@ -79,6 +97,11 @@ function PeerItem({ peer, isSelected, onClick }: { peer: Peer; isSelected: boole
         <p className="text-xs text-gray-400 truncate">{peer.department}</p>
         <p className="text-[10px] text-gray-500 truncate">{peer.online ? `${peer.ip}:${peer.port}` : "离线"}</p>
       </div>
+      {unread > 0 && !isSelected && (
+        <div className="flex-shrink-0 w-5 h-5 rounded-full bg-red-500 flex items-center justify-center text-[10px] font-bold">
+          {unread > 99 ? "99+" : unread}
+        </div>
+      )}
     </button>
   );
 }

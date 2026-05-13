@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import type { ChatMessage, Peer } from "../types";
 import { MessageBubble } from "./MessageBubble";
+import { saveTempFile } from "../api";
 
 interface ChatWindowProps {
   peer: Peer | null;
@@ -10,30 +11,47 @@ interface ChatWindowProps {
   onSendFile: (filePath: string) => void;
 }
 
+async function readFileAndSave(file: File): Promise<string> {
+  const buffer = await file.arrayBuffer();
+  const data = Array.from(new Uint8Array(buffer));
+  return await saveTempFile(data, file.name || "file");
+}
+
 export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: ChatWindowProps) {
   const [inputText, setInputText] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const nearBottomRef = useRef(true);
 
-  // Auto-scroll to bottom on new messages
+  // Track if user is near bottom
+  const handleScroll = useCallback(() => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+  }, []);
+
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (nearBottomRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [messages]);
 
-  // Focus input when peer changes
   useEffect(() => {
     if (peer) {
       inputRef.current?.focus();
+      nearBottomRef.current = true;
     }
   }, [peer]);
 
-  const handleSend = useCallback(() => {
+  const sendText = useCallback(() => {
     const trimmed = inputText.trim();
     if (!trimmed || !peer) return;
     onSendMessage(trimmed);
     setInputText("");
-    // Reset textarea height
+    nearBottomRef.current = true;
     if (inputRef.current) {
       inputRef.current.style.height = "auto";
     }
@@ -42,11 +60,10 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      sendText();
     }
   };
 
-  // Auto-resize textarea
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setInputText(e.target.value);
     const el = e.target;
@@ -54,7 +71,41 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
     el.style.height = Math.min(el.scrollHeight, 120) + "px";
   };
 
-  // Drag and drop file handling
+  const sendFileToPeer = useCallback(async (file: File) => {
+    if (!peer) return;
+    try {
+      // @ts-expect-error Tauri adds path property on drag events
+      const filePath: string = file.path;
+      if (filePath) {
+        onSendFile(filePath);
+        nearBottomRef.current = true;
+        return;
+      }
+    } catch {
+      // no path available
+    }
+    const savedPath = await readFileAndSave(file);
+    onSendFile(savedPath);
+    nearBottomRef.current = true;
+  }, [peer, onSendFile]);
+
+  // Paste handler — only on textarea, not the wrapper
+  const handlePaste = useCallback(async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData.items;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (file) {
+          sendFileToPeer(file);
+        }
+        return;
+      }
+    }
+  }, [sendFileToPeer]);
+
+  // Drag and drop
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(true);
@@ -65,24 +116,30 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
     setIsDragging(false);
   };
 
-  const handleDrop = (e: React.DragEvent) => {
+  const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
     if (!peer) return;
-
-    // In Tauri, we get file paths from the drag event
     const files = e.dataTransfer.files;
     for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      // @ts-expect-error Tauri adds path property to File
-      const filePath = file.path;
-      if (filePath) {
-        onSendFile(filePath);
-      }
+      sendFileToPeer(files[i]);
     }
+  }, [peer, sendFileToPeer]);
+
+  // File picker
+  const handlePickFile = () => {
+    fileInputRef.current?.click();
   };
 
-  // Empty state: no peer selected
+  const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || !peer) return;
+    for (let i = 0; i < files.length; i++) {
+      sendFileToPeer(files[i]);
+    }
+    e.target.value = "";
+  }, [peer, sendFileToPeer]);
+
   if (!peer) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center bg-gray-800 text-gray-400">
@@ -102,7 +159,6 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      {/* Drag overlay */}
       {isDragging && (
         <div className="absolute inset-0 z-50 bg-indigo-600/20 border-2 border-dashed border-indigo-400 flex items-center justify-center backdrop-blur-sm">
           <div className="text-center">
@@ -136,7 +192,11 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto py-4">
+      <div
+        ref={messagesContainerRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto py-4"
+      >
         {messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-gray-500">
             <p className="text-sm">暂无消息</p>
@@ -156,18 +216,35 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
 
       {/* Input area */}
       <div className="px-4 py-3 border-t border-gray-700 bg-gray-900/50">
-        <div className="flex items-end gap-3">
+        <div className="flex items-end gap-2">
+          <button
+            onClick={handlePickFile}
+            className="flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center"
+            title="发送文件"
+          >
+            <svg className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+            </svg>
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            onChange={handleFileChange}
+            style={{ position: "absolute", left: "-9999px", top: "-9999px" }}
+            multiple
+          />
           <textarea
             ref={inputRef}
             value={inputText}
             onChange={handleInputChange}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             placeholder={peer.online ? `发送消息给 ${peer.username}...` : "对方离线，消息将在上线后发送"}
             rows={1}
             className="flex-1 bg-gray-700 text-white text-sm rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-indigo-500 placeholder-gray-400 resize-none max-h-[120px]"
           />
           <button
-            onClick={handleSend}
+            onClick={sendText}
             disabled={!inputText.trim()}
             className="flex-shrink-0 w-10 h-10 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:hover:bg-indigo-600 transition-colors flex items-center justify-center"
           >
@@ -177,7 +254,7 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
           </button>
         </div>
         <p className="text-[10px] text-gray-600 mt-1.5 ml-1">
-          Enter 发送 · Shift+Enter 换行 · 拖拽文件发送
+          Enter 发送 · Shift+Enter 换行 · Ctrl+V 粘贴图片 · 拖拽/📎 发送文件
         </p>
       </div>
     </div>
