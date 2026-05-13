@@ -12,6 +12,7 @@ pub struct AppInfo {
     pub username: String,
     pub department: String,
     pub listen_port: u16,
+    pub my_ip: String,
 }
 
 #[derive(Deserialize)]
@@ -26,12 +27,17 @@ pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String>
     let runtime = state.runtime.lock().await;
 
     if let (Some(profile), Some(runtime)) = (profile, runtime.as_ref()) {
+        let my_ip = local_ip_address::local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| "127.0.0.1".to_string());
+
         Ok(AppInfo {
             initialized: true,
             peer_id: runtime.my_id.clone(),
             username: profile.username,
             department: profile.department,
             listen_port: runtime.listen_port,
+            my_ip,
         })
     } else {
         Ok(AppInfo {
@@ -43,6 +49,7 @@ pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String>
                 .ok()
                 .and_then(|value| value.parse::<u16>().ok())
                 .unwrap_or(9527),
+            my_ip: String::new(),
         })
     }
 }

@@ -11,15 +11,29 @@ interface SidebarProps {
   myId: string;
   myName: string;
   myDepartment: string;
+  myIp: string;
+  myPort: number;
   onEditProfile: () => void;
   unreadCounts: UnreadCount[];
 }
 
-export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, onEditProfile, unreadCounts, onJumpToSearchHit }: SidebarProps) {
+export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, myIp, myPort, onEditProfile, unreadCounts, onJumpToSearchHit }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
+  const [showProfile, setShowProfile] = useState(false);
+  const [copied, setCopied] = useState("");
+
+  const copyToClipboard = useCallback(async (text: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(label);
+      setTimeout(() => setCopied(""), 1500);
+    } catch {
+      // fallback
+    }
+  }, []);
 
   const onlinePeers = peers.filter((p) => p.online);
   const offlinePeers = peers.filter((p) => !p.online);
@@ -57,16 +71,23 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
 
   return (
     <div className="flex flex-col w-72 bg-gray-900 text-white h-full border-r border-gray-700">
-      <div className="p-4 border-b border-gray-700">
+      <div className="p-4 border-b border-gray-700 relative">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-full bg-indigo-500 flex items-center justify-center text-lg font-bold">
+          <button
+            onClick={() => setShowProfile(!showProfile)}
+            className="relative flex-shrink-0 w-10 h-10 rounded-full bg-indigo-500 hover:bg-indigo-400 transition-colors flex items-center justify-center text-lg font-bold cursor-pointer"
+            title="查看个人信息"
+          >
             {myName.charAt(0).toUpperCase()}
-          </div>
-          <div className="flex-1 min-w-0">
+          </button>
+          <button
+            onClick={() => setShowProfile(!showProfile)}
+            className="flex-1 min-w-0 text-left cursor-pointer hover:opacity-80"
+          >
             <p className="text-sm font-semibold truncate">{myName}</p>
             <p className="text-xs text-gray-400 truncate">{myDepartment}</p>
             <p className="text-[10px] text-gray-500 truncate">ID: {myId.slice(0, 8)}...</p>
-          </div>
+          </button>
           <button
             onClick={onEditProfile}
             className="text-xs px-2 py-1 rounded bg-gray-700 hover:bg-gray-600"
@@ -74,6 +95,65 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
             编辑
           </button>
         </div>
+
+        {showProfile && (
+          <div className="absolute top-full left-2 right-2 mt-1 z-50 bg-gray-800 border border-gray-600 rounded-xl p-4 shadow-2xl">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-12 h-12 rounded-full bg-indigo-500 flex items-center justify-center text-xl font-bold">
+                {myName.charAt(0).toUpperCase()}
+              </div>
+              <div>
+                <p className="text-sm font-semibold">{myName}</p>
+                <p className="text-xs text-gray-400">{myDepartment}</p>
+              </div>
+            </div>
+            <div className="space-y-1.5 text-xs">
+              <div className="flex items-center gap-1">
+                <span className="text-gray-400 w-14 flex-shrink-0">Peer ID</span>
+                <span className="text-gray-200 font-mono text-[10px] truncate flex-1" title={myId}>{myId.slice(0, 16)}...</span>
+                <button onClick={() => copyToClipboard(myId, "Peer ID")} className="flex-shrink-0 w-5 h-5 rounded hover:bg-white/10 flex items-center justify-center">
+                  {copied === "Peer ID" ? (
+                    <span className="text-[10px] text-green-400">✓</span>
+                  ) : (
+                    <svg className="w-3 h-3 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                  )}
+                </button>
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="text-gray-400 w-14 flex-shrink-0">IP</span>
+                <span className="text-gray-200 font-mono flex-1">{myIp}</span>
+                <button onClick={() => copyToClipboard(`${myIp}:${myPort}`, "IP:端口")} className="flex-shrink-0 w-5 h-5 rounded hover:bg-white/10 flex items-center justify-center">
+                  {copied === "IP:端口" ? (
+                    <span className="text-[10px] text-green-400">✓</span>
+                  ) : (
+                    <svg className="w-3 h-3 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                  )}
+                </button>
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="text-gray-400 w-14 flex-shrink-0">端口</span>
+                <span className="text-gray-200 font-mono flex-1">{myPort}</span>
+                <div className="w-5 h-5" />
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="text-gray-400 w-14 flex-shrink-0">用户名</span>
+                <span className="text-gray-200 flex-1">{myName}</span>
+                <div className="w-5 h-5" />
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="text-gray-400 w-14 flex-shrink-0">部门</span>
+                <span className="text-gray-200 flex-1">{myDepartment}</span>
+                <div className="w-5 h-5" />
+              </div>
+            </div>
+            <button
+              onClick={() => setShowProfile(false)}
+              className="mt-3 w-full text-center text-xs py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 transition-colors"
+            >
+              关闭
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Search input */}

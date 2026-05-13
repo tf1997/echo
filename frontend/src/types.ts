@@ -38,6 +38,7 @@ export interface AppInfo {
   username: string;
   department: string;
   listen_port: number;
+  my_ip: string;
 }
 
 export interface SaveProfilePayload {

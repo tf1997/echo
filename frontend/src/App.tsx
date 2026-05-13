@@ -197,6 +197,13 @@ function App() {
     setEditingProfile(true);
   }, [appInfo]);
 
+  const refreshDepartments = useCallback(async () => {
+    try {
+      const deps = await getDepartments();
+      setDepartmentOptions(deps);
+    } catch { /* keep existing */ }
+  }, []);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-screen bg-gray-900">
@@ -220,7 +227,7 @@ function App() {
           </div>
           <div className="space-y-2">
             <label className="text-sm text-gray-300">部门</label>
-            <input list="department-options" value={department} onChange={(e) => setDepartment(e.target.value)} placeholder="例如：研发部" className="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-indigo-500" />
+            <input list="department-options" value={department} onChange={(e) => setDepartment(e.target.value)} onFocus={refreshDepartments} placeholder="例如：研发部" className="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-indigo-500" />
             <datalist id="department-options">
               {departmentOptions.map((dep) => (
                 <option key={dep} value={dep} />
@@ -254,6 +261,8 @@ function App() {
         myId={appInfo.peer_id}
         myName={appInfo.username}
         myDepartment={appInfo.department}
+        myIp={appInfo.my_ip}
+        myPort={appInfo.listen_port}
         onEditProfile={openEditProfile}
         unreadCounts={unreadCounts}
       />
