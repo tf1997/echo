@@ -340,7 +340,7 @@ pub fn open_file(path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("cmd")
-            .args(["/C", "start", "", &path])
+            .args(["/C", "start", "", &std::path::Path::new(&path).to_string_lossy().as_ref()])
             .spawn()
             .map_err(|e| e.to_string())?;
     }

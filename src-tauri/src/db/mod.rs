@@ -129,6 +129,22 @@ impl Database {
         .await
         .context("Failed to clean duplicate peer endpoints")?;
 
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_conversation
+             ON messages(sender_id, receiver_id)",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create messages index")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_search
+             ON messages(content)",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create messages search index")?;
+
         info!("Database initialized successfully.");
         Ok(())
     }

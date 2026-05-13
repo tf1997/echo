@@ -353,74 +353,16 @@ impl ChatServer {
     }
 }
 
-/// Simple base64 encoding using standard library-style implementation.
 fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-
-        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-        if chunk.len() > 2 {
-            result.push(CHARS[(triple & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-    }
-    result
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(data)
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>> {
-    const DECODE: [i8; 128] = {
-        let mut table = [-1i8; 128];
-        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut i = 0;
-        while i < chars.len() {
-            table[chars[i] as usize] = i as i8;
-            i += 1;
-        }
-        table
-    };
-
-    let input = input.trim_end_matches('=');
-    let mut result = Vec::with_capacity(input.len() * 3 / 4);
-    let bytes: Vec<u8> = input.bytes().collect();
-
-    for chunk in bytes.chunks(4) {
-        let b0 = DECODE.get(chunk[0] as usize).copied().unwrap_or(-1);
-        let b1 = DECODE.get(chunk.get(1).copied().unwrap_or(b'A') as usize).copied().unwrap_or(-1);
-        let b2 = DECODE.get(chunk.get(2).copied().unwrap_or(b'A') as usize).copied().unwrap_or(-1);
-        let b3 = DECODE.get(chunk.get(3).copied().unwrap_or(b'A') as usize).copied().unwrap_or(-1);
-
-        if b0 < 0 || b1 < 0 {
-            anyhow::bail!("invalid base64 character");
-        }
-
-        let triple = ((b0 as u32) << 18)
-            | ((b1 as u32) << 12)
-            | ((b2.max(0) as u32) << 6)
-            | (b3.max(0) as u32);
-
-        result.push((triple >> 16) as u8);
-
-        if chunk.len() > 2 && b2 >= 0 {
-            result.push(((triple >> 8) & 0xFF) as u8);
-        }
-        if chunk.len() > 3 && b3 >= 0 {
-            result.push((triple & 0xFF) as u8);
-        }
-    }
-
-    Ok(result)
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .with_context(|| "Failed to decode base64")
 }
 
 fn save_received_file(data: &[u8], filename: &str) -> Result<String> {

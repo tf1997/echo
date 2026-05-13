@@ -76,18 +76,22 @@ pub fn run() {
                 let _ = db_for_offline.mark_all_peers_offline().await;
             });
 
-            // Continuous TCP health check + discovery sync, every 5 seconds
+            // Continuous TCP health check + discovery sync, every 8 seconds
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
                     if let Some(state) = app_handle.try_state::<AppState>() {
-                        if let Some(runtime) = state.runtime.lock().await.as_ref() {
-                            let discovery = runtime.discovery.lock().await;
-                            let peers = discovery.get_peers();
-                            drop(discovery);
+                        let peers = if let Some(runtime) = state.runtime.lock().await.as_ref() {
+                            runtime.discovery.lock().await.get_peers()
+                        } else {
+                            vec![]
+                        };
 
-                            for peer in &peers {
-                                let addr = format!("{}:{}", peer.ip, peer.port);
+                        // Parallel TCP health checks
+                        let checks: Vec<_> = peers.iter().map(|peer| {
+                            let addr = format!("{}:{}", peer.ip, peer.port);
+                            let peer_id = peer.id.clone();
+                            async move {
                                 let online = tokio::time::timeout(
                                     Duration::from_secs(2),
                                     TcpStream::connect(&addr),
@@ -95,9 +99,20 @@ pub fn run() {
                                 .await
                                 .map(|r| r.is_ok())
                                 .unwrap_or(false);
+                                (peer_id, online, addr)
+                            }
+                        }).collect();
 
-                                runtime.discovery.lock().await.set_online(&peer.id, online);
+                        let results = futures::future::join_all(checks).await;
 
+                        if let Some(runtime) = state.runtime.lock().await.as_ref() {
+                            for (peer_id, online, _addr) in &results {
+                                runtime.discovery.lock().await.set_online(peer_id, *online);
+                            }
+                        }
+
+                        for (peer_id, online, _) in &results {
+                            if let Some(peer) = peers.iter().find(|p| &p.id == peer_id) {
                                 let _ = state
                                     .db
                                     .upsert_peer(
@@ -106,24 +121,23 @@ pub fn run() {
                                         &peer.department,
                                         &peer.ip.to_string(),
                                         peer.port,
-                                        online,
+                                        *online,
                                     )
                                     .await;
-
                                 let updated = Peer::with_online(
                                     peer.id.clone(),
                                     peer.username.clone(),
                                     peer.department.clone(),
                                     peer.ip,
                                     peer.port,
-                                    online,
+                                    *online,
                                     peer.last_seen,
                                 );
                                 let _ = app_handle.emit("peer-discovered", &updated);
                             }
                         }
                     }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(Duration::from_secs(8)).await;
                 }
             });
 

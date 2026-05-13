@@ -40,9 +40,13 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const nearBottomRef = useRef(true);
 
-  // Clear pending when switching peers
+  // Clear pending when switching peers + focus input
   useEffect(() => {
     setPendingMessages([]);
+    if (peer) {
+      // Small delay to let React finish rendering
+      requestAnimationFrame(() => inputRef.current?.focus());
+    }
   }, [peer?.id]);
 
   const handleScroll = useCallback(() => {
@@ -56,13 +60,6 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages, pendingMessages]);
-
-  useEffect(() => {
-    if (peer) {
-      inputRef.current?.focus();
-      nearBottomRef.current = true;
-    }
-  }, [peer]);
 
   const retryText = useCallback(async (pending: PendingMessage) => {
     setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
