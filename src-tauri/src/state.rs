@@ -38,12 +38,15 @@ impl RuntimeServices {
         let my_id = discovery.my_id().to_string();
         discovery.start().await?;
 
+        let peers = discovery.peers_arc();
+
         let chat = ChatServer::new(
             listen_port,
             my_id.clone(),
             profile.username.clone(),
             profile.department.clone(),
             db,
+            peers,
         );
         chat.start().await?;
 

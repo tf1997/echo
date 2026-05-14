@@ -43,6 +43,7 @@ pub struct ChatServer {
     my_department: String,
     db: Arc<Database>,
     incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
+    peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
 }
 
 impl ChatServer {
@@ -52,6 +53,7 @@ impl ChatServer {
         my_name: String,
         my_department: String,
         db: Arc<Database>,
+        peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
     ) -> Self {
         let (incoming_tx, _incoming_rx) = mpsc::unbounded_channel();
         Self {
@@ -61,6 +63,7 @@ impl ChatServer {
             my_department,
             db,
             incoming_tx,
+            peers,
         }
     }
 
@@ -80,6 +83,7 @@ impl ChatServer {
 
         let db = Arc::clone(&self.db);
         let incoming_tx = self.incoming_tx.clone();
+        let peers = Arc::clone(&self.peers);
 
         tauri::async_runtime::spawn(async move {
             loop {
@@ -88,8 +92,9 @@ impl ChatServer {
                         info!("Incoming connection from {}", peer_addr);
                         let db = Arc::clone(&db);
                         let tx = incoming_tx.clone();
+                        let peers = Arc::clone(&peers);
                         tauri::async_runtime::spawn(async move {
-                            if let Err(e) = Self::handle_incoming(stream, peer_addr, db, tx).await {
+                            if let Err(e) = Self::handle_incoming(stream, peer_addr, db, tx, peers).await {
                                 error!("Error handling connection: {}", e);
                             }
                         });
@@ -109,6 +114,7 @@ impl ChatServer {
         peer_addr: std::net::SocketAddr,
         db: Arc<Database>,
         incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
+        peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
     ) -> Result<()> {
         let (reader, _writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
@@ -122,7 +128,7 @@ impl ChatServer {
                 Ok(msg) => {
                     let msg_type = msg.msg_type.as_str();
 
-                    // Register the sender as a peer
+                    // Register the sender as a peer in DB
                     if let Err(e) = db
                         .upsert_peer(
                             &msg.sender_id,
@@ -135,6 +141,39 @@ impl ChatServer {
                         .await
                     {
                         error!("Failed to upsert sender peer: {}", e);
+                    }
+
+                    // Also register in the in-memory peers map so UI picks it up immediately.
+                    // Use IP:port as the unique key to prevent duplicates.
+                    {
+                        let remote_ip = match peer_addr.ip() {
+                            std::net::IpAddr::V4(ip) => std::net::IpAddr::V4(ip),
+                            std::net::IpAddr::V6(ip) => std::net::IpAddr::V6(ip),
+                        };
+                        let pid = format!("{}:{}", peer_addr.ip(), msg.sender_port);
+                        let new_peer = Peer::new(
+                            pid.clone(),
+                            msg.sender_name.clone(),
+                            msg.sender_department.clone(),
+                            remote_ip,
+                            msg.sender_port,
+                        );
+                        if let Ok(mut map) = peers.write() {
+                            let is_new = !map.contains_key(&pid);
+                            // Also check IP:port dedup
+                            let already = map.values().any(|p| p.ip == remote_ip && p.port == msg.sender_port);
+                            if is_new && !already {
+                                map.insert(pid.clone(), new_peer.clone());
+                                info!("Auto-registered sender as peer: {}", new_peer);
+                            } else if already {
+                                // Update existing
+                                if let Some(existing) = map.values_mut().find(|p| p.ip == remote_ip && p.port == msg.sender_port) {
+                                    existing.username = msg.sender_name.clone();
+                                    existing.department = msg.sender_department.clone();
+                                    existing.online = true;
+                                }
+                            }
+                        }
                     }
 
                     match msg_type {

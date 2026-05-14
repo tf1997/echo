@@ -64,6 +64,10 @@ impl DiscoveryService {
         })
     }
 
+    pub fn peers_arc(&self) -> Arc<RwLock<HashMap<String, Peer>>> {
+        Arc::clone(&self.peers)
+    }
+
     pub fn get_peers(&self) -> Vec<Peer> {
         self.peers
             .read()
@@ -71,6 +75,49 @@ impl DiscoveryService {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Directly register a peer (used by manual IP discovery).
+    /// Deduplicates by IP:port — if a peer with same IP:port already exists, updates it.
+    pub fn register_peer(&self, peer: Peer) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let mut map = self.peers.write().expect("peers lock poisoned");
+
+        // Check if a peer with same IP:port already exists
+        let existing_id = map
+            .values()
+            .find(|p| p.ip == peer.ip && p.port == peer.port)
+            .map(|p| p.id.clone());
+
+        if let Some(id) = existing_id {
+            // Update existing peer
+            if let Some(existing) = map.get_mut(&id) {
+                existing.online = peer.online;
+                existing.last_seen = now;
+                if !peer.username.is_empty() {
+                    existing.username = peer.username;
+                }
+                if !peer.department.is_empty() {
+                    existing.department = peer.department;
+                }
+            }
+        } else {
+            map.insert(
+                peer.id.clone(),
+                Peer {
+                    id: peer.id,
+                    username: peer.username,
+                    department: peer.department,
+                    ip: peer.ip,
+                    port: peer.port,
+                    online: peer.online,
+                    last_seen: now,
+                },
+            );
+        }
     }
 
     pub fn get_peer(&self, peer_id: &str) -> Option<Peer> {
@@ -135,6 +182,7 @@ impl DiscoveryService {
         });
 
         // Also start LAN discovery (broadcast + multicast + unicast response)
+        let discovery_port = self.config.listen_port + 2;
         let lan_config = LanDiscoveryConfig {
             peer_id: self.config.peer_id.clone(),
             username: self.config.username.clone(),
@@ -142,6 +190,7 @@ impl DiscoveryService {
             listen_port: self.config.listen_port,
             local_ip,
             scan_subnets: self.config.scan_subnets.clone(),
+            discovery_port,
         };
         let lan = LanDiscovery::new(lan_config, Arc::clone(&self.peers))
             .context("Failed to start LAN discovery")?;

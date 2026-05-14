@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use super::peer::Peer;
 
-const DISCOVERY_PORT: u16 = 9529;
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 42);
 const ANNOUNCE_INTERVAL_SECS: u64 = 3;
 const READ_TIMEOUT_SECS: u64 = 1;
@@ -50,6 +49,7 @@ pub struct LanDiscoveryConfig {
     pub listen_port: u16,
     pub local_ip: IpAddr,
     pub scan_subnets: Vec<String>,
+    pub discovery_port: u16,
 }
 
 /// Manages UDP broadcast + multicast + unicast subnet scan + unicast-response discovery.
@@ -67,7 +67,8 @@ impl LanDiscovery {
         config: LanDiscoveryConfig,
         peers: Arc<RwLock<HashMap<String, Peer>>>,
     ) -> io::Result<Self> {
-        let bind_addr = format!("0.0.0.0:{}", DISCOVERY_PORT);
+        let discovery_port = config.discovery_port;
+        let bind_addr = format!("0.0.0.0:{}", discovery_port);
         let socket = UdpSocket::bind(&bind_addr)?;
 
         socket.set_broadcast(true)?;
@@ -104,7 +105,7 @@ impl LanDiscovery {
         let sender_cancel = Arc::clone(&cancel);
         let sender_id = config.peer_id.clone();
         let sender_handle = thread::spawn(move || {
-            Self::sender_loop(sender_socket, sender_bytes, sender_id, sender_cancel);
+            Self::sender_loop(sender_socket, sender_bytes, sender_id, sender_cancel, discovery_port);
         });
 
         // Listener thread (receive broadcasts + unicast responses + peer relay)
@@ -120,6 +121,7 @@ impl LanDiscovery {
                 listener_peers,
                 listener_my_id,
                 listener_cancel,
+                discovery_port,
             );
         });
 
@@ -138,6 +140,7 @@ impl LanDiscovery {
                 scanner_subnets,
                 scanner_peers,
                 scanner_cancel,
+                discovery_port,
             );
         });
 
@@ -240,9 +243,10 @@ impl LanDiscovery {
         data: Vec<u8>,
         my_id: String,
         cancel: Arc<AtomicBool>,
+        discovery_port: u16,
     ) {
-        let broadcast_target = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), DISCOVERY_PORT);
-        let multicast_target = SocketAddr::new(IpAddr::V4(MULTICAST_ADDR), DISCOVERY_PORT);
+        let broadcast_target = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), discovery_port);
+        let multicast_target = SocketAddr::new(IpAddr::V4(MULTICAST_ADDR), discovery_port);
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -276,6 +280,7 @@ impl LanDiscovery {
         subnets: Arc<RwLock<Vec<String>>>,
         peers: Arc<RwLock<HashMap<String, Peer>>>,
         cancel: Arc<AtomicBool>,
+        discovery_port: u16,
     ) {
         loop {
             // Wait before first scan
@@ -344,7 +349,7 @@ impl LanDiscovery {
                         return;
                     }
                     let target =
-                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, host)), DISCOVERY_PORT);
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, host)), discovery_port);
                     if socket.send_to(&base_data, target).is_ok() {
                         sent += 1;
                     }
@@ -369,6 +374,7 @@ impl LanDiscovery {
         peers: Arc<RwLock<HashMap<String, Peer>>>,
         my_id: String,
         cancel: Arc<AtomicBool>,
+        discovery_port: u16,
     ) {
         let mut buf = [0u8; 4096];
 
@@ -453,7 +459,7 @@ impl LanDiscovery {
                         info!("LAN discovered NEW peer: {}", peer);
 
                         // Unicast response with our own peer list (peer relay)
-                        let response_target = SocketAddr::new(remote_ip, DISCOVERY_PORT);
+                        let response_target = SocketAddr::new(remote_ip, discovery_port);
                         if let Err(e) = socket.send_to(&own_announce, response_target) {
                             warn!("Unicast response to {} failed: {}", response_target, e);
                         } else {

@@ -267,6 +267,7 @@ pub async fn discover_by_ip(
     };
 
     // Send our announce as a unicast UDP probe to the remote peer's discovery port.
+    // This triggers the remote peer to register us AND send back a unicast response.
     let probe = serde_json::json!({
         "id": my_id,
         "username": my_profile.as_ref().map(|p| p.username.as_str()).unwrap_or(""),
@@ -276,15 +277,71 @@ pub async fn discover_by_ip(
     });
 
     let probe_bytes = serde_json::to_vec(&probe).unwrap_or_default();
-    let target = format!("{}:{}", ip, 9529);
+    let discovery_port = port + 2;
+    let target = format!("{}:{}", ip, discovery_port);
     if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
         let _ = sock.set_broadcast(true);
         let _ = sock.send_to(&probe_bytes, &target);
     }
 
+    // Wait briefly for the remote peer's unicast response to arrive
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Check if the peer was auto-registered from the unicast response
+    let parsed_ip: std::net::IpAddr = ip.parse().map_err(|e| format!("无效 IP: {}", e))?;
+
+    let existing = {
+        let runtime = state.runtime.lock().await;
+        if let Some(runtime) = runtime.as_ref() {
+            let disc = runtime.discovery.lock().await;
+            disc.get_peers()
+                .into_iter()
+                .find(|p| p.ip == parsed_ip && p.port == port)
+        } else {
+            None
+        }
+    };
+
+    if let Some(found) = existing {
+        return Ok(DiscoverResult {
+            online: true,
+            message: format!("已连接 {} ({}) @ {}:{}", found.username, found.department, found.ip, found.port),
+        });
+    }
+
+    // Fallback: no unicast response received, register manually
+    let pid = format!("{}:{}", ip, port);
+    let peer = crate::discovery::Peer::new(
+        pid.clone(),
+        "手动添加".to_string(),
+        String::new(),
+        parsed_ip,
+        port,
+    );
+
+    {
+        let runtime = state.runtime.lock().await;
+        if let Some(runtime) = runtime.as_ref() {
+            let mut disc = runtime.discovery.lock().await;
+            // Don't duplicate: check by IP:port first
+            let already = disc
+                .get_peers()
+                .into_iter()
+                .any(|p| p.ip == parsed_ip && p.port == port);
+            if !already {
+                disc.register_peer(peer.clone());
+            }
+        }
+    }
+    // Save to DB
+    let _ = state
+        .db
+        .upsert_peer(&pid, "手动添加", "", &ip, port, true)
+        .await;
+
     Ok(DiscoverResult {
         online: true,
-        message: format!("发现在线主机 {}:{}，正在获取信息...", ip, port),
+        message: format!("已添加 {}:{}（未获取到对方信息）", ip, port),
     })
 }
 
