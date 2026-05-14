@@ -160,6 +160,9 @@ pub fn run() {
             commands::open_folder,
             commands::search_messages,
             commands::check_peer_online,
+            commands::discover_by_ip,
+            commands::get_scan_subnets,
+            commands::set_scan_subnets,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Echo");

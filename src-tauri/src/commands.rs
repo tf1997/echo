@@ -226,6 +226,68 @@ pub async fn send_file(
         .map_err(|e| e.to_string())
 }
 
+#[derive(Serialize)]
+pub struct DiscoverResult {
+    pub online: bool,
+    pub message: String,
+}
+
+#[tauri::command]
+pub async fn discover_by_ip(
+    state: State<'_, AppState>,
+    ip: String,
+    port: u16,
+) -> Result<DiscoverResult, String> {
+    let addr = format!("{}:{}", ip, port);
+
+    // Try TCP connect
+    let online = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+
+    if !online {
+        return Ok(DiscoverResult {
+            online: false,
+            message: format!("无法连接到 {}:{}", ip, port),
+        });
+    }
+
+    // Read my profile and runtime info
+    let my_profile = state.profile.lock().await.clone();
+    let (my_id, my_port) = {
+        let runtime = state.runtime.lock().await;
+        match runtime.as_ref() {
+            Some(r) => (r.my_id.clone(), r.listen_port),
+            None => return Err("应用尚未初始化".to_string()),
+        }
+    };
+
+    // Send our announce as a unicast UDP probe to the remote peer's discovery port.
+    let probe = serde_json::json!({
+        "id": my_id,
+        "username": my_profile.as_ref().map(|p| p.username.as_str()).unwrap_or(""),
+        "department": my_profile.as_ref().map(|p| p.department.as_str()).unwrap_or(""),
+        "ip": "",
+        "port": my_port,
+    });
+
+    let probe_bytes = serde_json::to_vec(&probe).unwrap_or_default();
+    let target = format!("{}:{}", ip, 9529);
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        let _ = sock.set_broadcast(true);
+        let _ = sock.send_to(&probe_bytes, &target);
+    }
+
+    Ok(DiscoverResult {
+        online: true,
+        message: format!("发现在线主机 {}:{}，正在获取信息...", ip, port),
+    })
+}
+
 #[tauri::command]
 pub async fn check_peer_online(
     ip: String,
@@ -448,6 +510,30 @@ pub async fn search_messages(
     }
 
     Ok(groups.into_values().collect())
+}
+
+#[tauri::command]
+pub async fn get_scan_subnets(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    state.db.get_scan_subnets().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_scan_subnets(
+    state: State<'_, AppState>,
+    subnets: Vec<String>,
+) -> Result<(), String> {
+    let joined = subnets.join(",");
+    state
+        .db
+        .save_scan_subnets(&joined)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(runtime) = state.runtime.lock().await.as_ref() {
+        runtime.discovery.lock().await.update_scan_subnets(&subnets);
+    }
+
+    Ok(())
 }
 
 fn path_mime(path: &str) -> &'static str {

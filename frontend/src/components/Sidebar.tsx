@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
 import type { Peer, UnreadCount } from "../types";
-import { searchMessages } from "../api";
+import { searchMessages, discoverByIp } from "../api";
 import type { SearchResult } from "../api";
 
 interface SidebarProps {
@@ -15,15 +15,32 @@ interface SidebarProps {
   myPort: number;
   onEditProfile: () => void;
   unreadCounts: UnreadCount[];
+  scanSubnets: string[];
+  onSaveScanSubnets: (subnets: string[]) => Promise<void>;
 }
 
-export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, myIp, myPort, onEditProfile, unreadCounts, onJumpToSearchHit }: SidebarProps) {
+export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
   const [copied, setCopied] = useState("");
+  const [subnetInput, setSubnetInput] = useState(scanSubnets.join(", "));
+  const [savingSubnets, setSavingSubnets] = useState(false);
+
+  const handleSaveSubnets = useCallback(async () => {
+    setSavingSubnets(true);
+    const list = subnetInput
+      .split(/[,，\s]+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    try {
+      await onSaveScanSubnets(list);
+    } finally {
+      setSavingSubnets(false);
+    }
+  }, [subnetInput, onSaveScanSubnets]);
 
   const copyToClipboard = useCallback(async (text: string, label: string) => {
     try {
@@ -68,6 +85,29 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
     setSearchResults([]);
     onJumpToSearchHit(peerId);
   }, [onJumpToSearchHit]);
+
+  const [manualIp, setManualIp] = useState("");
+  const [manualPort, setManualPort] = useState("9527");
+  const [searchingIp, setSearchingIp] = useState(false);
+  const [ipSearchMsg, setIpSearchMsg] = useState("");
+
+  const handleDiscoverIp = useCallback(async () => {
+    const ip = manualIp.trim();
+    if (!ip) return;
+    setSearchingIp(true);
+    setIpSearchMsg("");
+    try {
+      const result = await discoverByIp(ip, parseInt(manualPort) || 9527);
+      setIpSearchMsg(result.message);
+      if (!result.online) {
+        // Not found — still allow adding
+      }
+    } catch (e) {
+      setIpSearchMsg(String(e));
+    } finally {
+      setSearchingIp(false);
+    }
+  }, [manualIp, manualPort]);
 
   return (
     <div className="flex flex-col w-72 bg-gray-900 text-white h-full border-r border-gray-700">
@@ -146,9 +186,29 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                 <div className="w-5 h-5" />
               </div>
             </div>
+            <div className="border-t border-gray-700 my-3 pt-3">
+              <p className="text-xs text-gray-400 mb-2">网段扫描（跨子网发现）</p>
+              <input
+                type="text"
+                value={subnetInput}
+                onChange={(e) => setSubnetInput(e.target.value)}
+                placeholder="例: 10.100.0, 10.101.0"
+                className="w-full bg-gray-900 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500"
+              />
+              <button
+                onClick={handleSaveSubnets}
+                disabled={savingSubnets}
+                className="mt-2 w-full text-center text-xs py-1 rounded bg-indigo-600 hover:bg-indigo-500 transition-colors disabled:opacity-50"
+              >
+                {savingSubnets ? "保存中..." : "保存网段"}
+              </button>
+              <p className="text-[10px] text-gray-500 mt-1">
+                留空则不扫描 · 5 分钟间隔 · IP 随机
+              </p>
+            </div>
             <button
               onClick={() => setShowProfile(false)}
-              className="mt-3 w-full text-center text-xs py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 transition-colors"
+              className="mt-1 w-full text-center text-xs py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 transition-colors"
             >
               关闭
             </button>
@@ -170,6 +230,38 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
             className="w-full bg-gray-800 text-sm text-gray-200 rounded-lg pl-8 pr-3 py-2 outline-none focus:ring-2 focus:ring-indigo-500 placeholder-gray-500"
           />
         </div>
+      </div>
+
+      {/* Manual IP search */}
+      <div className="px-4 pb-2">
+        <div className="flex gap-1">
+          <input
+            type="text"
+            value={manualIp}
+            onChange={(e) => setManualIp(e.target.value)}
+            placeholder="IP 地址"
+            className="flex-1 bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
+            onKeyDown={(e) => { if (e.key === "Enter") handleDiscoverIp(); }}
+          />
+          <input
+            type="text"
+            value={manualPort}
+            onChange={(e) => setManualPort(e.target.value)}
+            placeholder="9527"
+            className="w-14 bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
+            onKeyDown={(e) => { if (e.key === "Enter") handleDiscoverIp(); }}
+          />
+          <button
+            onClick={handleDiscoverIp}
+            disabled={searchingIp}
+            className="px-2 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 whitespace-nowrap"
+          >
+            {searchingIp ? "..." : "查找"}
+          </button>
+        </div>
+        {ipSearchMsg && (
+          <p className="text-[10px] text-gray-400 mt-1 truncate">{ipSearchMsg}</p>
+        )}
       </div>
 
       {showSearch ? (

@@ -41,6 +41,18 @@ export async function getUnreadCounts(): Promise<UnreadCount[]> {
   return await invoke("get_unread_counts");
 }
 
+export async function getScanSubnets(): Promise<string[]> {
+  return await invoke("get_scan_subnets");
+}
+
+export async function setScanSubnets(subnets: string[]): Promise<void> {
+  await invoke("set_scan_subnets", { subnets });
+}
+
+export async function discoverByIp(ip: string, port: number): Promise<{ online: boolean; message: string }> {
+  return await invoke("discover_by_ip", { ip, port });
+}
+
 export async function saveTempFile(data: number[], filename: string): Promise<string> {
   return await invoke("save_temp_file", { data, filename });
 }

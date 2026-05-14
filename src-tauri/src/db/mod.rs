@@ -84,6 +84,17 @@ impl Database {
             }
         }
 
+        if let Err(error) =
+            sqlx::query("ALTER TABLE user_profile ADD COLUMN scan_subnets TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add scan_subnets column to user_profile");
+            }
+        }
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS peers (
                 peer_id TEXT PRIMARY KEY,
@@ -178,6 +189,32 @@ impl Database {
         .await
         .context("Failed to save user profile")?;
 
+        Ok(())
+    }
+
+    pub async fn get_scan_subnets(&self) -> Result<Vec<String>> {
+        let row = sqlx::query("SELECT scan_subnets FROM user_profile WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to load scan subnets")?;
+
+        let raw: String = row
+            .and_then(|r| r.try_get("scan_subnets").ok())
+            .unwrap_or_default();
+
+        Ok(raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+    }
+
+    pub async fn save_scan_subnets(&self, subnets: &str) -> Result<()> {
+        sqlx::query("UPDATE user_profile SET scan_subnets = ? WHERE id = 1")
+            .bind(subnets)
+            .execute(&self.pool)
+            .await
+            .context("Failed to save scan subnets")?;
         Ok(())
     }
 

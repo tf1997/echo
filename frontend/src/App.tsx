@@ -14,6 +14,8 @@ import {
   saveProfile,
   listStoredPeers,
   getUnreadCounts,
+  getScanSubnets,
+  setScanSubnets,
 } from "./api";
 
 function App() {
@@ -30,6 +32,7 @@ function App() {
   const [savingProfile, setSavingProfile] = useState(false);
   const [profileError, setProfileError] = useState("");
   const [editingProfile, setEditingProfile] = useState(false);
+  const [scanSubnets, setScanSubnetsState] = useState<string[]>([]);
 
   const mergePeers = useCallback((onlinePeers: Peer[], stored: StoredPeer[]): Peer[] => {
     const map = new Map<string, Peer>();
@@ -91,6 +94,12 @@ function App() {
     setDepartmentOptions(deps);
     if (info.initialized) {
       await loadPeerState();
+      try {
+        const subnets = await getScanSubnets();
+        setScanSubnetsState(subnets);
+      } catch {
+        // ignore — scan subnets not critical for startup
+      }
     }
   }, [loadPeerState]);
 
@@ -265,6 +274,11 @@ function App() {
         myPort={appInfo.listen_port}
         onEditProfile={openEditProfile}
         unreadCounts={unreadCounts}
+        scanSubnets={scanSubnets}
+        onSaveScanSubnets={async (list: string[]) => {
+          await setScanSubnets(list);
+          setScanSubnetsState(list);
+        }}
       />
       <ChatWindow
         peer={selectedPeer}

@@ -3,10 +3,11 @@ use local_ip_address::local_ip;
 use log::{info, warn};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use super::broadcast::{LanDiscovery, LanDiscoveryConfig};
 use super::peer::Peer;
 
 const SERVICE_TYPE: &str = "_echo-p2p._tcp.local.";
@@ -17,6 +18,7 @@ pub struct DiscoveryConfig {
     pub username: String,
     pub department: String,
     pub listen_port: u16,
+    pub scan_subnets: Vec<String>,
 }
 
 impl DiscoveryConfig {
@@ -25,6 +27,7 @@ impl DiscoveryConfig {
         username: impl Into<String>,
         department: impl Into<String>,
         listen_port: u16,
+        scan_subnets: Vec<String>,
     ) -> Self {
         let pid = peer_id.into();
         let pid = if pid.is_empty() {
@@ -37,6 +40,7 @@ impl DiscoveryConfig {
             username: username.into(),
             department: department.into(),
             listen_port,
+            scan_subnets,
         }
     }
 }
@@ -45,6 +49,7 @@ pub struct DiscoveryService {
     config: DiscoveryConfig,
     mdns: ServiceDaemon,
     peers: Arc<RwLock<HashMap<String, Peer>>>,
+    lan: Mutex<Option<LanDiscovery>>,
 }
 
 impl DiscoveryService {
@@ -55,6 +60,7 @@ impl DiscoveryService {
             config,
             mdns,
             peers: Arc::new(RwLock::new(HashMap::new())),
+            lan: Mutex::new(None),
         })
     }
 
@@ -128,11 +134,34 @@ impl DiscoveryService {
             Self::handle_mdns_events(receiver, peers, my_id).await;
         });
 
+        // Also start LAN discovery (broadcast + multicast + unicast response)
+        let lan_config = LanDiscoveryConfig {
+            peer_id: self.config.peer_id.clone(),
+            username: self.config.username.clone(),
+            department: self.config.department.clone(),
+            listen_port: self.config.listen_port,
+            local_ip,
+            scan_subnets: self.config.scan_subnets.clone(),
+        };
+        let lan = LanDiscovery::new(lan_config, Arc::clone(&self.peers))
+            .context("Failed to start LAN discovery")?;
+        *self.lan.lock().unwrap() = Some(lan);
+
         Ok(())
+    }
+
+    pub fn update_scan_subnets(&self, subnets: &[String]) {
+        if let Some(ref lan) = *self.lan.lock().unwrap() {
+            lan.update_scan_subnets(subnets);
+        }
     }
 
     pub fn stop(&self) -> Result<()> {
         info!("Stopping discovery service...");
+        // Shutdown LAN discovery first (joins threads)
+        if let Some(mut lan) = self.lan.lock().unwrap().take() {
+            lan.shutdown();
+        }
         let _ = self.mdns.unregister(SERVICE_TYPE);
         self.mdns.shutdown()?;
         Ok(())

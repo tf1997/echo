@@ -22,11 +22,17 @@ impl RuntimeServices {
                 .await
                 .ok();
         }
+        let scan_subnets = db
+            .get_scan_subnets()
+            .await
+            .unwrap_or_default();
+
         let config = DiscoveryConfig::new(
             &pid,
             &profile.username,
             &profile.department,
             listen_port,
+            scan_subnets,
         );
         let discovery = DiscoveryService::new(config)?;
         let my_id = discovery.my_id().to_string();
