@@ -52,3 +52,6 @@ base64 = "0.22"
 
 # Randomization (subnet scan IP shuffling)
 rand = "0.8"
+
+# Socket options (SO_REUSEADDR, SO_REUSEPORT)
+socket2 = "0.5"

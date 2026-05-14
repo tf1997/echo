@@ -7,10 +7,10 @@ mod state;
 use db::Database;
 use log::info;
 use crate::discovery::Peer;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{Emitter, Manager};
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use state::AppState;
@@ -76,68 +76,67 @@ pub fn run() {
                 let _ = db_for_offline.mark_all_peers_offline().await;
             });
 
-            // Continuous TCP health check + discovery sync, every 8 seconds
+            // Heartbeat-based online status sync, every 5 seconds
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // Allow time for initial discovery before first check
+                tokio::time::sleep(Duration::from_secs(10)).await;
+
                 loop {
                     if let Some(state) = app_handle.try_state::<AppState>() {
-                        let peers = if let Some(runtime) = state.runtime.lock().await.as_ref() {
-                            runtime.discovery.lock().await.get_peers()
-                        } else {
-                            vec![]
-                        };
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
 
-                        // Parallel TCP health checks
-                        let checks: Vec<_> = peers.iter().map(|peer| {
-                            let addr = format!("{}:{}", peer.ip, peer.port);
-                            let peer_id = peer.id.clone();
-                            async move {
-                                let online = tokio::time::timeout(
-                                    Duration::from_secs(2),
-                                    TcpStream::connect(&addr),
-                                )
-                                .await
-                                .map(|r| r.is_ok())
-                                .unwrap_or(false);
-                                (peer_id, online, addr)
-                            }
-                        }).collect();
+                        // Re-read peers fresh each cycle to avoid stale last_seen
+                        let snapshot: Vec<(String, String, String, IpAddr, u16, bool, i64)> =
+                            if let Some(runtime) = state.runtime.lock().await.as_ref() {
+                                runtime.discovery.lock().await.get_peers()
+                                    .into_iter()
+                                    .map(|p| (p.id, p.username, p.department, p.ip, p.port, p.online, p.last_seen))
+                                    .collect()
+                            } else {
+                                vec![]
+                            };
 
-                        let results = futures::future::join_all(checks).await;
+                        for (id, username, department, ip, port, current_online, last_seen) in &snapshot {
+                            let should_be_online = (now - last_seen) < 15;
 
-                        if let Some(runtime) = state.runtime.lock().await.as_ref() {
-                            for (peer_id, online, _addr) in &results {
-                                runtime.discovery.lock().await.set_online(peer_id, *online);
-                            }
-                        }
+                            if *current_online != should_be_online {
+                                // Update in-memory status
+                                if let Some(runtime) = state.runtime.lock().await.as_ref() {
+                                    runtime.discovery.lock().await.set_online(id, should_be_online);
+                                }
 
-                        for (peer_id, online, _) in &results {
-                            if let Some(peer) = peers.iter().find(|p| &p.id == peer_id) {
+                                // Persist to DB
                                 let _ = state
                                     .db
                                     .upsert_peer(
-                                        &peer.id,
-                                        &peer.username,
-                                        &peer.department,
-                                        &peer.ip.to_string(),
-                                        peer.port,
-                                        *online,
+                                        id,
+                                        username,
+                                        department,
+                                        &ip.to_string(),
+                                        *port,
+                                        should_be_online,
                                     )
                                     .await;
+
+                                // Emit to frontend
                                 let updated = Peer::with_online(
-                                    peer.id.clone(),
-                                    peer.username.clone(),
-                                    peer.department.clone(),
-                                    peer.ip,
-                                    peer.port,
-                                    *online,
-                                    peer.last_seen,
+                                    id.clone(),
+                                    username.clone(),
+                                    department.clone(),
+                                    *ip,
+                                    *port,
+                                    should_be_online,
+                                    *last_seen,
                                 );
                                 let _ = app_handle.emit("peer-discovered", &updated);
                             }
                         }
                     }
-                    tokio::time::sleep(Duration::from_secs(8)).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             });
 

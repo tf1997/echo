@@ -95,7 +95,7 @@ pub async fn save_profile(
         .as_ref()
         .map(|profile| profile.peer_id.clone())
         .filter(|peer_id| !peer_id.is_empty())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .unwrap_or_default(); // will be set to IP:port by RuntimeServices::start()
 
     state
         .db
@@ -277,8 +277,7 @@ pub async fn discover_by_ip(
     });
 
     let probe_bytes = serde_json::to_vec(&probe).unwrap_or_default();
-    let discovery_port = port + 2;
-    let target = format!("{}:{}", ip, discovery_port);
+    let target = format!("{}:{}", ip, 9529u16);
     if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
         let _ = sock.set_broadcast(true);
         let _ = sock.send_to(&probe_bytes, &target);

@@ -69,10 +69,25 @@ impl LanDiscovery {
     ) -> io::Result<Self> {
         let discovery_port = config.discovery_port;
         let bind_addr = format!("0.0.0.0:{}", discovery_port);
-        let socket = UdpSocket::bind(&bind_addr)?;
 
-        socket.set_broadcast(true)?;
-        socket.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)))?;
+        // Use socket2 for cross-platform SO_REUSEADDR/SO_REUSEPORT
+        let sock2 = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        sock2.set_reuse_address(true).ok();
+        #[cfg(unix)]
+        sock2.set_reuse_port(true).ok();
+        sock2.set_broadcast(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        sock2.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let sock_addr = socket2::SockAddr::from(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            discovery_port,
+        ));
+        sock2.bind(&sock_addr)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        let socket: UdpSocket = sock2.into();
 
         // Join multicast group
         if let Err(e) = socket.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED) {

@@ -84,6 +84,7 @@ impl ChatServer {
         let db = Arc::clone(&self.db);
         let incoming_tx = self.incoming_tx.clone();
         let peers = Arc::clone(&self.peers);
+        let my_id = self.my_id.clone();
 
         tauri::async_runtime::spawn(async move {
             loop {
@@ -93,8 +94,9 @@ impl ChatServer {
                         let db = Arc::clone(&db);
                         let tx = incoming_tx.clone();
                         let peers = Arc::clone(&peers);
+                        let my_id = my_id.clone();
                         tauri::async_runtime::spawn(async move {
-                            if let Err(e) = Self::handle_incoming(stream, peer_addr, db, tx, peers).await {
+                            if let Err(e) = Self::handle_incoming(stream, peer_addr, db, tx, peers, my_id).await {
                                 error!("Error handling connection: {}", e);
                             }
                         });
@@ -115,6 +117,7 @@ impl ChatServer {
         db: Arc<Database>,
         incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
         peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
+        my_id: String,
     ) -> Result<()> {
         let (reader, _writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
@@ -200,7 +203,7 @@ impl ChatServer {
 
                             let sender_id = file_sender_id.as_deref().unwrap_or(&msg.sender_id);
                             let sender_name = file_sender_name.as_deref().unwrap_or(&msg.sender_name);
-                            let receiver_id = &msg.receiver_id;
+                            let receiver_id = &my_id;
                             if let Err(e) = db
                                 .save_message(
                                     sender_id,
@@ -239,7 +242,7 @@ impl ChatServer {
                                 .save_message(
                                     &msg.sender_id,
                                     &msg.sender_name,
-                                    &msg.receiver_id,
+                                    &my_id,
                                     &msg.content,
                                     &msg.msg_type,
                                     msg.file_name.as_deref(),

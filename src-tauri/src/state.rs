@@ -15,27 +15,31 @@ pub struct RuntimeServices {
 
 impl RuntimeServices {
     pub async fn start(db: Arc<Database>, profile: &UserProfile, listen_port: u16) -> Result<Self> {
-        let mut pid = profile.peer_id.clone();
-        if pid.is_empty() {
-            pid = uuid::Uuid::new_v4().to_string();
-            db.save_user_profile(&pid, &profile.username, &profile.department)
+        // Identity = IP:port — no UUID, the network address IS the identity
+        let local_ip = local_ip_address::local_ip()
+            .map_err(|e| anyhow::anyhow!("Failed to get local IP: {}", e))?;
+        let my_id = format!("{}:{}", local_ip, listen_port);
+
+        // Persist peer_id for profile
+        if profile.peer_id.is_empty() || profile.peer_id != my_id {
+            db.save_user_profile(&my_id, &profile.username, &profile.department)
                 .await
                 .ok();
         }
+
         let scan_subnets = db
             .get_scan_subnets()
             .await
             .unwrap_or_default();
 
         let config = DiscoveryConfig::new(
-            &pid,
+            &my_id,
             &profile.username,
             &profile.department,
             listen_port,
             scan_subnets,
         );
         let discovery = DiscoveryService::new(config)?;
-        let my_id = discovery.my_id().to_string();
         discovery.start().await?;
 
         let peers = discovery.peers_arc();

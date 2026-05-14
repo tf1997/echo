@@ -5,7 +5,6 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 use super::broadcast::{LanDiscovery, LanDiscoveryConfig};
 use super::peer::Peer;
@@ -29,14 +28,8 @@ impl DiscoveryConfig {
         listen_port: u16,
         scan_subnets: Vec<String>,
     ) -> Self {
-        let pid = peer_id.into();
-        let pid = if pid.is_empty() {
-            Uuid::new_v4().to_string()
-        } else {
-            pid
-        };
         Self {
-            peer_id: pid,
+            peer_id: peer_id.into(),
             username: username.into(),
             department: department.into(),
             listen_port,
@@ -182,7 +175,7 @@ impl DiscoveryService {
         });
 
         // Also start LAN discovery (broadcast + multicast + unicast response)
-        let discovery_port = self.config.listen_port + 2;
+        let discovery_port = 9529u16;
         let lan_config = LanDiscoveryConfig {
             peer_id: self.config.peer_id.clone(),
             username: self.config.username.clone(),
