@@ -15,8 +15,15 @@ pub struct RuntimeServices {
 
 impl RuntimeServices {
     pub async fn start(db: Arc<Database>, profile: &UserProfile, listen_port: u16) -> Result<Self> {
+        let mut pid = profile.peer_id.clone();
+        if pid.is_empty() {
+            pid = uuid::Uuid::new_v4().to_string();
+            db.save_user_profile(&pid, &profile.username, &profile.department)
+                .await
+                .ok();
+        }
         let config = DiscoveryConfig::new(
-            &profile.peer_id,
+            &pid,
             &profile.username,
             &profile.department,
             listen_port,

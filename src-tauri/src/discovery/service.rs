@@ -5,6 +5,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use super::peer::Peer;
 
@@ -25,8 +26,14 @@ impl DiscoveryConfig {
         department: impl Into<String>,
         listen_port: u16,
     ) -> Self {
+        let pid = peer_id.into();
+        let pid = if pid.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            pid
+        };
         Self {
-            peer_id: peer_id.into(),
+            peer_id: pid,
             username: username.into(),
             department: department.into(),
             listen_port,
@@ -86,7 +93,7 @@ impl DiscoveryService {
             self.config.username, self.config.peer_id, local_ip, self.config.listen_port
         );
 
-        let instance_name = format!("echo-{}", &self.config.peer_id[..8]);
+        let instance_name = format!("echo-{}", &self.config.peer_id.get(..8).unwrap_or("00000000"));
         let port_str = self.config.listen_port.to_string();
         let properties = vec![
             ("id", self.config.peer_id.as_str()),
@@ -136,7 +143,7 @@ impl DiscoveryService {
 
         let _ = self.mdns.unregister(SERVICE_TYPE);
 
-        let instance_name = format!("echo-{}", &self.config.peer_id[..8]);
+        let instance_name = format!("echo-{}", &self.config.peer_id.get(..8).unwrap_or("00000000"));
         let port_str = self.config.listen_port.to_string();
         let properties = vec![
             ("id", self.config.peer_id.as_str()),
