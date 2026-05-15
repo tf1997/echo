@@ -70,17 +70,40 @@ pub fn run() {
                 runtime: Mutex::new(runtime_services),
             });
 
-            // Mark all stored peers as offline at startup
-            let db_for_offline = db.clone();
+            // Load stored peers from DB into DiscoveryService memory on startup
+            let db_for_load = db.clone();
+            let app_handle_for_load = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let _ = db_for_offline.mark_all_peers_offline().await;
+                let stored = db_for_load.list_stored_peers().await.unwrap_or_default();
+                if stored.is_empty() {
+                    return;
+                }
+                // Wait until state is available
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Some(state) = app_handle_for_load.try_state::<AppState>() {
+                    if let Some(runtime) = state.runtime.lock().await.as_ref() {
+                        let disc = runtime.discovery.lock().await;
+                        for sp in &stored {
+                            if let Ok(ip) = sp.ip.parse::<IpAddr>() {
+                                let peer = Peer::new(
+                                    sp.peer_id.clone(),
+                                    sp.username.clone(),
+                                    sp.department.clone(),
+                                    ip,
+                                    sp.port,
+                                );
+                                disc.register_peer(peer);
+                            }
+                        }
+                        info!("Loaded {} stored peer(s) into memory", stored.len());
+                    }
+                }
             });
 
-            // Heartbeat-based online status sync, every 5 seconds
+            // Health check: TCP connect refreshes last_seen, timeout marks offline
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                // Allow time for initial discovery before first check
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                use tokio::net::TcpStream;
 
                 loop {
                     if let Some(state) = app_handle.try_state::<AppState>() {
@@ -89,54 +112,59 @@ pub fn run() {
                             .unwrap_or_default()
                             .as_secs() as i64;
 
-                        // Re-read peers fresh each cycle to avoid stale last_seen
-                        let snapshot: Vec<(String, String, String, IpAddr, u16, bool, i64)> =
+                        let snapshot: Vec<(String, String, String, IpAddr, u16)> =
                             if let Some(runtime) = state.runtime.lock().await.as_ref() {
                                 runtime.discovery.lock().await.get_peers()
                                     .into_iter()
-                                    .map(|p| (p.id, p.username, p.department, p.ip, p.port, p.online, p.last_seen))
+                                    .map(|p| (p.id, p.username, p.department, p.ip, p.port))
                                     .collect()
                             } else {
                                 vec![]
                             };
 
-                        for (id, username, department, ip, port, current_online, last_seen) in &snapshot {
-                            let should_be_online = (now - last_seen) < 15;
+                        log::info!("HealthCheck cycle: {} peer(s)", snapshot.len());
 
-                            if *current_online != should_be_online {
-                                // Update in-memory status
+                        for (id, username, department, ip, port) in &snapshot {
+                            let addr = format!("{}:{}", ip, port);
+                            let tcp_ok = tokio::time::timeout(
+                                Duration::from_secs(2),
+                                TcpStream::connect(&addr),
+                            )
+                            .await
+                            .map(|r| r.is_ok())
+                            .unwrap_or(false);
+
+                            if tcp_ok {
+                                // TCP success → peer is alive, refresh last_seen
                                 if let Some(runtime) = state.runtime.lock().await.as_ref() {
-                                    runtime.discovery.lock().await.set_online(id, should_be_online);
+                                    runtime.discovery.lock().await.touch_peer(id);
                                 }
+                                let _ = state.db.upsert_peer(id, username, department, &ip.to_string(), *port, true).await;
+                                log::debug!("HealthCheck: {} TCP OK → online", id);
+                            } else {
+                                // TCP fail → check if last_seen is too old
+                                let should_offline = if let Some(runtime) = state.runtime.lock().await.as_ref() {
+                                    let disc = runtime.discovery.lock().await;
+                                    disc.get_peer(id)
+                                        .map(|p| p.online && (now - p.last_seen) >= 15)
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                };
 
-                                // Persist to DB
-                                let _ = state
-                                    .db
-                                    .upsert_peer(
-                                        id,
-                                        username,
-                                        department,
-                                        &ip.to_string(),
-                                        *port,
-                                        should_be_online,
-                                    )
-                                    .await;
-
-                                // Emit to frontend
-                                let updated = Peer::with_online(
-                                    id.clone(),
-                                    username.clone(),
-                                    department.clone(),
-                                    *ip,
-                                    *port,
-                                    should_be_online,
-                                    *last_seen,
-                                );
-                                let _ = app_handle.emit("peer-discovered", &updated);
+                                if should_offline {
+                                    if let Some(runtime) = state.runtime.lock().await.as_ref() {
+                                        runtime.discovery.lock().await.set_online(id, false);
+                                    }
+                                    let _ = state.db.upsert_peer(id, username, department, &ip.to_string(), *port, false).await;
+                                    let updated = Peer::with_online(id.clone(), username.clone(), department.clone(), *ip, *port, false, now);
+                                    let _ = app_handle.emit("peer-discovered", &updated);
+                                    log::info!("HealthCheck: {} → OFFLINE (tcp failed, age>15s)", username);
+                                }
                             }
                         }
                     }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(Duration::from_secs(8)).await;
                 }
             });
 

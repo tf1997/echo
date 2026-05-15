@@ -361,6 +361,8 @@ impl ChatServer {
         }
         stream.flush().await?;
 
+        self.bump_last_seen(peer);
+
         // Save outgoing file message to DB
         let saved = self.db
             .save_message(
@@ -391,7 +393,39 @@ impl ChatServer {
         stream.write_all(b"\n").await?;
         stream.flush().await?;
 
+        // TCP success = peer is definitely online
+        self.bump_last_seen(peer);
+
         Ok(())
+    }
+
+    fn bump_last_seen(&self, peer: &Peer) {
+        if let Ok(mut map) = self.peers.write() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            if let Some(existing) = map.values_mut().find(|p| p.ip == peer.ip && p.port == peer.port)
+            {
+                existing.online = true;
+                existing.last_seen = now;
+                if !peer.username.is_empty() && peer.username != "手动添加" {
+                    existing.username = peer.username.clone();
+                }
+                if !peer.department.is_empty() {
+                    existing.department = peer.department.clone();
+                }
+                info!("bump_last_seen: {} updated (online, last_seen={})", existing.id, now);
+            } else {
+                // Peer not in discovery map yet — insert it so UI picks it up
+                let mut p = peer.clone();
+                p.online = true;
+                p.last_seen = now;
+                map.insert(p.id.clone(), p.clone());
+                info!("bump_last_seen: inserted new peer {} into map ({} total)", p.id, map.len());
+            }
+        }
     }
 }
 

@@ -121,6 +121,20 @@ impl DiscoveryService {
             .cloned()
     }
 
+    /// Update last_seen and set online=true (called by health check when TCP succeeds).
+    /// If the peer isn't in the map yet, it's inserted.
+    pub fn touch_peer(&self, peer_id: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let mut map = self.peers.write().expect("peers lock poisoned");
+        if let Some(peer) = map.get_mut(peer_id) {
+            peer.online = true;
+            peer.last_seen = now;
+        }
+    }
+
     pub fn set_online(&self, peer_id: &str, online: bool) {
         if let Some(peer) = self.peers.write().expect("peers lock poisoned").get_mut(peer_id) {
             peer.online = online;
