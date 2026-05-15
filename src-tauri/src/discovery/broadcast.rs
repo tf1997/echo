@@ -96,45 +96,41 @@ impl LanDiscovery {
 
         let socket = Arc::new(socket);
 
-        let announce = AnnouncePacket {
-            id: config.peer_id.clone(),
-            username: config.username,
-            department: config.department,
-            ip: config.local_ip.to_string(),
-            port: config.listen_port,
-            known_peers: Vec::new(),
-        };
-
-        let announce_bytes =
-            serde_json::to_vec(&announce).expect("Failed to serialize announce packet");
-
         let cancel = Arc::new(AtomicBool::new(false));
 
         // Build initial subnet prefixes from config
         let initial_prefixes = Self::build_subnet_prefixes(config.local_ip, &config.scan_subnets);
         let scan_subnets = Arc::new(RwLock::new(initial_prefixes));
 
-        // Sender thread (broadcast + multicast heartbeat)
+        // Build the base packet (without known_peers — filled dynamically)
+        let base_announce = AnnouncePacket {
+            id: config.peer_id.clone(),
+            username: config.username.clone(),
+            department: config.department.clone(),
+            ip: config.local_ip.to_string(),
+            port: config.listen_port,
+            known_peers: Vec::new(),
+        };
+
+        // Sender thread — rebuilds known_peers each cycle
         let sender_socket = Arc::clone(&socket);
-        let sender_bytes = announce_bytes.clone();
         let sender_cancel = Arc::clone(&cancel);
-        let sender_id = config.peer_id.clone();
+        let sender_my_info = base_announce.clone();
+        let sender_peers = Arc::clone(&peers);
         let sender_handle = thread::spawn(move || {
-            Self::sender_loop(sender_socket, sender_bytes, sender_id, sender_cancel, discovery_port);
+            Self::sender_loop(sender_socket, sender_my_info, sender_peers, sender_cancel, discovery_port);
         });
 
-        // Listener thread (receive broadcasts + unicast responses + peer relay)
+        // Listener thread
         let listener_socket = Arc::clone(&socket);
-        let listener_bytes = announce_bytes.clone();
         let listener_cancel = Arc::clone(&cancel);
-        let listener_my_id = config.peer_id.clone();
+        let listener_my_info = base_announce.clone();
         let listener_peers = Arc::clone(&peers);
         let listener_handle = thread::spawn(move || {
             Self::listener_loop(
                 listener_socket,
-                listener_bytes,
+                listener_my_info,
                 listener_peers,
-                listener_my_id,
                 listener_cancel,
                 discovery_port,
             );
@@ -142,7 +138,7 @@ impl LanDiscovery {
 
         // Scanner thread (unicast subnet probe)
         let scanner_socket = Arc::clone(&socket);
-        let scanner_bytes = announce_bytes.clone();
+        let scanner_bytes = serde_json::to_vec(&base_announce).unwrap_or_default();
         let scanner_cancel = Arc::clone(&cancel);
         let scanner_id = config.peer_id;
         let scanner_subnets = Arc::clone(&scan_subnets);
@@ -253,10 +249,25 @@ impl LanDiscovery {
         out
     }
 
+    fn build_announce_data(my_info: &AnnouncePacket, peers: &Arc<RwLock<HashMap<String, Peer>>>) -> Vec<u8> {
+        let mut pkt = my_info.clone();
+        {
+            let map = peers.read().unwrap();
+            pkt.known_peers = map.values()
+                .filter(|p| p.online)
+                .map(|p| PeerEntry {
+                    id: p.id.clone(), username: p.username.clone(),
+                    department: p.department.clone(), ip: p.ip.to_string(), port: p.port,
+                })
+                .collect();
+        }
+        serde_json::to_vec(&pkt).unwrap_or_default()
+    }
+
     fn sender_loop(
         socket: Arc<UdpSocket>,
-        data: Vec<u8>,
-        my_id: String,
+        my_info: AnnouncePacket,
+        peers: Arc<RwLock<HashMap<String, Peer>>>,
         cancel: Arc<AtomicBool>,
         discovery_port: u16,
     ) {
@@ -264,24 +275,15 @@ impl LanDiscovery {
         let multicast_target = SocketAddr::new(IpAddr::V4(MULTICAST_ADDR), discovery_port);
 
         loop {
-            if cancel.load(Ordering::Relaxed) {
-                return;
-            }
+            if cancel.load(Ordering::Relaxed) { return; }
 
-            if let Err(e) = socket.send_to(&data, broadcast_target) {
-                warn!("UDP broadcast send failed: {}", e);
-            } else {
-                debug!("UDP broadcast sent (id={})", &my_id[..8.min(my_id.len())]);
-            }
+            let data = Self::build_announce_data(&my_info, &peers);
 
-            if let Err(e) = socket.send_to(&data, multicast_target) {
-                warn!("UDP multicast send failed: {}", e);
-            }
+            let _ = socket.send_to(&data, broadcast_target);
+            let _ = socket.send_to(&data, multicast_target);
 
             for _ in 0..ANNOUNCE_INTERVAL_SECS {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
+                if cancel.load(Ordering::Relaxed) { return; }
                 thread::sleep(Duration::from_secs(1));
             }
         }
@@ -307,31 +309,15 @@ impl LanDiscovery {
             }
 
             // Rebuild data with known peers for peer relay
-            {
-                let peers_map = peers.read().unwrap();
-                let known: Vec<PeerEntry> = peers_map
-                    .values()
-                    .filter(|p| p.online)
-                    .map(|p| PeerEntry {
-                        id: p.id.clone(),
-                        username: p.username.clone(),
-                        department: p.department.clone(),
-                        ip: p.ip.to_string(),
-                        port: p.port,
-                    })
-                    .collect();
-                let packet = AnnouncePacket {
-                    id: my_id.clone(),
-                    username: String::new(), // parsed from base_data; just rebuild
-                    department: String::new(),
-                    ip: String::new(),
-                    port: 0,
-                    known_peers: known,
-                };
-                if let Ok(json) = serde_json::to_vec(&packet) {
-                    base_data = json;
-                }
-            }
+            let my_info = AnnouncePacket {
+                id: my_id.clone(),
+                username: String::new(),
+                department: String::new(),
+                ip: String::new(),
+                port: 0,
+                known_peers: Vec::new(),
+            };
+            base_data = Self::build_announce_data(&my_info, &peers);
 
             let prefixes = subnets.read().unwrap().clone();
             let start = std::time::Instant::now();
@@ -385,9 +371,8 @@ impl LanDiscovery {
 
     fn listener_loop(
         socket: Arc<UdpSocket>,
-        own_announce: Vec<u8>,
+        my_info: AnnouncePacket,
         peers: Arc<RwLock<HashMap<String, Peer>>>,
-        my_id: String,
         cancel: Arc<AtomicBool>,
         discovery_port: u16,
     ) {
@@ -406,7 +391,7 @@ impl LanDiscovery {
                     };
 
                     // Skip self
-                    if packet.id == my_id {
+                    if packet.id == my_info.id {
                         continue;
                     }
 
@@ -447,7 +432,7 @@ impl LanDiscovery {
 
                     // Process peer relay: register all known_peers too
                     for entry in &packet.known_peers {
-                        if entry.id != my_id && !peers_map.contains_key(&entry.id) {
+                        if entry.id != my_info.id && !peers_map.contains_key(&entry.id) {
                             if let Ok(ip) = entry.ip.parse::<IpAddr>() {
                                 peers_map.insert(
                                     entry.id.clone(),
@@ -474,12 +459,9 @@ impl LanDiscovery {
                         info!("LAN discovered NEW peer: {}", peer);
 
                         // Unicast response with our own peer list (peer relay)
+                        let response_data = Self::build_announce_data(&my_info, &peers);
                         let response_target = SocketAddr::new(remote_ip, discovery_port);
-                        if let Err(e) = socket.send_to(&own_announce, response_target) {
-                            warn!("Unicast response to {} failed: {}", response_target, e);
-                        } else {
-                            debug!("Unicast response sent to {}", response_target);
-                        }
+                        let _ = socket.send_to(&response_data, response_target);
                     }
                 }
                 Err(ref e)

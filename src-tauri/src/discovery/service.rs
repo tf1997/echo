@@ -206,6 +206,13 @@ impl DiscoveryService {
         Ok(())
     }
 
+    pub fn get_scan_subnets(&self) -> Vec<String> {
+        self.lan.lock().unwrap()
+            .as_ref()
+            .map(|lan| lan.get_scan_subnets())
+            .unwrap_or_default()
+    }
+
     pub fn update_scan_subnets(&self, subnets: &[String]) {
         if let Some(ref lan) = *self.lan.lock().unwrap() {
             lan.update_scan_subnets(subnets);

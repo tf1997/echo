@@ -570,6 +570,14 @@ pub async fn search_messages(
 
 #[tauri::command]
 pub async fn get_scan_subnets(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    // Return from in-memory config (more up-to-date), fallback to DB
+    if let Some(runtime) = state.runtime.lock().await.as_ref() {
+        let disc = runtime.discovery.lock().await;
+        let subnets = disc.get_scan_subnets();
+        if !subnets.is_empty() {
+            return Ok(subnets);
+        }
+    }
     state.db.get_scan_subnets().await.map_err(|e| e.to_string())
 }
 
