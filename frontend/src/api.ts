@@ -53,6 +53,14 @@ export async function discoverByIp(ip: string, port: number): Promise<{ online: 
   return await invoke("discover_by_ip", { ip, port });
 }
 
+export async function listEmojiFiles(): Promise<string[]> {
+  return await invoke("list_emoji_files");
+}
+
+export async function addEmojiFile(sourcePath: string): Promise<string> {
+  return await invoke("add_emoji_file", { sourcePath });
+}
+
 export async function saveTempFile(data: number[], filename: string): Promise<string> {
   return await invoke("save_temp_file", { data, filename });
 }

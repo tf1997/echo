@@ -191,6 +191,8 @@ pub fn run() {
             commands::discover_by_ip,
             commands::get_scan_subnets,
             commands::set_scan_subnets,
+            commands::list_emoji_files,
+            commands::add_emoji_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Echo");

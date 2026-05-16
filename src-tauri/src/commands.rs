@@ -692,6 +692,45 @@ fn base64_encode_std(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
+#[tauri::command]
+pub fn list_emoji_files() -> Result<Vec<String>, String> {
+    let dir = emoji_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut files: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if matches!(ext.to_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+                    files.push(path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    Ok(files)
+}
+
+#[tauri::command]
+pub fn add_emoji_file(source_path: String) -> Result<String, String> {
+    let dir = emoji_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let name = std::path::Path::new(&source_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("invalid filename")?;
+    let dest = dir.join(name);
+    std::fs::copy(&source_path, &dest).map_err(|e| e.to_string())?;
+    Ok(dest.to_string_lossy().to_string())
+}
+
+fn emoji_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home).join("Echo").join("emojis")
+}
+
 fn echo_files_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))

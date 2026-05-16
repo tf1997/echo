@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import type { ChatMessage, Peer } from "../types";
 import { MessageBubble } from "./MessageBubble";
-import { saveTempFile } from "../api";
+import { saveTempFile, listEmojiFiles, addEmojiFile, readFileBase64 } from "../api";
 import { open } from "@tauri-apps/plugin-dialog";
 
 export interface PendingMessage {
@@ -35,6 +35,15 @@ async function readFileAndSave(file: File): Promise<string> {
 
 const EMOJIS = ["😀","😂","🤣","😍","🥰","😘","😜","🤪","😎","🤩","😢","😭","😤","😡","🤬","👍","👎","👏","🙌","💪","🎉","🔥","❤️","💔","💯","✅","❌","⭐","🌟","📎","📁","💡","🎵","🌹","🍕","☕","🚀","🐱","🐶","🦊","🐼","👋","🤝","🙏","💀","👻","🤖","🎂","🏆","🥇","💩"];
 
+function EmojiThumb({ path }: { path: string }) {
+  const [src, setSrc] = useState<string>("");
+  useEffect(() => {
+    readFileBase64(path).then((d) => setSrc(`data:${d.mime};base64,${d.base64}`)).catch(() => {});
+  }, [path]);
+  if (!src) return <div className="w-full h-full bg-gray-700 rounded" />;
+  return <img src={src} alt="" className="w-full h-full object-cover" />;
+}
+
 function formatSpeed(bytesPerSec: number | undefined): string {
   if (!bytesPerSec || bytesPerSec === 0) return "";
   if (bytesPerSec >= 1_000_000) return `${(bytesPerSec / 1_000_000).toFixed(1)} MB/s`;
@@ -47,6 +56,25 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
   const [isDragging, setIsDragging] = useState(false);
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
   const [showEmoji, setShowEmoji] = useState(false);
+  const [customEmojis, setCustomEmojis] = useState<string[]>([]);
+
+  // Load custom emojis
+  useEffect(() => {
+    listEmojiFiles().then(setCustomEmojis).catch(() => {});
+  }, []);
+
+  const handleAddEmoji = useCallback(async () => {
+    const selected = await open({ filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }] });
+    if (!selected) return;
+    const path = typeof selected === "string" ? selected : selected[0];
+    if (!path) return;
+    try {
+      const saved = await addEmojiFile(path);
+      setCustomEmojis((prev) => [...prev, saved]);
+    } catch (e) {
+      console.error("Failed to add emoji:", e);
+    }
+  }, []);
 
   // Listen for file send progress
   useEffect(() => {
@@ -386,7 +414,27 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
             </button>
             {showEmoji && (
               <div className="absolute bottom-full right-0 mb-2 bg-gray-800 border border-gray-600 rounded-xl p-3 shadow-2xl z-50 w-72">
-                <div className="grid grid-cols-10 gap-1 max-h-40 overflow-y-auto">
+                <div className="grid grid-cols-10 gap-1 max-h-52 overflow-y-auto">
+                  {customEmojis.map((path) => {
+                    const name = path.replace(/\\/g, "/").split("/").pop() || "emoji";
+                    return (
+                      <button
+                        key={path}
+                        onClick={() => {
+                          onSendFile(path).catch(console.error);
+                          setShowEmoji(false);
+                        }}
+                        className="w-7 h-7 rounded hover:bg-gray-600 overflow-hidden"
+                        title={name}
+                      >
+                        <EmojiThumb path={path} />
+                      </button>
+                    );
+                  })}
+                  {/* Add custom emoji button */}
+                  <button onClick={handleAddEmoji} className="w-7 h-7 flex items-center justify-center text-gray-400 hover:bg-gray-600 hover:text-white rounded text-lg" title="添加自定义表情">
+                    +
+                  </button>
                   {EMOJIS.map((emoji) => (
                     <button
                       key={emoji}
