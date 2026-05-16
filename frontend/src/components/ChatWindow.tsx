@@ -33,6 +33,8 @@ async function readFileAndSave(file: File): Promise<string> {
   return await saveTempFile(data, file.name || "file");
 }
 
+const EMOJIS = ["😀","😂","🤣","😍","🥰","😘","😜","🤪","😎","🤩","😢","😭","😤","😡","🤬","👍","👎","👏","🙌","💪","🎉","🔥","❤️","💔","💯","✅","❌","⭐","🌟","📎","📁","💡","🎵","🌹","🍕","☕","🚀","🐱","🐶","🦊","🐼","👋","🤝","🙏","💀","👻","🤖","🎂","🏆","🥇","💩"];
+
 function formatSpeed(bytesPerSec: number | undefined): string {
   if (!bytesPerSec || bytesPerSec === 0) return "";
   if (bytesPerSec >= 1_000_000) return `${(bytesPerSec / 1_000_000).toFixed(1)} MB/s`;
@@ -44,6 +46,7 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
   const [inputText, setInputText] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
+  const [showEmoji, setShowEmoji] = useState(false);
 
   // Listen for file send progress
   useEffect(() => {
@@ -377,6 +380,40 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
 
       <div className="px-4 py-3 border-t border-gray-700 bg-gray-900/50">
         <div className="flex items-end gap-2">
+          <div className="relative flex-shrink-0">
+            <button onClick={() => setShowEmoji(!showEmoji)} className="w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center" title="表情">
+              <span className="text-lg">😀</span>
+            </button>
+            {showEmoji && (
+              <div className="absolute bottom-full right-0 mb-2 bg-gray-800 border border-gray-600 rounded-xl p-3 shadow-2xl z-50 w-72">
+                <div className="grid grid-cols-10 gap-1 max-h-40 overflow-y-auto">
+                  {EMOJIS.map((emoji) => (
+                    <button
+                      key={emoji}
+                      onClick={() => {
+                        const el = inputRef.current;
+                        if (el) {
+                          const start = el.selectionStart ?? el.value.length;
+                          const end = el.selectionEnd ?? el.value.length;
+                          const before = el.value.slice(0, start);
+                          const after = el.value.slice(end);
+                          setInputText(before + emoji + after);
+                          requestAnimationFrame(() => {
+                            el.selectionStart = el.selectionEnd = start + emoji.length;
+                            el.focus();
+                          });
+                        }
+                        setShowEmoji(false);
+                      }}
+                      className="w-7 h-7 flex items-center justify-center text-base hover:bg-gray-600 rounded"
+                    >
+                      {emoji}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
           <button onClick={handlePickFile} className="flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center" title="发送文件">
             <svg className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />

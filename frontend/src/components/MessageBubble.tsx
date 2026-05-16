@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import type { ChatMessage } from "../types";
 import { readFileBase64, openFile, openFolder } from "../api";
 
-const MAX_PREVIEW_BYTES = 2 * 1024 * 1024; // 2MB
+const MAX_PREVIEW_BYTES = 20 * 1024 * 1024; // 20MB
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -21,7 +21,7 @@ function formatTime(ts: string): string {
 function isImageFile(name: string | null): boolean {
   if (!name) return false;
   const ext = name.split(".").pop()?.toLowerCase() ?? "";
-  return ["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext);
+  return ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tiff"].includes(ext);
 }
 
 function handleOpenFile(filePath: string | null) {
@@ -59,7 +59,7 @@ function ImagePreview({ filePath, fileSize }: { filePath: string; fileSize: numb
     <img
       src={src}
       alt=""
-      className="w-full max-h-[320px] object-cover cursor-pointer"
+      className="w-full max-h-[320px] object-contain cursor-pointer rounded"
       onClick={() => handleOpenFile(filePath)}
       onError={() => setFailed(true)}
     />
