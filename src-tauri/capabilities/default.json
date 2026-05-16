@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for Echo",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "dialog:default",
+    "dialog:allow-open"
+  ]
+}

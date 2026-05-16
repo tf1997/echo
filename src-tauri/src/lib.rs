@@ -21,6 +21,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let listen_port = std::env::var("ECHO_PORT")
                 .ok()

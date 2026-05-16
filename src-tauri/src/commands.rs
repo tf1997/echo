@@ -1,6 +1,8 @@
+use log::{error, info};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::chat::send_file_in_background;
 use crate::db::{ChatMessage, StoredPeer, UnreadCount, UserProfile};
 use crate::discovery::Peer;
 use crate::state::{AppState, RuntimeServices};
@@ -190,10 +192,13 @@ pub async fn send_message(
 
 #[tauri::command]
 pub async fn send_file(
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
     peer_id: String,
     file_path: String,
 ) -> Result<ChatMessage, String> {
+    info!("send_file: start");
+    let t0 = std::time::Instant::now();
     let runtime = state.runtime.lock().await;
     let Some(runtime) = runtime.as_ref() else {
         return Err("应用尚未初始化用户信息".to_string());
@@ -220,10 +225,51 @@ pub async fn send_file(
     };
     drop(discovery);
 
-    let chat = runtime.chat.lock().await;
-    chat.send_file(&peer, &file_path)
-        .await
-        .map_err(|e| e.to_string())
+    // Clone what we need and release the chat lock immediately
+    let (my_id, my_name, my_department, listen_port, db, peers_arc) = {
+        let chat = runtime.chat.lock().await;
+        (chat.my_id().to_string(), chat.my_name().to_string(), chat.my_department().to_string(), chat.listen_port(), chat.db().clone(), chat.peers().clone())
+    };
+    drop(runtime);
+
+    let file_name = std::path::Path::new(&file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Clone for placeholder (before moving into background task)
+    let placeholder_my_id = my_id.clone();
+    let placeholder_my_name = my_name.clone();
+    let placeholder_peer_id = peer.id.clone();
+
+    // Clone for background task
+    let bg_path = file_path.clone();
+    let bg_name = file_name.clone();
+    let bg_peer = peer.clone();
+    let handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        match send_file_in_background(&bg_path, &bg_name, &bg_peer, my_id, my_name, my_department, listen_port, db, peers_arc, handle).await {
+            Ok(msg) => info!("File sent: {}", msg.content),
+            Err(e) => error!("File send failed: {}", e),
+        }
+    });
+
+    info!("send_file: returning placeholder ({:?} total)", t0.elapsed());
+    use chrono::Utc;
+    Ok(ChatMessage {
+        id: 0,
+        sender_id: placeholder_my_id,
+        sender_name: placeholder_my_name,
+        receiver_id: placeholder_peer_id,
+        content: format!("📎 {}", file_name),
+        msg_type: "file".to_string(),
+        file_name: Some(file_name),
+        file_path: Some(file_path),
+        file_size: None,
+        timestamp: Utc::now().to_rfc3339(),
+        is_read: true,
+    })
 }
 
 #[derive(Serialize)]

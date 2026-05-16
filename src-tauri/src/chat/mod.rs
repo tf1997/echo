@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::db::Database;
 use crate::discovery::{Peer, PeerEntry};
+use tauri::Emitter;
 
 /// Wire protocol message sent between peers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +69,13 @@ impl ChatServer {
             peers,
         }
     }
+
+    pub fn my_id(&self) -> &str { &self.my_id }
+    pub fn my_name(&self) -> &str { &self.my_name }
+    pub fn my_department(&self) -> &str { &self.my_department }
+    pub fn listen_port(&self) -> u16 { self.listen_port }
+    pub fn db(&self) -> &Arc<Database> { &self.db }
+    pub fn peers(&self) -> &Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>> { &self.peers }
 
     pub fn update_identity(&mut self, username: &str, department: &str) {
         self.my_name = username.to_string();
@@ -323,34 +331,41 @@ impl ChatServer {
         Ok(saved)
     }
 
-    /// Send a file to a peer (reads file and sends as base64 in JSON over single connection).
-    pub async fn send_file(&self, peer: &Peer, file_path: &str) -> Result<crate::db::ChatMessage> {
-        use tokio::fs;
+    /// Send a file to a peer (streams the file, emits progress events).
+    pub async fn send_file(&self, peer: &Peer, file_path: &str, file_name: &str, app_handle: tauri::AppHandle) -> Result<crate::db::ChatMessage> {
+        use tokio::fs::File;
+        use tokio::io::AsyncReadExt;
 
-        let data = fs::read(file_path)
+        let metadata = tokio::fs::metadata(file_path)
             .await
-            .with_context(|| format!("Failed to read file: {}", file_path))?;
+            .with_context(|| format!("Failed to read metadata: {}", file_path))?;
+        let file_size = metadata.len();
 
-        let file_name = std::path::Path::new(file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let file_name = file_name.to_string();
 
-        let file_size = data.len() as u64;
+        // 48KB raw → 64KB base64 → fits in ~66KB JSON line (safe for BufReader)
+        const CHUNK_SIZE: usize = 48 * 1024;
+        let total_chunks = ((file_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE) as u64;
 
-        const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
-        let total_chunks = (data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let mut file = File::open(file_path)
+            .await
+            .with_context(|| format!("Failed to open file: {}", file_path))?;
 
-        // Open a single TCP connection for all chunks
         let mut stream = TcpStream::connect(peer.address())
             .await
             .with_context(|| format!("Failed to connect to peer {}", peer.address()))?;
 
-        for i in 0..total_chunks {
-            let start = i * CHUNK_SIZE;
-            let end = std::cmp::min(start + CHUNK_SIZE, data.len());
-            let chunk = &data[start..end];
+        let peers_list = self.build_known_peers();
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut i: u64 = 0;
+
+        loop {
+            let n = file.read(&mut buf).await
+                .with_context(|| format!("Failed to read file chunk {}", i))?;
+            if n == 0 {
+                break;
+            }
+            let is_last = n < CHUNK_SIZE || (file_size as usize) <= ((i as usize + 1) * CHUNK_SIZE);
 
             let msg = WireMessage {
                 sender_id: self.my_id.clone(),
@@ -358,23 +373,38 @@ impl ChatServer {
                 sender_department: self.my_department.clone(),
                 sender_port: self.listen_port,
                 receiver_id: peer.id.clone(),
-                content: base64_encode(chunk),
-                msg_type: if i == total_chunks - 1 {
-                    "file_end".to_string()
-                } else {
-                    "file_chunk".to_string()
-                },
+                content: base64_encode(&buf[..n]),
+                msg_type: if is_last { "file_end".to_string() } else { "file_chunk".to_string() },
                 file_name: Some(file_name.clone()),
                 file_size: Some(file_size),
                 file_data: None,
-                known_peers: self.build_known_peers(),
+                // Only include known_peers in first chunk (relay info, not needed per chunk)
+                known_peers: if i == 0 { peers_list.clone() } else { Vec::new() },
             };
 
             let json = serde_json::to_string(&msg).context("Failed to serialize message")?;
             stream.write_all(json.as_bytes()).await?;
             stream.write_all(b"\n").await?;
+            i += 1;
+
+            // Emit progress
+            let sent = std::cmp::min((i as usize) * CHUNK_SIZE, file_size as usize) as u64;
+            let _ = app_handle.emit("file-progress", serde_json::json!({
+                "fileName": file_name,
+                "sent": sent,
+                "total": file_size,
+            }));
         }
         stream.flush().await?;
+
+        // Emit complete
+        let _ = app_handle.emit("file-progress", serde_json::json!({
+            "fileName": file_name,
+            "sent": file_size,
+            "total": file_size,
+        }));
+
+        info!("File send complete: {} ({} bytes, {} chunks)", file_name, file_size, i);
 
         self.bump_last_seen(peer);
 
@@ -471,6 +501,110 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(input)
         .with_context(|| "Failed to decode base64")
+}
+
+/// Send a file in a background task (doesn't hold any long-lived locks).
+pub async fn send_file_in_background(
+    file_path: &str,
+    file_name: &str,
+    peer: &Peer,
+    my_id: String,
+    my_name: String,
+    my_department: String,
+    listen_port: u16,
+    db: Arc<Database>,
+    peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
+    app_handle: tauri::AppHandle,
+) -> Result<crate::db::ChatMessage> {
+    use tokio::fs::File;
+    use tokio::io::AsyncReadExt;
+
+    let metadata = tokio::fs::metadata(file_path).await
+        .with_context(|| format!("Failed to read metadata: {}", file_path))?;
+    let file_size = metadata.len();
+
+    const CHUNK_SIZE: usize = 48 * 1024;
+
+    let mut file = File::open(file_path).await
+        .with_context(|| format!("Failed to open file: {}", file_path))?;
+
+    let mut stream = TcpStream::connect(peer.address()).await
+        .with_context(|| format!("Failed to connect to peer {}", peer.address()))?;
+
+    // Build known_peers once
+    let peers_list: Vec<PeerEntry> = if let Ok(map) = peers.read() {
+        map.values().filter(|p| p.online).map(|p| PeerEntry {
+            id: p.id.clone(), username: p.username.clone(),
+            department: p.department.clone(), ip: p.ip.to_string(), port: p.port,
+        }).collect()
+    } else { Vec::new() };
+
+    // Emit start event immediately so UI shows progress bar
+    let _ = app_handle.emit("file-progress", serde_json::json!({
+        "fileName": file_name, "sent": 0, "total": file_size, "speed": 0,
+    }));
+
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut i: u64 = 0;
+    let start_time = std::time::Instant::now();
+
+    loop {
+        let n = file.read(&mut buf).await
+            .with_context(|| format!("Failed to read file chunk {}", i))?;
+        if n == 0 { break; }
+
+        let is_last = n < CHUNK_SIZE;
+        let msg = WireMessage {
+            sender_id: my_id.clone(), sender_name: my_name.clone(),
+            sender_department: my_department.clone(), sender_port: listen_port,
+            receiver_id: peer.id.clone(),
+            content: base64_encode(&buf[..n]),
+            msg_type: if is_last { "file_end".to_string() } else { "file_chunk".to_string() },
+            file_name: Some(file_name.to_string()), file_size: Some(file_size),
+            file_data: None,
+            known_peers: if i == 0 { peers_list.clone() } else { Vec::new() },
+        };
+
+        let json = serde_json::to_string(&msg).context("Failed to serialize message")?;
+        stream.write_all(json.as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+        i += 1;
+
+        let sent = std::cmp::min((i as usize) * CHUNK_SIZE, file_size as usize) as u64;
+        let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
+        let speed = (sent as f64 / elapsed) as u64; // bytes/sec
+        let _ = app_handle.emit("file-progress", serde_json::json!({
+            "fileName": file_name, "sent": sent, "total": file_size, "speed": speed,
+        }));
+    }
+    stream.flush().await?;
+
+    let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
+    let speed = (file_size as f64 / elapsed) as u64;
+    let _ = app_handle.emit("file-progress", serde_json::json!({
+        "fileName": file_name, "sent": file_size, "total": file_size, "speed": speed,
+    }));
+
+    info!("File send complete: {} ({} bytes, {} chunks)", file_name, file_size, i);
+
+    // Save to DB
+    let saved = db.save_message(&my_id, &my_name, &peer.id,
+        &format!("📎 {}", file_name), "file",
+        Some(file_path), Some(file_name), Some(file_size as i64),
+    ).await?;
+
+    // Update peer last_seen
+    {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        if let Ok(mut map) = peers.write() {
+            if let Some(existing) = map.values_mut().find(|p| p.ip == peer.ip && p.port == peer.port) {
+                existing.online = true;
+                existing.last_seen = now;
+            }
+        }
+    }
+
+    Ok(saved)
 }
 
 fn save_received_file(data: &[u8], filename: &str) -> Result<String> {

@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import type { ChatMessage, Peer } from "../types";
 import { MessageBubble } from "./MessageBubble";
 import { saveTempFile } from "../api";
+import { open } from "@tauri-apps/plugin-dialog";
 
 export interface PendingMessage {
   id: number;
@@ -10,8 +11,10 @@ export interface PendingMessage {
   file_name?: string;
   file_path?: string;
   file_size?: number;
-  status: "sending" | "failed";
+  status: "sending" | "failed" | "sent";
   error?: string;
+  progress?: number; // 0-100
+  speed?: number; // bytes/sec
 }
 
 interface ChatWindowProps {
@@ -19,7 +22,7 @@ interface ChatWindowProps {
   messages: ChatMessage[];
   myId: string;
   onSendMessage: (content: string) => Promise<ChatMessage>;
-  onSendFile: (filePath: string) => Promise<ChatMessage>;
+  onSendFile: (filePath: string) => Promise<void | ChatMessage>;
 }
 
 let pendingId = Date.now();
@@ -30,10 +33,42 @@ async function readFileAndSave(file: File): Promise<string> {
   return await saveTempFile(data, file.name || "file");
 }
 
+function formatSpeed(bytesPerSec: number | undefined): string {
+  if (!bytesPerSec || bytesPerSec === 0) return "";
+  if (bytesPerSec >= 1_000_000) return `${(bytesPerSec / 1_000_000).toFixed(1)} MB/s`;
+  if (bytesPerSec >= 1_000) return `${(bytesPerSec / 1_000).toFixed(0)} KB/s`;
+  return `${bytesPerSec} B/s`;
+}
+
 export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: ChatWindowProps) {
   const [inputText, setInputText] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
+
+  // Listen for file send progress
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    import("@tauri-apps/api/event").then(({ listen }) => {
+      listen<{ fileName: string; sent: number; total: number; speed: number }>("file-progress", (event) => {
+        const { fileName, sent, total, speed } = event.payload;
+        const pct = total > 0 ? Math.round((sent / total) * 100) : 0;
+        setPendingMessages((prev) =>
+          prev.map((p) =>
+            p.file_name === fileName
+              ? { ...p, progress: pct, speed, status: pct >= 100 ? "sent" as const : p.status }
+              : p
+          )
+        );
+        // Remove pending after 2s (real message will be in DB by then)
+        if (pct >= 100) {
+          setTimeout(() => {
+            setPendingMessages((prev) => prev.filter((p) => p.file_name !== fileName));
+          }, 2000);
+        }
+      }).then((fn) => { unlisten = fn; });
+    });
+    return () => { unlisten?.(); };
+  }, []);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -145,8 +180,11 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
       // @ts-expect-error Tauri adds path property on drag events
       const filePath: string = file.path;
       if (filePath) {
-        await onSendFile(filePath);
-        setPendingMessages((prev) => prev.filter((p) => p.id !== tempId));
+        onSendFile(filePath).catch((e) => {
+          setPendingMessages((prev) => prev.map((p) =>
+            p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
+          ));
+        });
         return;
       }
     } catch {
@@ -155,8 +193,11 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
 
     try {
       const savedPath = await readFileAndSave(file);
-      await onSendFile(savedPath);
-      setPendingMessages((prev) => prev.filter((p) => p.id !== tempId));
+      onSendFile(savedPath).catch((e) => {
+        setPendingMessages((prev) => prev.map((p) =>
+          p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
+        ));
+      });
     } catch (e) {
       setPendingMessages((prev) => prev.map((p) =>
         p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
@@ -189,7 +230,24 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
     }
   }, [peer, sendFileToPeer]);
 
-  const handlePickFile = () => fileInputRef.current?.click();
+  const handlePickFile = async () => {
+    const selected = await open({ multiple: true });
+    if (!selected) return;
+    const paths = Array.isArray(selected) ? selected : [selected];
+    for (const filePath of paths) {
+      const name = filePath.replace(/\\/g, "/").split("/").pop() || "file";
+      nearBottomRef.current = true;
+      const tempId = ++pendingId;
+      setPendingMessages((prev) => [...prev, {
+        id: tempId, content: `📎 ${name}`, msg_type: "file", file_name: name, status: "sending",
+      }]);
+      onSendFile(filePath).catch((e) => {
+        setPendingMessages((prev) => prev.map((p) =>
+          p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
+        ));
+      });
+    }
+  };
 
   const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files || !peer) return;
@@ -281,8 +339,15 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
                         <p className="text-sm whitespace-pre-wrap break-words">{item.content}</p>
                       )}
                     </div>
+                    {item.msg_type === "file" && item.status === "sending" && item.progress !== undefined && (
+                      <div className="w-full bg-gray-700 rounded-full h-1.5 mt-1.5">
+                        <div className="bg-indigo-400 h-1.5 rounded-full transition-all" style={{ width: `${item.progress}%` }} />
+                      </div>
+                    )}
                     <div className="flex items-center gap-2 mt-1">
-                      <span className="text-[10px] text-gray-500">{item.status === "failed" ? "发送失败" : "发送中..."}</span>
+                      <span className="text-[10px] text-gray-500">
+                        {item.status === "failed" ? "发送失败" : item.msg_type === "file" && item.progress !== undefined ? `${item.progress}% ${formatSpeed(item.speed)}` : "发送中..."}
+                      </span>
                       {item.status === "failed" && (
                         <button
                           onClick={() => {

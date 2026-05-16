@@ -171,9 +171,8 @@ function App() {
 
   const handleSendFile = useCallback(async (filePath: string) => {
     if (!selectedPeer) throw new Error("未选择联系人");
-    const sent = await sendFile(selectedPeer.id, filePath);
-    setMessages((prev) => [...prev, sent]);
-    return sent;
+    // Fire-and-forget: pending message shows progress, real message arrives via poll
+    sendFile(selectedPeer.id, filePath).catch(console.error);
   }, [selectedPeer]);
 
   const handleSaveProfile = useCallback(async () => {
