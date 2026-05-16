@@ -193,6 +193,8 @@ pub fn run() {
             commands::set_scan_subnets,
             commands::list_emoji_files,
             commands::add_emoji_file,
+            commands::list_recent_contacts,
+            commands::remove_recent_contact,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Echo");

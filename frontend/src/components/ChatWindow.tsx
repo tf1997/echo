@@ -106,11 +106,14 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const nearBottomRef = useRef(true);
 
-  // Clear pending when switching peers + focus input
+  const pendingScrollRef = useRef(false);
+
+  // Clear pending when switching peers + focus input + mark pending scroll
   useEffect(() => {
     setPendingMessages([]);
+    nearBottomRef.current = true;
+    pendingScrollRef.current = true;
     if (peer) {
-      // Small delay to let React finish rendering
       requestAnimationFrame(() => inputRef.current?.focus());
     }
   }, [peer?.id]);
@@ -122,7 +125,12 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
   }, []);
 
   useEffect(() => {
-    if (nearBottomRef.current) {
+    if (pendingScrollRef.current) {
+      pendingScrollRef.current = false;
+      requestAnimationFrame(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "instant" });
+      });
+    } else if (nearBottomRef.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages, pendingMessages]);

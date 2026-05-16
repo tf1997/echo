@@ -5,6 +5,7 @@ export interface Peer {
   ip: string;
   port: number;
   online: boolean;
+  last_seen?: number;
 }
 
 export interface StoredPeer {

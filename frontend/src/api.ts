@@ -61,6 +61,14 @@ export async function addEmojiFile(sourcePath: string): Promise<string> {
   return await invoke("add_emoji_file", { sourcePath });
 }
 
+export async function listRecentContacts(): Promise<StoredPeer[]> {
+  return await invoke("list_recent_contacts");
+}
+
+export async function removeRecentContact(peerId: string): Promise<void> {
+  await invoke("remove_recent_contact", { peerId });
+}
+
 export async function saveTempFile(data: number[], filename: string): Promise<string> {
   return await invoke("save_temp_file", { data, filename });
 }

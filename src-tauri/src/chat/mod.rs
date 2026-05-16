@@ -141,6 +141,9 @@ impl ChatServer {
                 Ok(msg) => {
                     let msg_type = msg.msg_type.as_str();
 
+                    // Mark sender as recent contact
+                    let _ = db.add_recent_contact(&msg.sender_id).await;
+
                     // Register the sender as a peer in DB
                     if let Err(e) = db
                         .upsert_peer(
@@ -313,6 +316,9 @@ impl ChatServer {
         };
 
         self.send_wire_message(peer, &msg).await?;
+
+        // Mark as recent contact
+        let _ = self.db.add_recent_contact(&peer.id).await;
 
         // Save outgoing message to DB
         let saved = self.db
@@ -586,6 +592,9 @@ pub async fn send_file_in_background(
     }));
 
     info!("File send complete: {} ({} bytes, {} chunks)", file_name, file_size, i);
+
+    // Mark as recent contact
+    let _ = db.add_recent_contact(&peer.id).await;
 
     // Save to DB
     let saved = db.save_message(&my_id, &my_name, &peer.id,

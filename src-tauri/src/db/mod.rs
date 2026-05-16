@@ -156,9 +156,65 @@ impl Database {
         .await
         .context("Failed to create messages search index")?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS recent_contacts (
+                peer_id TEXT PRIMARY KEY,
+                added_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create recent_contacts table")?;
+
         info!("Database initialized successfully.");
         Ok(())
     }
+
+    pub async fn add_recent_contact(&self, peer_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        log::info!("add_recent_contact: {}", peer_id);
+        sqlx::query("INSERT INTO recent_contacts (peer_id, added_at) VALUES (?, ?) ON CONFLICT(peer_id) DO UPDATE SET added_at = excluded.added_at")
+            .bind(peer_id).bind(&now)
+            .execute(&self.pool).await
+            .context("Failed to add recent contact")?;
+        Ok(())
+    }
+
+    pub async fn list_recent_contacts(&self) -> Result<Vec<StoredPeer>> {
+        let rows = sqlx::query(
+            "SELECT r.peer_id, COALESCE(p.username, r.peer_id) as username,
+                    COALESCE(p.department, '') as department,
+                    COALESCE(p.ip, '') as ip, COALESCE(p.port, 0) as port,
+                    COALESCE(p.is_online, 0) as is_online,
+                    COALESCE(p.first_seen_at, '') as first_seen_at,
+                    COALESCE(p.last_seen_at, '') as last_seen_at
+             FROM recent_contacts r
+             LEFT JOIN peers p ON r.peer_id = p.peer_id
+             ORDER BY r.added_at DESC",
+        )
+        .fetch_all(&self.pool).await
+        .context("Failed to list recent contacts")?;
+
+        Ok(rows.iter().map(|r| StoredPeer {
+            peer_id: r.get("peer_id"),
+            username: r.get("username"),
+            department: r.get("department"),
+            ip: r.get("ip"),
+            port: r.get::<i64, _>("port") as u16,
+            is_online: r.get::<bool, _>("is_online"),
+            first_seen_at: r.get("first_seen_at"),
+            last_seen_at: r.get("last_seen_at"),
+        }).collect())
+    }
+
+    pub async fn remove_recent_contact(&self, peer_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM recent_contacts WHERE peer_id = ?")
+            .bind(peer_id)
+            .execute(&self.pool).await
+            .context("Failed to remove recent contact")?;
+        Ok(())
+    }
+
 
     pub async fn get_user_profile(&self) -> Result<Option<UserProfile>> {
         let row = sqlx::query("SELECT peer_id, username, department FROM user_profile WHERE id = 1")

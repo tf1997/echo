@@ -724,6 +724,19 @@ pub fn add_emoji_file(source_path: String) -> Result<String, String> {
     Ok(dest.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+pub async fn list_recent_contacts(state: State<'_, AppState>) -> Result<Vec<StoredPeer>, String> {
+    log::info!("list_recent_contacts COMMAND called");
+    let result = state.db.list_recent_contacts().await.map_err(|e| e.to_string())?;
+    log::info!("list_recent_contacts: {} entries", result.len());
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn remove_recent_contact(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
+    state.db.remove_recent_contact(&peer_id).await.map_err(|e| e.to_string())
+}
+
 fn emoji_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))

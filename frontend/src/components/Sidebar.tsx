@@ -1,6 +1,6 @@
-import { useState, useCallback } from "react";
-import type { Peer, UnreadCount } from "../types";
-import { searchMessages, discoverByIp } from "../api";
+import { useState, useCallback, useEffect } from "react";
+import type { Peer, UnreadCount, StoredPeer } from "../types";
+import { searchMessages, discoverByIp, listRecentContacts, removeRecentContact } from "../api";
 import type { SearchResult } from "../api";
 
 interface SidebarProps {
@@ -28,6 +28,16 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   const [copied, setCopied] = useState("");
   const [subnetInput, setSubnetInput] = useState(scanSubnets.join(", "));
   const [savingSubnets, setSavingSubnets] = useState(false);
+  const [tab, setTab] = useState<"recent" | "contacts">("recent");
+  const [recentContacts, setRecentContacts] = useState<StoredPeer[]>([]);
+
+  // Fetch recent contacts when tab switches or peers change
+  useEffect(() => { listRecentContacts().then(setRecentContacts).catch(() => {}); }, [peers, tab]);
+
+  const handleRemoveRecent = useCallback(async (peerId: string) => {
+    await removeRecentContact(peerId).catch(() => {});
+    setRecentContacts((prev) => prev.filter((r) => r.peer_id !== peerId));
+  }, []);
 
   const handleSaveSubnets = useCallback(async () => {
     setSavingSubnets(true);
@@ -52,8 +62,18 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
     }
   }, []);
 
-  const onlinePeers = peers.filter((p) => p.online);
-  const offlinePeers = peers.filter((p) => !p.online);
+  // Group peers by department for "contacts" tab
+  const deptGroups = new Map<string, Peer[]>();
+  for (const p of peers) {
+    const dept = p.department || "未分组";
+    if (!deptGroups.has(dept)) deptGroups.set(dept, []);
+    deptGroups.get(dept)!.push(p);
+  }
+  const sortedDepts = [...deptGroups.keys()].sort((a, b) => {
+    if (a === "未分组") return 1;
+    if (b === "未分组") return -1;
+    return a.localeCompare(b);
+  });
 
   const unreadMap = new Map<string, number>();
   for (const uc of unreadCounts) {
@@ -299,24 +319,43 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
           )}
         </div>
       ) : (
-        <div className="flex-1 overflow-y-auto">
-          {onlinePeers.length > 0 && (
-            <div>
-              <p className="px-4 py-2 text-xs text-gray-400 font-medium uppercase tracking-wider">在线 — {onlinePeers.length}</p>
-              {onlinePeers.map((peer) => (
-                <PeerItem key={peer.id} peer={peer} isSelected={selectedPeerId === peer.id} unread={unreadMap.get(peer.id) ?? 0} onClick={() => onSelectPeer(peer)} />
-              ))}
-            </div>
-          )}
+        <div className="flex-1 flex flex-col min-h-0">
+          {/* Tabs */}
+          <div className="flex border-b border-gray-700">
+            <button onClick={() => { setTab("recent"); listRecentContacts().then(setRecentContacts).catch(() => {}); }} className={`flex-1 py-2 text-xs font-medium ${tab === "recent" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>最近</button>
+            <button onClick={() => setTab("contacts")} className={`flex-1 py-2 text-xs font-medium ${tab === "contacts" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>联系人</button>
+          </div>
 
-          {offlinePeers.length > 0 && (
-            <div>
-              <p className="px-4 py-2 text-xs text-gray-400 font-medium uppercase tracking-wider">离线/历史 — {offlinePeers.length}</p>
-              {offlinePeers.map((peer) => (
-                <PeerItem key={peer.id} peer={peer} isSelected={selectedPeerId === peer.id} unread={unreadMap.get(peer.id) ?? 0} onClick={() => onSelectPeer(peer)} />
-              ))}
-            </div>
-          )}
+          {/* Tab content */}
+          <div className="flex-1 overflow-y-auto">
+            {tab === "recent" ? (
+              recentContacts.length === 0 ? (
+                <p className="px-4 py-8 text-xs text-gray-500 text-center">暂无最近联系人</p>
+              ) : (
+                recentContacts.map(r => {
+                  const peer: Peer = { id: r.peer_id, username: r.username, department: r.department, ip: r.ip, port: r.port, online: r.is_online, last_seen: r.last_seen_at ? new Date(r.last_seen_at).getTime() / 1000 : undefined };
+                  return (
+                    <div key={r.peer_id} className="group relative">
+                      <PeerItem peer={peer} isSelected={selectedPeerId === r.peer_id} unread={unreadMap.get(r.peer_id) ?? 0} onClick={() => onSelectPeer(peer)} />
+                      <button onClick={(e) => { e.stopPropagation(); handleRemoveRecent(r.peer_id); }} className="absolute right-2 top-3 hidden group-hover:flex w-5 h-5 rounded-full bg-gray-600 hover:bg-red-600 items-center justify-center text-[10px]" title="移除">×</button>
+                    </div>
+                  );
+                })
+              )
+            ) : (
+              <>
+                {sortedDepts.map(dept => (
+                  <div key={dept}>
+                    <p className="px-4 py-2 text-xs text-gray-400 font-medium uppercase tracking-wider">{dept} — {(deptGroups.get(dept) || []).length}</p>
+                    {(deptGroups.get(dept) || []).map(peer => (
+                      <PeerItem key={peer.id} peer={peer} isSelected={selectedPeerId === peer.id} unread={unreadMap.get(peer.id) ?? 0} onClick={() => onSelectPeer(peer)} />
+                    ))}
+                  </div>
+                ))}
+                {peers.length === 0 && <p className="px-4 py-8 text-xs text-gray-500 text-center">暂无联系人</p>}
+              </>
+            )}
+          </div>
         </div>
       )}
 
