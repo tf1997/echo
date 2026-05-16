@@ -7,7 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::db::Database;
-use crate::discovery::Peer;
+use crate::discovery::{Peer, PeerEntry};
 
 /// Wire protocol message sent between peers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +22,8 @@ pub struct WireMessage {
     pub file_name: Option<String>,
     pub file_size: Option<u64>,
     pub file_data: Option<Vec<u8>>, // base64 encoded in JSON
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_peers: Vec<PeerEntry>,
 }
 
 /// Events forwarded to the frontend.
@@ -147,7 +149,6 @@ impl ChatServer {
                     }
 
                     // Also register in the in-memory peers map so UI picks it up immediately.
-                    // Use IP:port as the unique key to prevent duplicates.
                     {
                         let remote_ip = match peer_addr.ip() {
                             std::net::IpAddr::V4(ip) => std::net::IpAddr::V4(ip),
@@ -163,17 +164,29 @@ impl ChatServer {
                         );
                         if let Ok(mut map) = peers.write() {
                             let is_new = !map.contains_key(&pid);
-                            // Also check IP:port dedup
                             let already = map.values().any(|p| p.ip == remote_ip && p.port == msg.sender_port);
                             if is_new && !already {
                                 map.insert(pid.clone(), new_peer.clone());
                                 info!("Auto-registered sender as peer: {}", new_peer);
                             } else if already {
-                                // Update existing
                                 if let Some(existing) = map.values_mut().find(|p| p.ip == remote_ip && p.port == msg.sender_port) {
                                     existing.username = msg.sender_name.clone();
                                     existing.department = msg.sender_department.clone();
                                     existing.online = true;
+                                }
+                            }
+
+                            // Process sender's known_peers (bidirectional relay via chat)
+                            for entry in &msg.known_peers {
+                                if entry.id != my_id && !map.contains_key(&entry.id) {
+                                    if let Ok(entry_ip) = entry.ip.parse::<std::net::IpAddr>() {
+                                        let relay = Peer::new(
+                                            entry.id.clone(), entry.username.clone(),
+                                            entry.department.clone(), entry_ip, entry.port,
+                                        );
+                                        map.insert(entry.id.clone(), relay.clone());
+                                        info!("Chat relay: discovered {} via {}", entry.username, msg.sender_name);
+                                    }
                                 }
                             }
                         }
@@ -288,6 +301,7 @@ impl ChatServer {
             file_name: None,
             file_size: None,
             file_data: None,
+            known_peers: self.build_known_peers(),
         };
 
         self.send_wire_message(peer, &msg).await?;
@@ -353,6 +367,7 @@ impl ChatServer {
                 file_name: Some(file_name.clone()),
                 file_size: Some(file_size),
                 file_data: None,
+                known_peers: self.build_known_peers(),
             };
 
             let json = serde_json::to_string(&msg).context("Failed to serialize message")?;
@@ -397,6 +412,23 @@ impl ChatServer {
         self.bump_last_seen(peer);
 
         Ok(())
+    }
+
+    fn build_known_peers(&self) -> Vec<PeerEntry> {
+        if let Ok(map) = self.peers.read() {
+            map.values()
+                .filter(|p| p.online)
+                .map(|p| PeerEntry {
+                    id: p.id.clone(),
+                    username: p.username.clone(),
+                    department: p.department.clone(),
+                    ip: p.ip.to_string(),
+                    port: p.port,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn bump_last_seen(&self, peer: &Peer) {

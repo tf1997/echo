@@ -267,39 +267,60 @@ pub async fn discover_by_ip(
     };
 
     // Send our announce as a unicast UDP probe to the remote peer's discovery port.
-    // This triggers the remote peer to register us AND send back a unicast response.
+    // Include our own known_peers so they also get our contacts (bidirectional relay).
+    let our_known: Vec<serde_json::Value> = {
+        let runtime = state.runtime.lock().await;
+        if let Some(runtime) = runtime.as_ref() {
+            runtime.discovery.lock().await.get_peers().into_iter()
+                .filter(|p| p.online)
+                .map(|p| serde_json::json!({
+                    "id": p.id, "username": p.username, "department": p.department,
+                    "ip": p.ip.to_string(), "port": p.port,
+                }))
+                .collect()
+        } else { vec![] }
+    };
+
     let probe = serde_json::json!({
         "id": my_id,
         "username": my_profile.as_ref().map(|p| p.username.as_str()).unwrap_or(""),
         "department": my_profile.as_ref().map(|p| p.department.as_str()).unwrap_or(""),
         "ip": "",
         "port": my_port,
+        "known_peers": our_known,
     });
 
     let probe_bytes = serde_json::to_vec(&probe).unwrap_or_default();
-    let target = format!("{}:{}", ip, 9529u16);
-    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        let _ = sock.set_broadcast(true);
-        let _ = sock.send_to(&probe_bytes, &target);
-    }
+    let target = format!("{}:{}", ip, port + 2);
 
-    // Wait briefly for the remote peer's unicast response to arrive
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // Check if the peer was auto-registered from the unicast response
+    // Send UDP probe up to 3 times, waiting 1s between each
     let parsed_ip: std::net::IpAddr = ip.parse().map_err(|e| format!("无效 IP: {}", e))?;
+    let mut existing = None;
 
-    let existing = {
-        let runtime = state.runtime.lock().await;
-        if let Some(runtime) = runtime.as_ref() {
-            let disc = runtime.discovery.lock().await;
-            disc.get_peers()
-                .into_iter()
-                .find(|p| p.ip == parsed_ip && p.port == port)
-        } else {
-            None
+    for attempt in 0..3 {
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            let _ = sock.set_broadcast(true);
+            let _ = sock.send_to(&probe_bytes, &target);
         }
-    };
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Check if the peer was auto-registered from the unicast response
+        let found = {
+            let runtime = state.runtime.lock().await;
+            if let Some(runtime) = runtime.as_ref() {
+                runtime.discovery.lock().await
+                    .get_peers().into_iter()
+                    .find(|p| p.ip == parsed_ip && p.port == port)
+            } else { None }
+        };
+
+        if let Some(f) = found {
+            existing = Some(f);
+            break;
+        }
+        log::info!("UDP probe attempt {} for {}:{} — no response yet", attempt + 1, ip, port);
+    }
 
     if let Some(found) = existing {
         return Ok(DiscoverResult {

@@ -2,6 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::IpAddr;
 
+/// Lightweight peer info for peer relay lists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerEntry {
+    pub id: String,
+    pub username: String,
+    pub department: String,
+    pub ip: String,
+    pub port: u16,
+}
+
 /// Represents a discovered peer on the local network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {

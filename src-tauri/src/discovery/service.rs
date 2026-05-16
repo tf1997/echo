@@ -189,7 +189,7 @@ impl DiscoveryService {
         });
 
         // Also start LAN discovery (broadcast + multicast + unicast response)
-        let discovery_port = 9529u16;
+        let discovery_port = self.config.listen_port + 2;
         let lan_config = LanDiscoveryConfig {
             peer_id: self.config.peer_id.clone(),
             username: self.config.username.clone(),

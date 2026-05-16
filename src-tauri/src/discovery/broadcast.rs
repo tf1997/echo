@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use super::peer::Peer;
+use super::peer::{Peer, PeerEntry};
 
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 42);
 const ANNOUNCE_INTERVAL_SECS: u64 = 3;
@@ -30,15 +30,6 @@ struct AnnouncePacket {
     /// Optional: list of peers this node knows about (for peer relay / 网桥)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     known_peers: Vec<PeerEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PeerEntry {
-    id: String,
-    username: String,
-    department: String,
-    ip: String,
-    port: u16,
 }
 
 /// Configuration for LAN discovery.
@@ -390,8 +381,11 @@ impl LanDiscovery {
                         Err(_) => continue,
                     };
 
+                    info!("UDP recv: id={} from {} ({} known_peers)", packet.id, src_addr, packet.known_peers.len());
+
                     // Skip self
                     if packet.id == my_info.id {
+                        debug!("UDP recv: skipping self");
                         continue;
                     }
 
@@ -453,15 +447,43 @@ impl LanDiscovery {
                             }
                         }
                     }
-                    drop(peers_map);
+                    // Collect existing contacts BEFORE dropping the write lock
+                    let existing_targets: Vec<SocketAddr> = peers_map.iter()
+                        .filter(|(id, p)| *id != &packet.id && p.online)
+                        .map(|(_, p)| SocketAddr::new(p.ip, p.port + 2))
+                        .collect();
+
+                    drop(peers_map); // Release write lock so build_announce_data can read
 
                     if is_new {
                         info!("LAN discovered NEW peer: {}", peer);
 
-                        // Unicast response with our own peer list (peer relay)
+                        // Unicast response + our known_peers to the new peer
+                        let remote_discovery_port = packet.port + 2;
                         let response_data = Self::build_announce_data(&my_info, &peers);
-                        let response_target = SocketAddr::new(remote_ip, discovery_port);
+                        let response_target = SocketAddr::new(remote_ip, remote_discovery_port);
+                        info!("UDP response to {} ({} bytes)", response_target, response_data.len());
                         let _ = socket.send_to(&response_data, response_target);
+
+                        // Tell ALL our existing contacts about this new peer
+                        let intro = AnnouncePacket {
+                            id: my_info.id.clone(),
+                            username: my_info.username.clone(),
+                            department: my_info.department.clone(),
+                            ip: my_info.ip.clone(),
+                            port: my_info.port,
+                            known_peers: vec![PeerEntry {
+                                id: peer.id.clone(),
+                                username: peer.username.clone(),
+                                department: peer.department.clone(),
+                                ip: remote_ip.to_string(),
+                                port: packet.port,
+                            }],
+                        };
+                        let intro_bytes = serde_json::to_vec(&intro).unwrap_or_default();
+                        for target in &existing_targets {
+                            let _ = socket.send_to(&intro_bytes, *target);
+                        }
                     }
                 }
                 Err(ref e)
