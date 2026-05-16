@@ -25,6 +25,8 @@ pub struct WireMessage {
     pub file_data: Option<Vec<u8>>, // base64 encoded in JSON
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_peers: Vec<PeerEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
 }
 
 /// Events forwarded to the frontend.
@@ -144,6 +146,25 @@ impl ChatServer {
                     // Mark sender as recent contact
                     let _ = db.add_recent_contact(&msg.sender_id).await;
 
+                    // Auto-join/discover group for system messages
+                    if let Some(ref gid) = msg.group_id {
+                        if msg.msg_type == "group_created" {
+                            // Parse member list from content JSON: {"name":"...","member_ids":[...]}
+                            let all_members: Vec<String> = serde_json::from_str::<serde_json::Value>(&msg.content).ok()
+                                .and_then(|v| v["member_ids"].as_array().cloned())
+                                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                                .unwrap_or_else(|| vec![msg.sender_id.clone(), my_id.clone()]);
+                            let group_name = serde_json::from_str::<serde_json::Value>(&msg.content).ok()
+                                .and_then(|v| v["name"].as_str().map(|s| s.to_string()))
+                                .unwrap_or_else(|| msg.content.clone());
+                            let _ = db.create_group(gid, &group_name, &msg.sender_id, &all_members).await;
+                            info!("Joined new group {} ({} members)", group_name, all_members.len());
+                        } else if msg.msg_type == "group_dissolved" {
+                            let _ = db.remove_group_member(gid, &my_id).await;
+                            info!("Group {} dissolved — removed", gid);
+                        }
+                    }
+
                     // Register the sender as a peer in DB
                     if let Err(e) = db
                         .upsert_peer(
@@ -258,24 +279,25 @@ impl ChatServer {
                             file_sender_id = None;
                             file_sender_name = None;
                         }
+                        "group_created" | "group_dissolved" => {
+                            // System notifications — already handled above, don't save as message
+                        }
                         _ => {
                             // Text or other message types
                             info!("Received message from {}: {}", msg.sender_name, msg.content);
 
-                            if let Err(e) = db
-                                .save_message(
-                                    &msg.sender_id,
-                                    &msg.sender_name,
-                                    &my_id,
-                                    &msg.content,
-                                    &msg.msg_type,
-                                    msg.file_name.as_deref(),
-                                    None,
-                                    msg.file_size.map(|s| s as i64),
-                                )
-                                .await
-                            {
-                                error!("Failed to save incoming message: {}", e);
+                            if let Some(ref gid) = msg.group_id {
+                                // Group message — save with group_id
+                                let _ = db.save_group_message(gid, &msg.sender_id, &msg.sender_name, &msg.content, &msg.msg_type, None, None, None).await;
+                                // Auto-join if needed
+                                let my_groups = db.list_groups(&my_id).await.unwrap_or_default();
+                                if !my_groups.iter().any(|g| g.group_id == *gid) {
+                                    let _ = db.add_group_members(gid, &[my_id.clone()]).await;
+                                    info!("Auto-joined group {} from message", gid);
+                                }
+                            } else {
+                                // Private message
+                                let _ = db.save_message(&msg.sender_id, &msg.sender_name, &my_id, &msg.content, &msg.msg_type, msg.file_name.as_deref(), None, msg.file_size.map(|s| s as i64)).await;
                             }
 
                             let _ = incoming_tx.send(IncomingMessage {
@@ -313,6 +335,7 @@ impl ChatServer {
             file_size: None,
             file_data: None,
             known_peers: self.build_known_peers(),
+            group_id: None,
         };
 
         self.send_wire_message(peer, &msg).await?;
@@ -386,6 +409,7 @@ impl ChatServer {
                 file_data: None,
                 // Only include known_peers in first chunk (relay info, not needed per chunk)
                 known_peers: if i == 0 { peers_list.clone() } else { Vec::new() },
+                group_id: None,
             };
 
             let json = serde_json::to_string(&msg).context("Failed to serialize message")?;
@@ -569,6 +593,7 @@ pub async fn send_file_in_background(
             file_name: Some(file_name.to_string()), file_size: Some(file_size),
             file_data: None,
             known_peers: if i == 0 { peers_list.clone() } else { Vec::new() },
+            group_id: None,
         };
 
         let json = serde_json::to_string(&msg).context("Failed to serialize message")?;

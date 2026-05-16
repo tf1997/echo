@@ -69,6 +69,47 @@ export async function removeRecentContact(peerId: string): Promise<void> {
   await invoke("remove_recent_contact", { peerId });
 }
 
+// Group APIs
+export interface GroupInfo {
+  group_id: string;
+  name: string;
+  creator_id: string;
+  created_at: string;
+  members: StoredPeer[];
+}
+
+export async function createGroup(name: string, members: string[]): Promise<GroupInfo> {
+  return await invoke("create_group", { payload: { name, members } });
+}
+
+export async function listGroups(): Promise<GroupInfo[]> {
+  return await invoke("list_groups");
+}
+
+export async function sendGroupMessage(groupId: string, content: string): Promise<ChatMessage> {
+  return await invoke("send_group_message", { groupId, content });
+}
+
+export async function getGroupMessages(groupId: string): Promise<ChatMessage[]> {
+  return await invoke("get_group_messages", { groupId });
+}
+
+export async function renameGroup(groupId: string, newName: string): Promise<void> {
+  await invoke("rename_group", { groupId, newName });
+}
+
+export async function leaveGroup(groupId: string): Promise<void> {
+  await invoke("leave_group", { groupId });
+}
+
+export async function inviteToGroup(groupId: string, members: string[]): Promise<void> {
+  await invoke("invite_to_group", { groupId, members });
+}
+
+export async function dissolveGroup(groupId: string): Promise<void> {
+  await invoke("dissolve_group", { groupId });
+}
+
 export async function saveTempFile(data: number[], filename: string): Promise<string> {
   return await invoke("save_temp_file", { data, filename });
 }

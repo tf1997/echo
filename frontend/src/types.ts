@@ -51,3 +51,11 @@ export interface UnreadCount {
   peer_id: string;
   count: number;
 }
+
+export interface GroupInfo {
+  group_id: string;
+  name: string;
+  creator_id: string;
+  created_at: string;
+  members: StoredPeer[];
+}

@@ -16,7 +16,11 @@ import {
   getUnreadCounts,
   getScanSubnets,
   setScanSubnets,
+  getGroupMessages,
+  sendGroupMessage,
+  listGroups,
 } from "./api";
+import type { GroupInfo } from "./api";
 
 function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
@@ -33,6 +37,8 @@ function App() {
   const [profileError, setProfileError] = useState("");
   const [editingProfile, setEditingProfile] = useState(false);
   const [scanSubnets, setScanSubnetsState] = useState<string[]>([]);
+  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
+  const [groups, setGroups] = useState<GroupInfo[]>([]);
 
   const mergePeers = useCallback((onlinePeers: Peer[], stored: StoredPeer[]): Peer[] => {
     const map = new Map<string, Peer>();
@@ -130,27 +136,44 @@ function App() {
 
   useEffect(() => {
     if (!appInfo?.initialized || !selectedPeer) return;
-
     const interval = setInterval(() => {
       const activePeerId = selectedPeer.id;
-      getConversation(activePeerId)
-        .then(setMessages)
-        .catch(console.error);
+      getConversation(activePeerId).then(setMessages).catch(console.error);
       markRead(activePeerId).catch(console.error);
     }, 1000);
-
     return () => clearInterval(interval);
   }, [appInfo?.initialized, selectedPeer]);
 
+  // Poll group messages
+  useEffect(() => {
+    if (!appInfo?.initialized || !selectedGroupId) return;
+    const interval = setInterval(() => {
+      getGroupMessages(selectedGroupId).then(setMessages).catch(console.error);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [appInfo?.initialized, selectedGroupId]);
+
+  // Load groups
+  useEffect(() => {
+    if (!appInfo?.initialized) return;
+    const interval = setInterval(() => { listGroups().then((gs) => {
+      setGroups(gs);
+      // Deselect if current group was dissolved
+      setSelectedGroupId((prev) => prev && !gs.some((g) => g.group_id === prev) ? null : prev);
+    }).catch(() => {}); }, 5000);
+    return () => clearInterval(interval);
+  }, [appInfo?.initialized]);
+
   const handleSelectPeer = useCallback(async (peer: Peer) => {
+    setSelectedGroupId(null);
     setSelectedPeer(peer);
+    setMessages([]);
     try {
       const [conv] = await Promise.all([
         getConversation(peer.id),
         markRead(peer.id),
       ]);
       setMessages(conv);
-      // Immediately check if peer is online
       checkPeerOnline(peer.ip, peer.port).then((online) => {
         setPeers((prev) =>
           prev.map((p) => (p.id === peer.id ? { ...p, online } : p))
@@ -158,7 +181,18 @@ function App() {
       });
     } catch (err) {
       console.error("Failed to load conversation:", err);
-      setMessages([]);
+    }
+  }, []);
+
+  const handleSelectGroup = useCallback(async (groupId: string) => {
+    setSelectedPeer(null);
+    setSelectedGroupId(groupId);
+    setMessages([]);
+    try {
+      const msgs = await getGroupMessages(groupId);
+      setMessages(msgs);
+    } catch (err) {
+      console.error("Failed to load group messages:", err);
     }
   }, []);
 
@@ -168,6 +202,12 @@ function App() {
     setMessages((prev) => [...prev, sent]);
     return sent;
   }, [selectedPeer]);
+
+  const handleSendGroupMsg = useCallback(async (groupId: string, content: string) => {
+    const msg = await sendGroupMessage(groupId, content);
+    setMessages((prev) => [...prev, msg]);
+    return msg;
+  }, []);
 
   const handleSendFile = useCallback(async (filePath: string) => {
     if (!selectedPeer) throw new Error("未选择联系人");
@@ -278,12 +318,14 @@ function App() {
           await setScanSubnets(list);
           setScanSubnetsState(list);
         }}
+        selectedGroupId={selectedGroupId}
+        onSelectGroup={handleSelectGroup}
       />
       <ChatWindow
-        peer={selectedPeer}
+        peer={selectedGroupId ? { id: selectedGroupId, username: groups.find(g => g.group_id === selectedGroupId)?.name || "群聊", department: "", ip: "", port: 0, online: true } : selectedPeer}
         messages={messages}
         myId={appInfo.peer_id}
-        onSendMessage={handleSendMessage}
+        onSendMessage={selectedGroupId ? ((content: string) => handleSendGroupMsg(selectedGroupId!, content)) : handleSendMessage}
         onSendFile={handleSendFile}
       />
     </div>

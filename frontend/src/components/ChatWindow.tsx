@@ -345,9 +345,9 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
           </div>
           <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-gray-900 ${peer.online ? "bg-green-400" : "bg-gray-500"}`} />
         </div>
-        <div>
-          <p className="text-white text-sm font-semibold">{peer.username}</p>
-          <p className="text-xs text-gray-400">{peer.online ? `${peer.ip}:${peer.port}` : "离线"}</p>
+        <div className="flex-1 min-w-0">
+          <p className="text-white text-sm font-semibold truncate">{peer.username}</p>
+          <p className="text-xs text-gray-400">{peer.online ? `${peer.ip}:${peer.port}` : "群聊"}</p>
         </div>
       </div>
 

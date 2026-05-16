@@ -153,40 +153,44 @@ impl DiscoveryService {
             self.config.username, self.config.peer_id, local_ip, self.config.listen_port
         );
 
-        let instance_name = format!("echo-{}", &self.config.peer_id.get(..8).unwrap_or("00000000"));
-        let port_str = self.config.listen_port.to_string();
-        let properties = vec![
-            ("id", self.config.peer_id.as_str()),
-            ("username", self.config.username.as_str()),
-            ("department", self.config.department.as_str()),
-            ("port", port_str.as_str()),
-        ];
+        // mDNS disabled — unreliable on this network, using UDP broadcast instead
+        // Keeping the code but skipping registration and browsing
+        if false {
+            let instance_name = format!("echo-{}", &self.config.peer_id.get(..8).unwrap_or("00000000"));
+            let port_str = self.config.listen_port.to_string();
+            let properties = vec![
+                ("id", self.config.peer_id.as_str()),
+                ("username", self.config.username.as_str()),
+                ("department", self.config.department.as_str()),
+                ("port", port_str.as_str()),
+            ];
 
-        let service_info = mdns_sd::ServiceInfo::new(
-            SERVICE_TYPE,
-            &instance_name,
-            &format!("{}.local.", instance_name),
-            local_ip,
-            self.config.listen_port,
-            &properties[..],
-        )
-        .context("Failed to create mDNS ServiceInfo")?;
+            let service_info = mdns_sd::ServiceInfo::new(
+                SERVICE_TYPE,
+                &instance_name,
+                &format!("{}.local.", instance_name),
+                local_ip,
+                self.config.listen_port,
+                &properties[..],
+            )
+            .context("Failed to create mDNS ServiceInfo")?;
 
-        self.mdns
-            .register(service_info)
-            .context("Failed to register mDNS service")?;
+            self.mdns
+                .register(service_info)
+                .context("Failed to register mDNS service")?;
 
-        let receiver = self
-            .mdns
-            .browse(SERVICE_TYPE)
-            .context("Failed to start mDNS browse")?;
+            let receiver = self
+                .mdns
+                .browse(SERVICE_TYPE)
+                .context("Failed to start mDNS browse")?;
 
-        let peers = Arc::clone(&self.peers);
-        let my_id = self.config.peer_id.clone();
+            let peers = Arc::clone(&self.peers);
+            let my_id = self.config.peer_id.clone();
 
-        tauri::async_runtime::spawn(async move {
-            Self::handle_mdns_events(receiver, peers, my_id).await;
-        });
+            tauri::async_runtime::spawn(async move {
+                Self::handle_mdns_events(receiver, peers, my_id).await;
+            });
+        }
 
         // Also start LAN discovery (broadcast + multicast + unicast response)
         let discovery_port = self.config.listen_port + 2;

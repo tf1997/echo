@@ -141,6 +141,12 @@ pub fn run() {
                                     runtime.discovery.lock().await.touch_peer(id);
                                 }
                                 let _ = state.db.upsert_peer(id, username, department, &ip.to_string(), *port, true).await;
+                                // Deliver pending group messages
+                                let db = state.db.clone();
+                                let pid = id.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    crate::commands::deliver_pending_to_peer(&db, &pid).await;
+                                });
                                 log::debug!("HealthCheck: {} TCP OK → online", id);
                             } else {
                                 // TCP fail → check if last_seen is too old
@@ -195,6 +201,15 @@ pub fn run() {
             commands::add_emoji_file,
             commands::list_recent_contacts,
             commands::remove_recent_contact,
+            commands::create_group,
+            commands::list_groups,
+            commands::send_group_message,
+            commands::get_group_messages,
+            commands::rename_group,
+            commands::leave_group,
+            commands::invite_to_group,
+            commands::dissolve_group,
+            commands::deliver_pending,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Echo");
