@@ -25,6 +25,10 @@ export async function sendMessage(peerId: string, content: string): Promise<Chat
   return await invoke("send_message", { peerId, content });
 }
 
+export async function sendMessageTyped(peerId: string, content: string, msgType: string): Promise<ChatMessage> {
+  return await invoke("send_message_typed", { peerId, content, msgType });
+}
+
 export async function sendFile(peerId: string, filePath: string): Promise<ChatMessage> {
   return await invoke("send_file", { peerId, filePath });
 }
@@ -97,6 +101,10 @@ export async function listGroups(): Promise<GroupInfo[]> {
 
 export async function sendGroupMessage(groupId: string, content: string): Promise<ChatMessage> {
   return await invoke("send_group_message", { groupId, content });
+}
+
+export async function sendGroupMessageTyped(groupId: string, content: string, msgType: string): Promise<ChatMessage> {
+  return await invoke("send_group_message_typed", { groupId, content, msgType });
 }
 
 export async function sendGroupFile(groupId: string, filePath: string): Promise<ChatMessage> {

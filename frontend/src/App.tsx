@@ -340,6 +340,9 @@ function App() {
         messages={messages}
         myId={appInfo.peer_id}
         isGroup={!!selectedGroupId}
+        groupId={selectedGroupId}
+        peers={peers}
+        groups={groups}
         onSendMessage={selectedGroupId ? ((content: string) => handleSendGroupMsg(selectedGroupId!, content)) : handleSendMessage}
         onSendFile={handleSendFile}
       />

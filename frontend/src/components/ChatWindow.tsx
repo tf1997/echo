@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import type { ChatMessage, Peer } from "../types";
-import { MessageBubble } from "./MessageBubble";
-import { saveTempFile, listEmojiFiles, addEmojiFile, readFileBase64 } from "../api";
+import type { GroupInfo } from "../api";
+import { MessageBubble, DateDivider, formatDateLabel } from "./MessageBubble";
+import { saveTempFile, listEmojiFiles, addEmojiFile, readFileBase64, sendMessage, sendMessageTyped, sendGroupMessage, sendGroupMessageTyped } from "../api";
+import type { ForwardCardData } from "./MessageBubble";
 import { open } from "@tauri-apps/plugin-dialog";
 
 export interface PendingMessage {
@@ -22,6 +24,9 @@ interface ChatWindowProps {
   messages: ChatMessage[];
   myId: string;
   isGroup?: boolean;
+  groupId?: string | null;
+  peers?: Peer[];
+  groups?: GroupInfo[];
   onSendMessage: (content: string) => Promise<ChatMessage>;
   onSendFile: (filePath: string) => Promise<void | ChatMessage>;
 }
@@ -52,12 +57,137 @@ function formatSpeed(bytesPerSec: number | undefined): string {
   return `${bytesPerSec} B/s`;
 }
 
-export function ChatWindow({ peer, messages, myId, isGroup = false, onSendMessage, onSendFile }: ChatWindowProps) {
+type ForwardMode = "individual" | "merged";
+
+interface ForwardModalProps {
+  messages: ChatMessage[];
+  mode: ForwardMode;
+  peers: Peer[];
+  groups: GroupInfo[];
+  myId: string;
+  onClose: () => void;
+}
+
+function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardModalProps) {
+  const [query, setQuery] = useState("");
+  const [sending, setSending] = useState<string | null>(null);
+  const [sent, setSent] = useState<Set<string>>(new Set());
+
+  const filteredPeers = peers.filter((p) => p.id !== myId && p.username.toLowerCase().includes(query.toLowerCase()));
+  const filteredGroups = groups.filter((g) => g.name.toLowerCase().includes(query.toLowerCase()));
+
+  const forward = async (targetId: string, isGroup: boolean) => {
+    if (sent.has(targetId) || sending) return;
+    setSending(targetId);
+    try {
+      const sorted = [...messages].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+      if (mode === "merged") {
+        const card: ForwardCardData = {
+          title: `${sorted[0]?.sender_name ?? ""} 等人的聊天记录`,
+          items: sorted.map((m) => ({ sender: m.sender_name, content: m.content, msg_type: m.msg_type, timestamp: m.timestamp })),
+        };
+        const json = JSON.stringify(card);
+        if (isGroup) await sendGroupMessageTyped(targetId, json, "forward_card");
+        else await sendMessageTyped(targetId, json, "forward_card");
+      } else {
+        for (const m of sorted) {
+          if (isGroup) await sendGroupMessage(targetId, m.content);
+          else await sendMessage(targetId, m.content);
+        }
+      }
+      setSent((prev) => new Set([...prev, targetId]));
+    } catch {
+      // ignore
+    } finally {
+      setSending(null);
+    }
+  };
+
+  const modeLabel = mode === "merged" ? "合并转发" : "逐条转发";
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
+      <div className="bg-gray-800 border border-gray-600 rounded-2xl w-80 max-h-[480px] flex flex-col shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+          <div>
+            <span className="text-sm font-semibold text-white">转发给</span>
+            <span className="ml-2 text-xs text-gray-400">{modeLabel} · {messages.length} 条</span>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-white text-lg leading-none">×</button>
+        </div>
+        <div className="px-3 py-2 border-b border-gray-700">
+          <input autoFocus value={query} onChange={(e) => setQuery(e.target.value)}
+            placeholder="搜索联系人或群聊..."
+            className="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-400"
+          />
+        </div>
+        <div className="overflow-y-auto flex-1 py-1">
+          {filteredGroups.map((g) => (
+            <button key={g.group_id} onClick={() => forward(g.group_id, true)} disabled={!!sending}
+              className="w-full flex items-center gap-3 px-4 py-2 hover:bg-gray-700 text-left disabled:opacity-60">
+              <div className="w-8 h-8 rounded-full bg-indigo-700 flex items-center justify-center text-sm flex-shrink-0">👥</div>
+              <span className="text-sm text-gray-200 flex-1 truncate">{g.name}</span>
+              {sent.has(g.group_id) ? <span className="text-xs text-green-400">已发送</span>
+                : sending === g.group_id ? <span className="text-xs text-gray-400">发送中</span> : null}
+            </button>
+          ))}
+          {filteredPeers.map((p) => (
+            <button key={p.id} onClick={() => forward(p.id, false)} disabled={!!sending}
+              className="w-full flex items-center gap-3 px-4 py-2 hover:bg-gray-700 text-left disabled:opacity-60">
+              <div className="w-8 h-8 rounded-full bg-gray-600 flex items-center justify-center text-sm font-medium text-white flex-shrink-0">
+                {p.username.charAt(0).toUpperCase()}
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm text-gray-200 truncate">{p.username}</p>
+                {!p.online && <p className="text-[10px] text-gray-500">离线</p>}
+              </div>
+              {sent.has(p.id) ? <span className="text-xs text-green-400">已发送</span>
+                : sending === p.id ? <span className="text-xs text-gray-400">发送中</span> : null}
+            </button>
+          ))}
+          {filteredPeers.length === 0 && filteredGroups.length === 0 && (
+            <p className="text-center text-gray-500 text-sm py-6">无匹配联系人</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function ChatWindow({ peer, messages, myId, isGroup = false, peers = [], groups = [], onSendMessage, onSendFile }: ChatWindowProps) {
   const [inputText, setInputText] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
   const [showEmoji, setShowEmoji] = useState(false);
   const [customEmojis, setCustomEmojis] = useState<string[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchIndex, setSearchIndex] = useState(0);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [forwardModal, setForwardModal] = useState<{ messages: ChatMessage[]; mode: ForwardMode } | null>(null);
+  const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+
+  const exitSelectMode = useCallback(() => { setSelectMode(false); setSelectedIds(new Set()); }, []);
+
+  const handleStartForward = useCallback((msg: ChatMessage) => {
+    setSelectMode(true);
+    setSelectedIds(new Set([msg.id]));
+  }, []);
+
+  const handleToggleSelect = useCallback((msg: ChatMessage) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(msg.id)) next.delete(msg.id); else next.add(msg.id);
+      return next;
+    });
+  }, []);
+
+  const openForwardModal = useCallback((mode: ForwardMode) => {
+    const selected = messages.filter((m) => selectedIds.has(m.id));
+    if (selected.length === 0) return;
+    setForwardModal({ messages: selected, mode });
+  }, [messages, selectedIds]);
 
   // Load custom emojis
   useEffect(() => {
@@ -352,7 +482,57 @@ export function ChatWindow({ peer, messages, myId, isGroup = false, onSendMessag
           <p className="text-white text-sm font-semibold truncate">{peer.username}</p>
           <p className="text-xs text-gray-400">{isGroup ? "群聊" : (peer.online ? `${peer.ip}:${peer.port}` : "离线")}</p>
         </div>
+        <button
+          onClick={() => { setShowSearch((v) => !v); setSearchQuery(""); setSearchIndex(0); }}
+          className="flex-shrink-0 w-8 h-8 rounded-lg hover:bg-gray-700 flex items-center justify-center text-gray-400 hover:text-white"
+          title="搜索消息"
+        >
+          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
+        </button>
       </div>
+      {showSearch && (() => {
+        const textMessages = messages.filter((m) => m.msg_type === "text" && searchQuery && m.content.toLowerCase().includes(searchQuery.toLowerCase()));
+        const total = textMessages.length;
+        const clampedIndex = total > 0 ? Math.min(searchIndex, total - 1) : 0;
+        const scrollToMatch = (idx: number) => {
+          const msg = textMessages[idx];
+          if (!msg) return;
+          const el = messageRefs.current.get(msg.id);
+          el?.scrollIntoView({ behavior: "smooth", block: "center" });
+        };
+        return (
+          <div className="flex items-center gap-2 px-4 py-2 bg-gray-900/60 border-b border-gray-700">
+            <input
+              autoFocus
+              value={searchQuery}
+              onChange={(e) => { setSearchQuery(e.target.value); setSearchIndex(0); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  if (total === 0) return;
+                  const next = (clampedIndex + 1) % total;
+                  setSearchIndex(next);
+                  scrollToMatch(next);
+                }
+                if (e.key === "Escape") { setShowSearch(false); setSearchQuery(""); }
+              }}
+              placeholder="搜索消息..."
+              className="flex-1 bg-gray-700 text-white text-sm rounded-lg px-3 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-400"
+            />
+            {searchQuery && (
+              <span className="text-xs text-gray-400 flex-shrink-0">{total > 0 ? `${clampedIndex + 1}/${total}` : "无结果"}</span>
+            )}
+            <button disabled={total === 0} onClick={() => { const prev = (clampedIndex - 1 + total) % total; setSearchIndex(prev); scrollToMatch(prev); }} className="text-gray-400 hover:text-white disabled:opacity-30">
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" /></svg>
+            </button>
+            <button disabled={total === 0} onClick={() => { const next = (clampedIndex + 1) % total; setSearchIndex(next); scrollToMatch(next); }} className="text-gray-400 hover:text-white disabled:opacity-30">
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+            </button>
+          </div>
+        );
+      })()}
 
       <div ref={messagesContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto py-4">
         {allItems.length === 0 ? (
@@ -360,11 +540,26 @@ export function ChatWindow({ peer, messages, myId, isGroup = false, onSendMessag
             <p className="text-sm">暂无消息</p>
             <p className="text-xs mt-1">向 {peer.username} 发送第一条消息吧</p>
           </div>
-        ) : (
-          allItems.map((item) => {
+        ) : (() => {
+          const searchMatches = searchQuery
+            ? new Set(messages.filter((m) => m.msg_type === "text" && m.content.toLowerCase().includes(searchQuery.toLowerCase())).map((m) => m.id))
+            : new Set<number>();
+          const textMatches = searchQuery
+            ? messages.filter((m) => m.msg_type === "text" && m.content.toLowerCase().includes(searchQuery.toLowerCase()))
+            : [];
+          const highlightedId = textMatches[Math.min(searchIndex, textMatches.length - 1)]?.id;
+          let lastDateLabel = "";
+          return allItems.map((item) => {
+            const elements: React.ReactNode[] = [];
+            if ("timestamp" in item) {
+              const label = formatDateLabel(item.timestamp);
+              if (label && label !== lastDateLabel) {
+                lastDateLabel = label;
+                elements.push(<DateDivider key={`date-${item.id}`} date={label} />);
+              }
+            }
             if ("status" in item) {
-              // Pending message
-              return (
+              elements.push(
                 <div key={`pending-${item.id}`} className="flex justify-end mb-3 px-4">
                   <div className="max-w-[70%] flex flex-col items-end">
                     <div className={`rounded-2xl px-4 py-2.5 rounded-br-md ${
@@ -392,30 +587,61 @@ export function ChatWindow({ peer, messages, myId, isGroup = false, onSendMessag
                       </span>
                       {item.status === "failed" && (
                         <button
-                          onClick={() => {
-                            if (item.msg_type === "file") {
-                              retryFile(item);
-                            } else {
-                              retryText(item);
-                            }
-                          }}
+                          onClick={() => { if (item.msg_type === "file") retryFile(item); else retryText(item); }}
                           className="text-[10px] text-indigo-400 hover:text-indigo-300"
-                        >
-                          重试
-                        </button>
+                        >重试</button>
                       )}
                     </div>
                   </div>
                 </div>
               );
+            } else {
+              elements.push(
+                <div key={item.id} ref={(el) => { if (el) messageRefs.current.set(item.id, el); else messageRefs.current.delete(item.id); }}>
+                  <MessageBubble
+                    message={item}
+                    isOwn={item.sender_id === myId}
+                    showSender={isGroup}
+                    highlighted={searchMatches.has(item.id) && item.id === highlightedId}
+                    selectMode={selectMode}
+                    selected={selectedIds.has(item.id)}
+                    onToggleSelect={handleToggleSelect}
+                    onStartForward={handleStartForward}
+                  />
+                </div>
+              );
             }
-            return (
-              <MessageBubble key={item.id} message={item} isOwn={item.sender_id === myId} showSender={isGroup} />
-            );
-          })
-        )}
+            return elements;
+          });
+        })()}
         <div ref={messagesEndRef} />
       </div>
+      {selectMode && (
+        <div className="flex items-center gap-2 px-4 py-2.5 bg-gray-900 border-t border-gray-700">
+          <span className="text-sm text-gray-300 flex-1">已选 {selectedIds.size} 条</span>
+          <button onClick={exitSelectMode} className="px-3 py-1.5 text-sm text-gray-400 hover:text-white rounded-lg hover:bg-gray-700">取消</button>
+          <button
+            disabled={selectedIds.size === 0}
+            onClick={() => openForwardModal("individual")}
+            className="px-3 py-1.5 text-sm bg-gray-700 hover:bg-gray-600 text-white rounded-lg disabled:opacity-40"
+          >逐条转发</button>
+          <button
+            disabled={selectedIds.size === 0}
+            onClick={() => openForwardModal("merged")}
+            className="px-3 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg disabled:opacity-40"
+          >合并转发</button>
+        </div>
+      )}
+      {forwardModal && (
+        <ForwardModal
+          messages={forwardModal.messages}
+          mode={forwardModal.mode}
+          peers={peers}
+          groups={groups}
+          myId={myId}
+          onClose={() => { setForwardModal(null); exitSelectMode(); }}
+        />
+      )}
 
       <div className="px-4 py-3 border-t border-gray-700 bg-gray-900/50">
         <div className="flex items-end gap-2">

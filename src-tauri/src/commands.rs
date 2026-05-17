@@ -158,6 +158,16 @@ pub async fn send_message(
     peer_id: String,
     content: String,
 ) -> Result<ChatMessage, String> {
+    send_message_typed(state, peer_id, content, "text".to_string()).await
+}
+
+#[tauri::command]
+pub async fn send_message_typed(
+    state: State<'_, AppState>,
+    peer_id: String,
+    content: String,
+    msg_type: String,
+) -> Result<ChatMessage, String> {
     let runtime = state.runtime.lock().await;
     let Some(runtime) = runtime.as_ref() else {
         return Err("应用尚未初始化用户信息".to_string());
@@ -185,7 +195,7 @@ pub async fn send_message(
     drop(discovery);
 
     let chat = runtime.chat.lock().await;
-    chat.send_message(&peer, &content)
+    chat.send_message_typed(&peer, &content, &msg_type)
         .await
         .map_err(|e| e.to_string())
 }
@@ -827,6 +837,13 @@ pub async fn list_groups(state: State<'_, AppState>) -> Result<Vec<crate::db::Gr
 pub async fn send_group_message(
     state: State<'_, AppState>, group_id: String, content: String,
 ) -> Result<ChatMessage, String> {
+    send_group_message_typed(state, group_id, content, "text".to_string()).await
+}
+
+#[tauri::command]
+pub async fn send_group_message_typed(
+    state: State<'_, AppState>, group_id: String, content: String, msg_type: String,
+) -> Result<ChatMessage, String> {
     let (my_id, my_name, listen_port, members) = {
         let runtime = state.runtime.lock().await;
         let r = runtime.as_ref().ok_or("未初始化")?;
@@ -836,9 +853,8 @@ pub async fn send_group_message(
     };
 
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let msg = state.db.save_group_message(&group_id, &my_id, &my_name, &content, "text", None, None, None, true).await.map_err(|e| e.to_string())?;
+    let msg = state.db.save_group_message(&group_id, &my_id, &my_name, &content, &msg_type, None, None, None, true).await.map_err(|e| e.to_string())?;
 
-    // Get online peers for IP lookup
     let online_peers = {
         let runtime = state.runtime.lock().await;
         match runtime.as_ref() {
@@ -847,7 +863,6 @@ pub async fn send_group_message(
         }
     };
 
-    // Send to each member via TCP, queue for offline members
     for member in &members {
         if member.peer_id == my_id { continue; }
         let Some((ip, port)) = resolve_peer_addr(&member.peer_id, &state.db, &online_peers).await else { continue; };
@@ -858,7 +873,7 @@ pub async fn send_group_message(
             sender_id: my_id.clone(), sender_name: my_name.clone(),
             sender_department: String::new(), sender_port: listen_port,
             receiver_id: member.peer_id.clone(), content: content.clone(),
-            msg_type: "text".to_string(), file_name: None, file_size: None, file_data: None,
+            msg_type: msg_type.clone(), file_name: None, file_size: None, file_data: None,
             known_peers: Vec::new(), group_id: Some(group_id.clone()),
         };
         let json = serde_json::to_string(&wm).map_err(|e| e.to_string())?;
@@ -872,8 +887,7 @@ pub async fn send_group_message(
             _ => {}
         }
         if !delivered {
-            let _ = state.db.store_pending_group_msg(&group_id, &member.peer_id, &my_id, &my_name, &content, "text", &timestamp).await;
-            log::info!("Queued group msg for offline member {}", member.peer_id);
+            let _ = state.db.store_pending_group_msg(&group_id, &member.peer_id, &my_id, &my_name, &content, &msg_type, &timestamp).await;
         }
     }
     Ok(msg)

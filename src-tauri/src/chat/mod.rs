@@ -357,6 +357,10 @@ impl ChatServer {
 
     /// Send a text message to a peer.
     pub async fn send_message(&self, peer: &Peer, content: &str) -> Result<crate::db::ChatMessage> {
+        self.send_message_typed(peer, content, "text").await
+    }
+
+    pub async fn send_message_typed(&self, peer: &Peer, content: &str, msg_type: &str) -> Result<crate::db::ChatMessage> {
         let msg = WireMessage {
             sender_id: self.my_id.clone(),
             sender_name: self.my_name.clone(),
@@ -364,7 +368,7 @@ impl ChatServer {
             sender_port: self.listen_port,
             receiver_id: peer.id.clone(),
             content: content.to_string(),
-            msg_type: "text".to_string(),
+            msg_type: msg_type.to_string(),
             file_name: None,
             file_size: None,
             file_data: None,
@@ -373,24 +377,10 @@ impl ChatServer {
         };
 
         self.send_wire_message(peer, &msg).await?;
-
-        // Mark as recent contact
         let _ = self.db.add_recent_contact(&peer.id).await;
-
-        // Save outgoing message to DB
         let saved = self.db
-            .save_message(
-                &self.my_id,
-                &self.my_name,
-                &peer.id,
-                content,
-                "text",
-                None,
-                None,
-                None,
-            )
+            .save_message(&self.my_id, &self.my_name, &peer.id, content, msg_type, None, None, None)
             .await?;
-
         Ok(saved)
     }
 
