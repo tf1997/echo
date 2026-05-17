@@ -18,7 +18,9 @@ import {
   setScanSubnets,
   getGroupMessages,
   sendGroupMessage,
+  sendGroupFile,
   listGroups,
+  markGroupRead,
 } from "./api";
 import type { GroupInfo } from "./api";
 
@@ -149,18 +151,22 @@ function App() {
     if (!appInfo?.initialized || !selectedGroupId) return;
     const interval = setInterval(() => {
       getGroupMessages(selectedGroupId).then(setMessages).catch(console.error);
+      markGroupRead(selectedGroupId).catch(console.error);
     }, 1000);
     return () => clearInterval(interval);
   }, [appInfo?.initialized, selectedGroupId]);
 
-  // Load groups
+  // Load groups (with unread + last message)
   useEffect(() => {
     if (!appInfo?.initialized) return;
-    const interval = setInterval(() => { listGroups().then((gs) => {
-      setGroups(gs);
-      // Deselect if current group was dissolved
-      setSelectedGroupId((prev) => prev && !gs.some((g) => g.group_id === prev) ? null : prev);
-    }).catch(() => {}); }, 5000);
+    const tick = () => {
+      listGroups().then((gs) => {
+        setGroups(gs);
+        setSelectedGroupId((prev) => prev && !gs.some((g) => g.group_id === prev) ? null : prev);
+      }).catch(() => {});
+    };
+    tick();
+    const interval = setInterval(tick, 2000);
     return () => clearInterval(interval);
   }, [appInfo?.initialized]);
 
@@ -189,7 +195,10 @@ function App() {
     setSelectedGroupId(groupId);
     setMessages([]);
     try {
-      const msgs = await getGroupMessages(groupId);
+      const [msgs] = await Promise.all([
+        getGroupMessages(groupId),
+        markGroupRead(groupId),
+      ]);
       setMessages(msgs);
     } catch (err) {
       console.error("Failed to load group messages:", err);
@@ -210,10 +219,14 @@ function App() {
   }, []);
 
   const handleSendFile = useCallback(async (filePath: string) => {
+    if (selectedGroupId) {
+      // Fire-and-forget; poll will pick up the saved message
+      sendGroupFile(selectedGroupId, filePath).catch(console.error);
+      return;
+    }
     if (!selectedPeer) throw new Error("未选择联系人");
-    // Fire-and-forget: pending message shows progress, real message arrives via poll
     sendFile(selectedPeer.id, filePath).catch(console.error);
-  }, [selectedPeer]);
+  }, [selectedPeer, selectedGroupId]);
 
   const handleSaveProfile = useCallback(async () => {
     const trimmedUser = username.trim();
@@ -320,11 +333,13 @@ function App() {
         }}
         selectedGroupId={selectedGroupId}
         onSelectGroup={handleSelectGroup}
+        groups={groups}
       />
       <ChatWindow
         peer={selectedGroupId ? { id: selectedGroupId, username: groups.find(g => g.group_id === selectedGroupId)?.name || "群聊", department: "", ip: "", port: 0, online: true } : selectedPeer}
         messages={messages}
         myId={appInfo.peer_id}
+        isGroup={!!selectedGroupId}
         onSendMessage={selectedGroupId ? ((content: string) => handleSendGroupMsg(selectedGroupId!, content)) : handleSendMessage}
         onSendFile={handleSendFile}
       />

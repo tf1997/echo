@@ -7,6 +7,7 @@ const MAX_PREVIEW_BYTES = 20 * 1024 * 1024; // 20MB
 interface MessageBubbleProps {
   message: ChatMessage;
   isOwn: boolean;
+  showSender?: boolean;
 }
 
 function formatTime(ts: string): string {
@@ -66,15 +67,15 @@ function ImagePreview({ filePath, fileSize }: { filePath: string; fileSize: numb
   );
 }
 
-export function MessageBubble({ message, isOwn }: MessageBubbleProps) {
+export function MessageBubble({ message, isOwn, showSender = false }: MessageBubbleProps) {
   const isFile = message.msg_type === "file";
   const showPreview = isFile && isImageFile(message.file_name) && message.file_path;
 
   return (
     <div className={`flex ${isOwn ? "justify-end" : "justify-start"} mb-3 px-4`}>
       <div className={`max-w-[70%] ${isOwn ? "items-end" : "items-start"} flex flex-col`}>
-        {!isOwn && (
-          <span className="text-xs text-gray-400 mb-1 ml-1">{message.sender_name}</span>
+        {!isOwn && showSender && (
+          <span className="text-xs text-indigo-300 mb-1 ml-1">{message.sender_name}</span>
         )}
 
         <div

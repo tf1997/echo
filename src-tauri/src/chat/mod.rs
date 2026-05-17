@@ -137,6 +137,7 @@ impl ChatServer {
         let mut file_buffer: Vec<u8> = Vec::new();
         let mut file_sender_id: Option<String> = None;
         let mut file_sender_name: Option<String> = None;
+        let mut file_group_id: Option<String> = None;
 
         while let Some(line) = lines.next_line().await? {
             match serde_json::from_str::<WireMessage>(&line) {
@@ -157,11 +158,18 @@ impl ChatServer {
                             let group_name = serde_json::from_str::<serde_json::Value>(&msg.content).ok()
                                 .and_then(|v| v["name"].as_str().map(|s| s.to_string()))
                                 .unwrap_or_else(|| msg.content.clone());
+                            // Idempotent — INSERT OR IGNORE under the hood; safe to call repeatedly
                             let _ = db.create_group(gid, &group_name, &msg.sender_id, &all_members).await;
-                            info!("Joined new group {} ({} members)", group_name, all_members.len());
+                            // Always add members (covers re-broadcast after invite_to_group)
+                            let _ = db.add_group_members(gid, &all_members).await;
+                            info!("Synced group {} ({} members)", group_name, all_members.len());
                         } else if msg.msg_type == "group_dissolved" {
                             let _ = db.remove_group_member(gid, &my_id).await;
                             info!("Group {} dissolved — removed", gid);
+                        } else if msg.msg_type == "group_member_left" {
+                            // sender_id is the leaving member's peer_id
+                            let _ = db.remove_group_member(gid, &msg.sender_id).await;
+                            info!("Member {} left group {}", msg.sender_id, gid);
                         }
                     }
 
@@ -222,6 +230,17 @@ impl ChatServer {
                                 }
                             }
                         }
+
+                        // Persist known_peers to DB (out of the sync RwLock so we can await).
+                        // Skips entries with missing ip/port — those carry id-only and we have nothing to store.
+                        for entry in &msg.known_peers {
+                            if entry.id == my_id || entry.ip.is_empty() || entry.port == 0 { continue; }
+                            if entry.ip.parse::<std::net::IpAddr>().is_err() { continue; }
+                            let _ = db.upsert_peer(
+                                &entry.id, &entry.username, &entry.department,
+                                &entry.ip, entry.port, false,
+                            ).await;
+                        }
                     }
 
                     match msg_type {
@@ -229,6 +248,7 @@ impl ChatServer {
                             if file_buffer.is_empty() {
                                 file_sender_id = Some(msg.sender_id.clone());
                                 file_sender_name = Some(msg.sender_name.clone());
+                                file_group_id = msg.group_id.clone();
                             }
                             let decoded = base64_decode(&msg.content)
                                 .unwrap_or_default();
@@ -238,6 +258,7 @@ impl ChatServer {
                             if file_sender_id.is_none() {
                                 file_sender_id = Some(msg.sender_id.clone());
                                 file_sender_name = Some(msg.sender_name.clone());
+                                file_group_id = msg.group_id.clone();
                             }
                             let decoded = base64_decode(&msg.content)
                                 .unwrap_or_default();
@@ -248,27 +269,39 @@ impl ChatServer {
 
                             let sender_id = file_sender_id.as_deref().unwrap_or(&msg.sender_id);
                             let sender_name = file_sender_name.as_deref().unwrap_or(&msg.sender_name);
-                            let receiver_id = &my_id;
-                            if let Err(e) = db
-                                .save_message(
-                                    sender_id,
-                                    sender_name,
-                                    receiver_id,
-                                    &format!("📎 {}", file_name_display),
-                                    "file",
-                                    Some(&saved_path),
-                                    Some(file_name_display),
-                                    msg.file_size.map(|s| s as i64),
-                                )
-                                .await
-                            {
-                                error!("Failed to save incoming file message: {}", e);
+                            let display_content = format!("📎 {}", file_name_display);
+                            if let Some(ref gid) = file_group_id {
+                                // Group file message — is_read=false so unread fires
+                                if let Err(e) = db.save_group_message(
+                                    gid, sender_id, sender_name, &display_content, "file",
+                                    Some(&saved_path), Some(file_name_display),
+                                    msg.file_size.map(|s| s as i64), false,
+                                ).await {
+                                    error!("Failed to save incoming group file message: {}", e);
+                                }
+                            } else {
+                                let receiver_id = &my_id;
+                                if let Err(e) = db
+                                    .save_message(
+                                        sender_id,
+                                        sender_name,
+                                        receiver_id,
+                                        &display_content,
+                                        "file",
+                                        Some(&saved_path),
+                                        Some(file_name_display),
+                                        msg.file_size.map(|s| s as i64),
+                                    )
+                                    .await
+                                {
+                                    error!("Failed to save incoming file message: {}", e);
+                                }
                             }
 
                             let _ = incoming_tx.send(IncomingMessage {
                                 sender_id: sender_id.to_string(),
                                 sender_name: sender_name.to_string(),
-                                content: format!("📎 {}", file_name_display),
+                                content: display_content,
                                 msg_type: "file".to_string(),
                                 file_name: Some(file_name_display.to_string()),
                                 file_size: msg.file_size,
@@ -278,8 +311,9 @@ impl ChatServer {
                             file_buffer.clear();
                             file_sender_id = None;
                             file_sender_name = None;
+                            file_group_id = None;
                         }
-                        "group_created" | "group_dissolved" => {
+                        "group_created" | "group_dissolved" | "group_member_left" => {
                             // System notifications — already handled above, don't save as message
                         }
                         _ => {
@@ -287,12 +321,12 @@ impl ChatServer {
                             info!("Received message from {}: {}", msg.sender_name, msg.content);
 
                             if let Some(ref gid) = msg.group_id {
-                                // Group message — save with group_id
-                                let _ = db.save_group_message(gid, &msg.sender_id, &msg.sender_name, &msg.content, &msg.msg_type, None, None, None).await;
-                                // Auto-join if needed
+                                // Group message — save with group_id; is_read=false so unread counts work
+                                let _ = db.save_group_message(gid, &msg.sender_id, &msg.sender_name, &msg.content, &msg.msg_type, None, None, None, false).await;
+                                // Auto-join if needed (only when group truly missing — typical when we missed group_created)
                                 let my_groups = db.list_groups(&my_id).await.unwrap_or_default();
                                 if !my_groups.iter().any(|g| g.group_id == *gid) {
-                                    let _ = db.add_group_members(gid, &[my_id.clone()]).await;
+                                    let _ = db.create_group(gid, "(未命名群组)", &msg.sender_id, &[msg.sender_id.clone(), my_id.clone()]).await;
                                     info!("Auto-joined group {} from message", gid);
                                 }
                             } else {
@@ -546,6 +580,46 @@ pub async fn send_file_in_background(
     peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
     app_handle: tauri::AppHandle,
 ) -> Result<crate::db::ChatMessage> {
+    send_file_in_background_inner(
+        file_path, file_name, peer, my_id, my_name, my_department,
+        listen_port, db, peers, app_handle, None,
+    ).await
+}
+
+/// Like `send_file_in_background` but tags each chunk with a group_id and skips per-peer DB save
+/// (the caller persists a single outgoing message before the fanout).
+pub async fn send_file_in_background_grouped(
+    file_path: &str,
+    file_name: &str,
+    peer: &Peer,
+    my_id: String,
+    my_name: String,
+    my_department: String,
+    listen_port: u16,
+    db: Arc<Database>,
+    peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
+    app_handle: tauri::AppHandle,
+    group_id: Option<String>,
+) -> Result<()> {
+    send_file_in_background_inner(
+        file_path, file_name, peer, my_id, my_name, my_department,
+        listen_port, db, peers, app_handle, group_id,
+    ).await.map(|_| ())
+}
+
+async fn send_file_in_background_inner(
+    file_path: &str,
+    file_name: &str,
+    peer: &Peer,
+    my_id: String,
+    my_name: String,
+    my_department: String,
+    listen_port: u16,
+    db: Arc<Database>,
+    peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
+    app_handle: tauri::AppHandle,
+    group_id: Option<String>,
+) -> Result<crate::db::ChatMessage> {
     use tokio::fs::File;
     use tokio::io::AsyncReadExt;
 
@@ -593,7 +667,7 @@ pub async fn send_file_in_background(
             file_name: Some(file_name.to_string()), file_size: Some(file_size),
             file_data: None,
             known_peers: if i == 0 { peers_list.clone() } else { Vec::new() },
-            group_id: None,
+            group_id: group_id.clone(),
         };
 
         let json = serde_json::to_string(&msg).context("Failed to serialize message")?;
@@ -618,27 +692,51 @@ pub async fn send_file_in_background(
 
     info!("File send complete: {} ({} bytes, {} chunks)", file_name, file_size, i);
 
-    // Mark as recent contact
-    let _ = db.add_recent_contact(&peer.id).await;
+    // For 1:1 chat we save the outgoing message + bump recent contacts here.
+    // For group chats the caller already persisted the outgoing message before fanout,
+    // so we just return a synthetic ChatMessage placeholder.
+    if group_id.is_none() {
+        // Mark as recent contact
+        let _ = db.add_recent_contact(&peer.id).await;
 
-    // Save to DB
-    let saved = db.save_message(&my_id, &my_name, &peer.id,
-        &format!("📎 {}", file_name), "file",
-        Some(file_path), Some(file_name), Some(file_size as i64),
-    ).await?;
+        let saved = db.save_message(&my_id, &my_name, &peer.id,
+            &format!("📎 {}", file_name), "file",
+            Some(file_path), Some(file_name), Some(file_size as i64),
+        ).await?;
 
-    // Update peer last_seen
-    {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-        if let Ok(mut map) = peers.write() {
-            if let Some(existing) = map.values_mut().find(|p| p.ip == peer.ip && p.port == peer.port) {
-                existing.online = true;
-                existing.last_seen = now;
+        // Update peer last_seen
+        {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            if let Ok(mut map) = peers.write() {
+                if let Some(existing) = map.values_mut().find(|p| p.ip == peer.ip && p.port == peer.port) {
+                    existing.online = true;
+                    existing.last_seen = now;
+                }
             }
         }
-    }
 
-    Ok(saved)
+        Ok(saved)
+    } else {
+        // Update last_seen for group case too
+        {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            if let Ok(mut map) = peers.write() {
+                if let Some(existing) = map.values_mut().find(|p| p.ip == peer.ip && p.port == peer.port) {
+                    existing.online = true;
+                    existing.last_seen = now;
+                }
+            }
+        }
+        Ok(crate::db::ChatMessage {
+            id: 0,
+            sender_id: my_id, sender_name: my_name, receiver_id: peer.id.clone(),
+            content: format!("📎 {}", file_name), msg_type: "file".to_string(),
+            file_path: Some(file_path.to_string()), file_name: Some(file_name.to_string()),
+            file_size: Some(file_size as i64),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            is_read: true,
+        })
+    }
 }
 
 fn save_received_file(data: &[u8], filename: &str) -> Result<String> {

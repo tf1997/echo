@@ -30,6 +30,20 @@ pub struct GroupInfo {
     pub creator_id: String,
     pub created_at: String,
     pub members: Vec<StoredPeer>,
+    #[serde(default)]
+    pub last_message: Option<String>,
+    #[serde(default)]
+    pub last_message_at: Option<String>,
+    #[serde(default)]
+    pub last_message_sender: Option<String>,
+    #[serde(default)]
+    pub unread_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupUnread {
+    pub group_id: String,
+    pub count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,7 +395,7 @@ impl Database {
 
     pub async fn create_group(&self, group_id: &str, name: &str, creator_id: &str, member_ids: &[String]) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query("INSERT INTO groups (group_id, name, creator_id, created_at) VALUES (?, ?, ?, ?)")
+        sqlx::query("INSERT OR IGNORE INTO groups (group_id, name, creator_id, created_at) VALUES (?, ?, ?, ?)")
             .bind(group_id).bind(name).bind(creator_id).bind(&now)
             .execute(&self.pool).await.context("Failed to create group")?;
         for mid in member_ids {
@@ -397,11 +411,49 @@ impl Database {
             "SELECT g.group_id, g.name, g.creator_id, g.created_at FROM groups g
              INNER JOIN group_members gm ON g.group_id = gm.group_id WHERE gm.peer_id = ?"
         ).bind(my_id).fetch_all(&self.pool).await.context("Failed to list groups")?;
-        Ok(rows.iter().map(|r| GroupInfo {
-            group_id: r.get("group_id"), name: r.get("name"),
-            creator_id: r.get("creator_id"), created_at: r.get("created_at"),
-            members: Vec::new(),
-        }).collect())
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let group_id: String = r.get("group_id");
+            // Latest message in this group
+            let last_row = sqlx::query(
+                "SELECT content, msg_type, file_name, sender_name, timestamp FROM messages
+                 WHERE group_id = ? AND msg_type NOT IN ('file_chunk','file_end')
+                 ORDER BY id DESC LIMIT 1"
+            ).bind(&group_id).fetch_optional(&self.pool).await.ok().flatten();
+            let (last_message, last_message_at, last_message_sender) = if let Some(lr) = last_row {
+                let msg_type: String = lr.get("msg_type");
+                let preview = if msg_type == "file" {
+                    let fname: Option<String> = lr.try_get("file_name").ok();
+                    format!("📎 {}", fname.unwrap_or_else(|| "文件".to_string()))
+                } else {
+                    lr.get::<String, _>("content")
+                };
+                (
+                    Some(preview),
+                    Some(lr.get::<String, _>("timestamp")),
+                    Some(lr.get::<String, _>("sender_name")),
+                )
+            } else {
+                (None, None, None)
+            };
+            // Unread count: messages in group from someone other than me
+            let unread: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM messages WHERE group_id = ? AND sender_id <> ? AND is_read = 0"
+            ).bind(&group_id).bind(my_id).fetch_one(&self.pool).await.unwrap_or(0);
+
+            out.push(GroupInfo {
+                group_id,
+                name: r.get("name"),
+                creator_id: r.get("creator_id"),
+                created_at: r.get("created_at"),
+                members: Vec::new(),
+                last_message,
+                last_message_at,
+                last_message_sender,
+                unread_count: unread as u32,
+            });
+        }
+        Ok(out)
     }
 
     pub async fn get_group_members(&self, group_id: &str) -> Result<Vec<StoredPeer>> {
@@ -452,20 +504,41 @@ impl Database {
     pub async fn save_group_message(
         &self, group_id: &str, sender_id: &str, sender_name: &str,
         content: &str, msg_type: &str, file_path: Option<&str>, file_name: Option<&str>, file_size: Option<i64>,
+        is_read: bool,
     ) -> Result<ChatMessage> {
         let timestamp = Utc::now().to_rfc3339();
         let id = sqlx::query(
             "INSERT INTO messages (sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, group_id)
-             VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, 1, ?)"
+             VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)"
         ).bind(sender_id).bind(sender_name).bind(content).bind(msg_type)
-         .bind(file_path).bind(file_name).bind(file_size).bind(&timestamp).bind(group_id)
+         .bind(file_path).bind(file_name).bind(file_size).bind(&timestamp)
+         .bind(if is_read { 1 } else { 0 }).bind(group_id)
          .execute(&self.pool).await.context("Failed to save group message")?.last_insert_rowid();
         Ok(ChatMessage {
             id, sender_id: sender_id.to_string(), sender_name: sender_name.to_string(),
             receiver_id: String::new(), content: content.to_string(), msg_type: msg_type.to_string(),
             file_path: file_path.map(|s| s.to_string()), file_name: file_name.map(|s| s.to_string()),
-            file_size, timestamp, is_read: true,
+            file_size, timestamp, is_read,
         })
+    }
+
+    pub async fn get_group_unread_counts(&self, my_id: &str) -> Result<Vec<GroupUnread>> {
+        let rows = sqlx::query(
+            "SELECT group_id, COUNT(*) as cnt FROM messages
+             WHERE group_id IS NOT NULL AND group_id <> '' AND sender_id <> ? AND is_read = 0
+             GROUP BY group_id"
+        ).bind(my_id).fetch_all(&self.pool).await.context("Failed to get group unread counts")?;
+        Ok(rows.iter().map(|r| GroupUnread {
+            group_id: r.get("group_id"),
+            count: r.get::<i64, _>("cnt") as u32,
+        }).collect())
+    }
+
+    pub async fn mark_group_read(&self, group_id: &str, my_id: &str) -> Result<()> {
+        sqlx::query("UPDATE messages SET is_read = 1 WHERE group_id = ? AND sender_id <> ?")
+            .bind(group_id).bind(my_id)
+            .execute(&self.pool).await.context("Failed to mark group read")?;
+        Ok(())
     }
 
     pub async fn get_group_messages(&self, group_id: &str) -> Result<Vec<ChatMessage>> {
@@ -513,22 +586,36 @@ impl Database {
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
 
-        sqlx::query("DELETE FROM peers WHERE (ip = ? AND port = ?) OR (username = ? AND department = ? AND peer_id <> ?)")
+        // Cleanup duplicates at the same endpoint (different peer_id, same ip:port).
+        sqlx::query("DELETE FROM peers WHERE ip = ? AND port = ? AND peer_id <> ?")
             .bind(ip)
             .bind(port as i64)
-            .bind(username)
-            .bind(department)
             .bind(peer_id)
             .execute(&self.pool)
             .await
-            .context("Failed to remove duplicate peer endpoints")?;
+            .context("Failed to remove stale peer endpoints")?;
 
+        // Cleanup by identity (same name+dept under a different peer_id, e.g. peer IP changed)
+        // only when username is known — otherwise we'd nuke other unnamed peers indiscriminately.
+        if !username.is_empty() {
+            sqlx::query("DELETE FROM peers WHERE username = ? AND department = ? AND peer_id <> ?")
+                .bind(username)
+                .bind(department)
+                .bind(peer_id)
+                .execute(&self.pool)
+                .await
+                .context("Failed to remove duplicate identity")?;
+        }
+
+        // Upsert. Preserve existing non-empty username/department when the incoming row has
+        // empty values — system messages (group_created, group_dissolved, group_member_left)
+        // historically carried empty sender_name and would otherwise wipe good peer data.
         sqlx::query(
             "INSERT INTO peers (peer_id, username, department, ip, port, is_online, first_seen_at, last_seen_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(peer_id) DO UPDATE SET
-                username = excluded.username,
-                department = excluded.department,
+                username = CASE WHEN excluded.username = '' THEN peers.username ELSE excluded.username END,
+                department = CASE WHEN excluded.department = '' THEN peers.department ELSE excluded.department END,
                 ip = excluded.ip,
                 port = excluded.port,
                 is_online = excluded.is_online,

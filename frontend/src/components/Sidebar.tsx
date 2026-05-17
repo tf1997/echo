@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
 import type { Peer, UnreadCount, StoredPeer } from "../types";
-import { searchMessages, discoverByIp, listRecentContacts, removeRecentContact, listGroups, createGroup, renameGroup, leaveGroup, inviteToGroup, dissolveGroup } from "../api";
+import { searchMessages, discoverByIp, listRecentContacts, removeRecentContact, createGroup, renameGroup, leaveGroup, inviteToGroup, dissolveGroup } from "../api";
 import type { GroupInfo } from "../api";
 import type { SearchResult } from "../api";
 
@@ -20,9 +20,10 @@ interface SidebarProps {
   onSaveScanSubnets: (subnets: string[]) => Promise<void>;
   selectedGroupId: string | null;
   onSelectGroup: (groupId: string) => void;
+  groups: GroupInfo[];
 }
 
-export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit, selectedGroupId, onSelectGroup }: SidebarProps) {
+export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit, selectedGroupId, onSelectGroup, groups }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
@@ -33,14 +34,19 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   const [savingSubnets, setSavingSubnets] = useState(false);
   const [tab, setTab] = useState<"recent" | "contacts" | "groups">("recent");
   const [recentContacts, setRecentContacts] = useState<StoredPeer[]>([]);
-  const [groups, setGroups] = useState<GroupInfo[]>([]);
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
   const [newGroupMembers, setNewGroupMembers] = useState<string[]>([]);
   const [infoGroup, setInfoGroup] = useState<GroupInfo | null>(null);
 
   useEffect(() => { listRecentContacts().then(setRecentContacts).catch(() => {}); }, [peers, tab]);
-  useEffect(() => { listGroups().then(setGroups).catch(() => {}); }, [peers]);
+
+  // Keep infoGroup in sync with latest group data (for live member list)
+  useEffect(() => {
+    if (!infoGroup) return;
+    const updated = groups.find((g) => g.group_id === infoGroup.group_id);
+    if (updated) setInfoGroup(updated);
+  }, [groups]);
 
   const handleRemoveRecent = useCallback(async (peerId: string) => {
     await removeRecentContact(peerId).catch(() => {});
@@ -54,7 +60,6 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
       setShowCreateGroup(false);
       setNewGroupName("");
       setNewGroupMembers([]);
-      listGroups().then(setGroups).catch(() => {});
     } catch (e) {
       console.error("Failed to create group:", e);
     }
@@ -100,6 +105,8 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   for (const uc of unreadCounts) {
     unreadMap.set(uc.peer_id, uc.count);
   }
+
+  const groupsTotalUnread = groups.reduce((sum, g) => sum + (g.unread_count || 0), 0);
 
   const handleSearchChange = useCallback(async (value: string) => {
     setSearchQuery(value);
@@ -345,7 +352,12 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
           <div className="flex border-b border-gray-700">
             <button onClick={() => { setTab("recent"); listRecentContacts().then(setRecentContacts).catch(() => {}); }} className={`flex-1 py-2 text-xs font-medium ${tab === "recent" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>最近</button>
             <button onClick={() => setTab("contacts")} className={`flex-1 py-2 text-xs font-medium ${tab === "contacts" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>联系人</button>
-            <button onClick={() => { setTab("groups"); listGroups().then(setGroups).catch(() => {}); }} className={`flex-1 py-2 text-xs font-medium ${tab === "groups" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>群组</button>
+            <button onClick={() => setTab("groups")} className={`flex-1 py-2 text-xs font-medium relative ${tab === "groups" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>
+              群组
+              {groupsTotalUnread > 0 && (
+                <span className="absolute top-1 right-2 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center">{groupsTotalUnread > 99 ? "99+" : groupsTotalUnread}</span>
+              )}
+            </button>
           </div>
 
           {/* Tab content */}
@@ -373,16 +385,13 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                   <p className="px-4 py-8 text-xs text-gray-500 text-center">暂未加入群组</p>
                 ) : (
                   groups.map((g) => (
-                    <div key={g.group_id} className="flex items-center">
-                      <button onClick={() => { onSelectGroup(g.group_id); }}
-                        className={`flex-1 text-left px-4 py-2 hover:bg-gray-800 flex items-center gap-2 ${selectedGroupId === g.group_id ? "bg-indigo-600/20 border-l-2 border-indigo-400" : "border-l-2 border-transparent"}`}>
-                        <span className="text-sm">👥</span>
-                        <span className="text-sm text-gray-200 truncate">{g.name}</span>
-                        <span className="text-[10px] text-gray-500 ml-auto">{g.members?.length || 0}人</span>
-                      </button>
-                      <button onClick={() => { listGroups().then(setGroups).catch(() => {}); setInfoGroup(g); }}
-                        className="px-2 py-2 text-xs text-gray-500 hover:text-gray-300" title="群信息">ℹ️</button>
-                    </div>
+                    <GroupItem
+                      key={g.group_id}
+                      group={g}
+                      isSelected={selectedGroupId === g.group_id}
+                      onSelect={() => onSelectGroup(g.group_id)}
+                      onOpenInfo={() => setInfoGroup(g)}
+                    />
                   ))
                 )}
               </>
@@ -417,7 +426,6 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                 <input defaultValue={infoGroup.name} onBlur={async (e) => {
                   if (e.target.value.trim() && e.target.value !== infoGroup.name) {
                     await renameGroup(infoGroup.group_id, e.target.value.trim());
-                    listGroups().then(setGroups).catch(() => {});
                   }
                 }} className="flex-1 bg-gray-900 border border-gray-600 rounded px-2 py-1 text-gray-200 outline-none" />
               </div>
@@ -435,9 +443,8 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                   const pid = e.target.value;
                   if (pid && !infoGroup.members?.some((m) => m.peer_id === pid)) {
                     await inviteToGroup(infoGroup.group_id, [pid]);
-                    listGroups().then(setGroups).catch(() => {});
-                    setInfoGroup((prev) => prev ? {...prev, members: [...(prev.members||[]), {peer_id: pid, username: peers.find(p=>p.id===pid)?.username||pid, department:"", ip:"", port:0, is_online:false, first_seen_at:"", last_seen_at:""}]} : null);
                   }
+                  e.target.value = "";
                 }} className="flex-1 bg-gray-900 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 outline-none">
                   <option value="">+ 邀请成员</option>
                   {peers.filter((p) => !infoGroup.members?.some((m) => m.peer_id === p.id)).map((p) => (
@@ -446,14 +453,15 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                 </select>
               </div>
               <div className="flex gap-2 pt-2">
-                <button onClick={async () => { await leaveGroup(infoGroup.group_id); setInfoGroup(null); listGroups().then(setGroups).catch(() => {}); }}
-                  className="flex-1 py-1.5 text-xs rounded bg-yellow-700 hover:bg-yellow-600">退群</button>
+                {infoGroup.creator_id !== myId && (
+                  <button onClick={async () => { await leaveGroup(infoGroup.group_id); setInfoGroup(null); }}
+                    className="flex-1 py-1.5 text-xs rounded bg-yellow-700 hover:bg-yellow-600">退群</button>
+                )}
                 {infoGroup.creator_id === myId && (
                   <button onClick={async () => {
                     await dissolveGroup(infoGroup.group_id);
                     if (selectedGroupId === infoGroup.group_id) onSelectGroup("");
                     setInfoGroup(null);
-                    listGroups().then(setGroups).catch(() => {});
                   }}
                     className="flex-1 py-1.5 text-xs rounded bg-red-700 hover:bg-red-600">解散群</button>
                 )}
@@ -518,5 +526,38 @@ function PeerItem({ peer, isSelected, unread, onClick }: { peer: Peer; isSelecte
         </div>
       )}
     </button>
+  );
+}
+
+function GroupItem({ group, isSelected, onSelect, onOpenInfo }: { group: GroupInfo; isSelected: boolean; onSelect: () => void; onOpenInfo: () => void }) {
+  const unread = group.unread_count || 0;
+  const preview = group.last_message || "暂无消息";
+  const sender = group.last_message_sender;
+  const time = group.last_message_at ? new Date(group.last_message_at).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+  return (
+    <div className={`flex items-stretch ${isSelected ? "bg-indigo-600/20 border-l-2 border-indigo-400" : "border-l-2 border-transparent hover:bg-gray-800"}`}>
+      <button onClick={onSelect} className="flex-1 min-w-0 text-left px-4 py-3 flex items-center gap-3">
+        <div className="relative flex-shrink-0">
+          <div className="w-9 h-9 rounded-full bg-indigo-700 flex items-center justify-center text-base">👥</div>
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <p className="text-sm font-medium truncate flex-1">{group.name}</p>
+            <span className="text-[10px] text-gray-500 flex-shrink-0">{time}</span>
+          </div>
+          <p className="text-xs text-gray-400 truncate">
+            {sender ? <span className="text-gray-500">{sender}: </span> : null}
+            {preview}
+          </p>
+          <p className="text-[10px] text-gray-500 truncate">{group.members?.length || 0} 人</p>
+        </div>
+        {unread > 0 && !isSelected && (
+          <div className="flex-shrink-0 w-5 h-5 rounded-full bg-red-500 flex items-center justify-center text-[10px] font-bold text-white">
+            {unread > 99 ? "99+" : unread}
+          </div>
+        )}
+      </button>
+      <button onClick={onOpenInfo} className="px-2 text-xs text-gray-500 hover:text-gray-300" title="群信息">ℹ️</button>
+    </div>
   );
 }

@@ -388,7 +388,7 @@ pub async fn discover_by_ip(
     {
         let runtime = state.runtime.lock().await;
         if let Some(runtime) = runtime.as_ref() {
-            let mut disc = runtime.discovery.lock().await;
+            let disc = runtime.discovery.lock().await;
             // Don't duplicate: check by IP:port first
             let already = disc
                 .get_peers()
@@ -769,28 +769,26 @@ pub async fn create_group(
             None => (9527, vec![]),
         }
     };
+    let (my_name, my_department) = {
+        let p = state.profile.lock().await;
+        p.as_ref().map(|p| (p.username.clone(), p.department.clone()))
+            .unwrap_or_default()
+    };
+    let directory = build_member_directory(
+        &state.db, &online_peers, &all_members,
+        &my_id, &my_name, &my_department, listen_port,
+    ).await;
+
     for m in &all_members {
         if m == &my_id { continue; }
-        // Check discovery map first (online peers), then fallback to stored peers
-        let online = online_peers.iter().find(|p| p.id == *m);
-        let (ip, port) = if let Some(p) = online {
-            (p.ip, p.port)
-        } else if let Ok(Some(stored)) = state.db.get_stored_peer(m).await {
-            match stored.ip.parse::<std::net::IpAddr>() {
-                Ok(parsed_ip) => (parsed_ip, stored.port),
-                Err(_) => continue,
-            }
-        } else {
-            continue;
-        };
-        if ip.is_unspecified() || port == 0 { continue; }
+        let Some((ip, port)) = resolve_peer_addr(m, &state.db, &online_peers).await else { continue; };
 
         let notify = serde_json::json!({
-            "sender_id": my_id, "sender_name": "", "sender_department": "", "sender_port": listen_port,
+            "sender_id": my_id, "sender_name": my_name, "sender_department": my_department, "sender_port": listen_port,
             "receiver_id": m, "content": serde_json::json!({
                 "name": payload.name, "member_ids": all_members,
             }).to_string(),
-            "msg_type": "group_created", "group_id": gid, "known_peers": [],
+            "msg_type": "group_created", "group_id": gid, "known_peers": directory,
             "file_name": null, "file_size": null, "file_data": null,
         });
         let json = serde_json::to_string(&notify).unwrap_or_default();
@@ -805,7 +803,11 @@ pub async fn create_group(
         }
     }
 
-    Ok(crate::db::GroupInfo { group_id: gid, name: payload.name, creator_id: my_id, created_at: String::new(), members })
+    Ok(crate::db::GroupInfo {
+        group_id: gid, name: payload.name, creator_id: my_id,
+        created_at: String::new(), members,
+        last_message: None, last_message_at: None, last_message_sender: None, unread_count: 0,
+    })
 }
 
 #[tauri::command]
@@ -834,7 +836,7 @@ pub async fn send_group_message(
     };
 
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let msg = state.db.save_group_message(&group_id, &my_id, &my_name, &content, "text", None, None, None).await.map_err(|e| e.to_string())?;
+    let msg = state.db.save_group_message(&group_id, &my_id, &my_name, &content, "text", None, None, None, true).await.map_err(|e| e.to_string())?;
 
     // Get online peers for IP lookup
     let online_peers = {
@@ -848,29 +850,7 @@ pub async fn send_group_message(
     // Send to each member via TCP, queue for offline members
     for member in &members {
         if member.peer_id == my_id { continue; }
-        // Try discovery map first, then stored peer, then member fields
-        let (ip, port) = if let Ok(parsed) = member.ip.parse::<std::net::IpAddr>() {
-            if !parsed.is_unspecified() && member.port != 0 {
-                (parsed, member.port)
-            } else {
-                // Look up from online peers
-                if let Some(online) = online_peers.iter().find(|p| p.id == member.peer_id) {
-                    (online.ip, online.port)
-                } else if let Ok(Some(sp)) = state.db.get_stored_peer(&member.peer_id).await {
-                    (sp.ip.parse().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)), sp.port)
-                } else {
-                    continue;
-                }
-            }
-        } else {
-            // member.ip is invalid — try online peers
-            if let Some(online) = online_peers.iter().find(|p| p.id == member.peer_id) {
-                (online.ip, online.port)
-            } else {
-                continue;
-            }
-        };
-        if ip.is_unspecified() || port == 0 { continue; }
+        let Some((ip, port)) = resolve_peer_addr(&member.peer_id, &state.db, &online_peers).await else { continue; };
 
         let mut delivered = false;
         let addr = format!("{}:{}", ip, port);
@@ -910,49 +890,243 @@ pub async fn rename_group(state: State<'_, AppState>, group_id: String, new_name
 }
 
 #[tauri::command]
-pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result<(), String> {
-    let my_id = {
-        let runtime = state.runtime.lock().await;
-        runtime.as_ref().map(|r| r.my_id.clone()).unwrap_or_default()
+pub async fn invite_to_group(state: State<'_, AppState>, group_id: String, members: Vec<String>) -> Result<(), String> {
+    // 1) Persist new members locally
+    state.db.add_group_members(&group_id, &members).await.map_err(|e| e.to_string())?;
+
+    // 2) Fetch group info + full member list for the broadcast payload
+    let groups = {
+        let my_id_opt = state.runtime.lock().await.as_ref().map(|r| r.my_id.clone());
+        let my_id = my_id_opt.unwrap_or_default();
+        state.db.list_groups(&my_id).await.map_err(|e| e.to_string())?
     };
-    state.db.remove_group_member(&group_id, &my_id).await.map_err(|e| e.to_string())
+    let group = groups.iter().find(|g| g.group_id == group_id).ok_or("群组不存在")?.clone();
+    let member_records = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
+    let all_member_ids: Vec<String> = member_records.iter().map(|m| m.peer_id.clone()).collect();
+
+    let (my_id, listen_port, online_peers) = {
+        let runtime = state.runtime.lock().await;
+        let r = runtime.as_ref().ok_or("未初始化")?;
+        let my_id = r.my_id.clone();
+        let listen_port = r.listen_port;
+        let peers = r.discovery.lock().await.get_peers();
+        (my_id, listen_port, peers)
+    };
+    let (my_name, my_department) = {
+        let p = state.profile.lock().await;
+        p.as_ref().map(|p| (p.username.clone(), p.department.clone()))
+            .unwrap_or_default()
+    };
+    let directory = build_member_directory(
+        &state.db, &online_peers, &all_member_ids,
+        &my_id, &my_name, &my_department, listen_port,
+    ).await;
+
+    // 3) Broadcast group_created to ALL current members (new + existing) so member tables converge
+    for mid in &all_member_ids {
+        if mid == &my_id { continue; }
+        let Some((ip, port)) = resolve_peer_addr(mid, &state.db, &online_peers).await else { continue; };
+        let notify = serde_json::json!({
+            "sender_id": my_id, "sender_name": my_name, "sender_department": my_department, "sender_port": listen_port,
+            "receiver_id": mid, "content": serde_json::json!({
+                "name": group.name, "member_ids": all_member_ids,
+            }).to_string(),
+            "msg_type": "group_created", "group_id": group_id, "known_peers": directory,
+            "file_name": null, "file_size": null, "file_data": null,
+        });
+        let json = serde_json::to_string(&notify).unwrap_or_default();
+        let addr = format!("{}:{}", ip, port);
+        if let Ok(Ok(mut stream)) = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.write_all(json.as_bytes()).await;
+            let _ = stream.write_all(b"\n").await;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn invite_to_group(state: State<'_, AppState>, group_id: String, members: Vec<String>) -> Result<(), String> {
-    state.db.add_group_members(&group_id, &members).await.map_err(|e| e.to_string())
+pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result<(), String> {
+    let (my_id, listen_port, online_peers, members) = {
+        let runtime = state.runtime.lock().await;
+        let r = runtime.as_ref().ok_or("未初始化")?;
+        let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
+        let online = r.discovery.lock().await.get_peers();
+        (r.my_id.clone(), r.listen_port, online, members)
+    };
+
+    // Group creator cannot leave — must dissolve instead
+    let groups = state.db.list_groups(&my_id).await.map_err(|e| e.to_string())?;
+    if let Some(g) = groups.iter().find(|g| g.group_id == group_id) {
+        if g.creator_id == my_id {
+            return Err("群主不可退群，请使用解散群".to_string());
+        }
+    }
+    let (my_name, my_department) = {
+        let p = state.profile.lock().await;
+        p.as_ref().map(|p| (p.username.clone(), p.department.clone()))
+            .unwrap_or_default()
+    };
+
+    // Notify remaining members BEFORE removing ourselves
+    for m in &members {
+        if m.peer_id == my_id { continue; }
+        let Some((ip, port)) = resolve_peer_addr(&m.peer_id, &state.db, &online_peers).await else { continue; };
+        let notify = serde_json::json!({
+            "sender_id": my_id, "sender_name": my_name, "sender_department": my_department, "sender_port": listen_port,
+            "receiver_id": m.peer_id, "content": "",
+            "msg_type": "group_member_left", "group_id": group_id, "known_peers": [],
+            "file_name": null, "file_size": null, "file_data": null,
+        });
+        let json = serde_json::to_string(&notify).unwrap_or_default();
+        let addr = format!("{}:{}", ip, port);
+        if let Ok(Ok(mut stream)) = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.write_all(json.as_bytes()).await;
+            let _ = stream.write_all(b"\n").await;
+        }
+    }
+
+    state.db.remove_group_member(&group_id, &my_id).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn dissolve_group(state: State<'_, AppState>, group_id: String) -> Result<(), String> {
     let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
+    let (my_id, listen_port, online_peers) = {
+        let runtime = state.runtime.lock().await;
+        let r = runtime.as_ref().ok_or("未初始化")?;
+        let online = r.discovery.lock().await.get_peers();
+        (r.my_id.clone(), r.listen_port, online)
+    };
+    let (my_name, my_department) = {
+        let p = state.profile.lock().await;
+        p.as_ref().map(|p| (p.username.clone(), p.department.clone()))
+            .unwrap_or_default()
+    };
+
     state.db.dissolve_group(&group_id).await.map_err(|e| e.to_string())?;
 
     // Notify members via TCP
-    let (my_id, listen_port) = {
-        let runtime = state.runtime.lock().await;
-        let r = runtime.as_ref().ok_or("未初始化")?;
-        (r.my_id.clone(), r.listen_port)
-    };
     for m in &members {
         if m.peer_id == my_id { continue; }
-        if let Ok(ip) = m.ip.parse::<std::net::IpAddr>() {
-            if ip.is_unspecified() || m.port == 0 { continue; }
-            let wm = serde_json::json!({
-                "sender_id": my_id, "sender_name": "", "sender_department": "", "sender_port": listen_port,
-                "receiver_id": m.peer_id, "content": "群组已解散", "msg_type": "group_dissolved",
-                "group_id": group_id, "known_peers": [], "file_name": null, "file_size": null, "file_data": null,
-            });
-            let addr = format!("{}:{}", ip, m.port);
-            if let Ok(mut stream) = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await.map_err(|e| e.to_string())? {
-                use tokio::io::AsyncWriteExt;
-                let json = serde_json::to_string(&wm).unwrap_or_default();
-                let _ = stream.write_all(json.as_bytes()).await;
-                let _ = stream.write_all(b"\n").await;
-            }
+        let Some((ip, port)) = resolve_peer_addr(&m.peer_id, &state.db, &online_peers).await else { continue; };
+        let wm = serde_json::json!({
+            "sender_id": my_id, "sender_name": my_name, "sender_department": my_department, "sender_port": listen_port,
+            "receiver_id": m.peer_id, "content": "群组已解散", "msg_type": "group_dissolved",
+            "group_id": group_id, "known_peers": [], "file_name": null, "file_size": null, "file_data": null,
+        });
+        let addr = format!("{}:{}", ip, port);
+        if let Ok(Ok(mut stream)) = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
+            use tokio::io::AsyncWriteExt;
+            let json = serde_json::to_string(&wm).unwrap_or_default();
+            let _ = stream.write_all(json.as_bytes()).await;
+            let _ = stream.write_all(b"\n").await;
         }
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn send_group_file(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+    group_id: String,
+    file_path: String,
+) -> Result<ChatMessage, String> {
+    use chrono::Utc;
+    let (my_id, my_name, my_department, listen_port, db, peers_arc, members) = {
+        let runtime = state.runtime.lock().await;
+        let r = runtime.as_ref().ok_or("未初始化")?;
+        let my_name = state.profile.lock().await.as_ref().map(|p| p.username.clone()).unwrap_or_default();
+        let my_department = state.profile.lock().await.as_ref().map(|p| p.department.clone()).unwrap_or_default();
+        let chat = r.chat.lock().await;
+        let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
+        (r.my_id.clone(), my_name, my_department, r.listen_port, chat.db().clone(), chat.peers().clone(), members)
+    };
+
+    let file_name = std::path::Path::new(&file_path)
+        .file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+    let file_size = tokio::fs::metadata(&file_path).await
+        .map(|m| m.len() as i64).map_err(|e| e.to_string())?;
+
+    // Save outgoing file message to the group conversation (read=true for sender)
+    let saved = db.save_group_message(
+        &group_id, &my_id, &my_name,
+        &format!("📎 {}", file_name), "file",
+        Some(&file_path), Some(&file_name), Some(file_size), true,
+    ).await.map_err(|e| e.to_string())?;
+
+    // Get online peer snapshot once
+    let online_peers = {
+        let runtime = state.runtime.lock().await;
+        match runtime.as_ref() {
+            Some(r) => r.discovery.lock().await.get_peers(),
+            None => vec![],
+        }
+    };
+
+    for member in members {
+        if member.peer_id == my_id { continue; }
+        let Some((ip, port)) = resolve_peer_addr(&member.peer_id, &db, &online_peers).await else { continue; };
+        let peer = crate::discovery::Peer::new(
+            member.peer_id.clone(),
+            member.username.clone(),
+            member.department.clone(),
+            ip, port,
+        );
+        let bg_path = file_path.clone();
+        let bg_name = file_name.clone();
+        let bg_my_id = my_id.clone();
+        let bg_my_name = my_name.clone();
+        let bg_my_dep = my_department.clone();
+        let bg_db = db.clone();
+        let bg_peers = peers_arc.clone();
+        let bg_handle = app_handle.clone();
+        let bg_gid = group_id.clone();
+        tauri::async_runtime::spawn(async move {
+            match crate::chat::send_file_in_background_grouped(
+                &bg_path, &bg_name, &peer,
+                bg_my_id, bg_my_name, bg_my_dep, listen_port,
+                bg_db, bg_peers, bg_handle, Some(bg_gid),
+            ).await {
+                Ok(_) => log::info!("Group file sent to {}", peer.id),
+                Err(e) => log::error!("Group file send failed to {}: {}", peer.id, e),
+            }
+        });
+    }
+
+    Ok(ChatMessage {
+        id: saved.id,
+        sender_id: my_id,
+        sender_name: my_name,
+        receiver_id: String::new(),
+        content: format!("📎 {}", file_name),
+        msg_type: "file".to_string(),
+        file_name: Some(file_name),
+        file_path: Some(file_path),
+        file_size: Some(file_size),
+        timestamp: Utc::now().to_rfc3339(),
+        is_read: true,
+    })
+}
+
+#[tauri::command]
+pub async fn get_group_unread_counts(state: State<'_, AppState>) -> Result<Vec<crate::db::GroupUnread>, String> {
+    let runtime = state.runtime.lock().await;
+    let Some(runtime) = runtime.as_ref() else {
+        return Ok(vec![]);
+    };
+    state.db.get_group_unread_counts(&runtime.my_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn mark_group_read(state: State<'_, AppState>, group_id: String) -> Result<(), String> {
+    let runtime = state.runtime.lock().await;
+    let Some(runtime) = runtime.as_ref() else {
+        return Ok(());
+    };
+    state.db.mark_group_read(&group_id, &runtime.my_id).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -960,7 +1134,7 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
     let pending = state.db.get_pending_for_peer(&peer_id).await.map_err(|e| e.to_string())?;
     if pending.is_empty() { return Ok(()); }
 
-    let (my_id, listen_port) = {
+    let (_my_id, listen_port) = {
         let runtime = state.runtime.lock().await;
         let r = runtime.as_ref().ok_or("未初始化")?;
         (r.my_id.clone(), r.listen_port)
@@ -1061,4 +1235,83 @@ fn echo_files_dir() -> std::path::PathBuf {
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/tmp".to_string());
     std::path::PathBuf::from(home).join("Echo").join("files")
+}
+
+async fn resolve_peer_addr(
+    peer_id: &str,
+    db: &crate::db::Database,
+    online_peers: &[Peer],
+) -> Option<(std::net::IpAddr, u16)> {
+    if let Some(p) = online_peers.iter().find(|p| p.id == peer_id) {
+        if !p.ip.is_unspecified() && p.port != 0 {
+            return Some((p.ip, p.port));
+        }
+    }
+    if let Ok(Some(sp)) = db.get_stored_peer(peer_id).await {
+        if let Ok(ip) = sp.ip.parse::<std::net::IpAddr>() {
+            if !ip.is_unspecified() && sp.port != 0 {
+                return Some((ip, sp.port));
+            }
+        }
+    }
+    None
+}
+
+/// Build a full PeerEntry list for the given member ids, including ourselves.
+/// Used so receivers of `group_created` can populate their local `peers` table
+/// with usernames/departments even for members they've never directly contacted.
+async fn build_member_directory(
+    db: &crate::db::Database,
+    online_peers: &[Peer],
+    member_ids: &[String],
+    self_id: &str,
+    self_name: &str,
+    self_department: &str,
+    self_port: u16,
+) -> Vec<crate::discovery::PeerEntry> {
+    let my_ip = local_ip_address::local_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+    let mut out = Vec::with_capacity(member_ids.len());
+    for id in member_ids {
+        if id == self_id {
+            out.push(crate::discovery::PeerEntry {
+                id: self_id.to_string(),
+                username: self_name.to_string(),
+                department: self_department.to_string(),
+                ip: my_ip.clone(),
+                port: self_port,
+            });
+            continue;
+        }
+        if let Some(p) = online_peers.iter().find(|p| p.id == *id) {
+            out.push(crate::discovery::PeerEntry {
+                id: p.id.clone(),
+                username: p.username.clone(),
+                department: p.department.clone(),
+                ip: p.ip.to_string(),
+                port: p.port,
+            });
+            continue;
+        }
+        if let Ok(Some(sp)) = db.get_stored_peer(id).await {
+            out.push(crate::discovery::PeerEntry {
+                id: sp.peer_id,
+                username: sp.username,
+                department: sp.department,
+                ip: sp.ip,
+                port: sp.port,
+            });
+        } else {
+            // Member we have no info about — still ship the id so receivers know they exist
+            out.push(crate::discovery::PeerEntry {
+                id: id.clone(),
+                username: String::new(),
+                department: String::new(),
+                ip: String::new(),
+                port: 0,
+            });
+        }
+    }
+    out
 }

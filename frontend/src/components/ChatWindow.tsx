@@ -21,6 +21,7 @@ interface ChatWindowProps {
   peer: Peer | null;
   messages: ChatMessage[];
   myId: string;
+  isGroup?: boolean;
   onSendMessage: (content: string) => Promise<ChatMessage>;
   onSendFile: (filePath: string) => Promise<void | ChatMessage>;
 }
@@ -51,7 +52,7 @@ function formatSpeed(bytesPerSec: number | undefined): string {
   return `${bytesPerSec} B/s`;
 }
 
-export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: ChatWindowProps) {
+export function ChatWindow({ peer, messages, myId, isGroup = false, onSendMessage, onSendFile }: ChatWindowProps) {
   const [inputText, setInputText] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
@@ -340,14 +341,16 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
 
       <div className="flex items-center gap-3 px-5 py-3 bg-gray-900/80 border-b border-gray-700 backdrop-blur">
         <div className="relative">
-          <div className="w-9 h-9 rounded-full bg-gray-600 flex items-center justify-center text-sm font-medium text-white">
-            {peer.username.charAt(0).toUpperCase()}
+          <div className={`w-9 h-9 rounded-full flex items-center justify-center text-sm font-medium text-white ${isGroup ? "bg-indigo-700 text-base" : "bg-gray-600"}`}>
+            {isGroup ? "👥" : peer.username.charAt(0).toUpperCase()}
           </div>
-          <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-gray-900 ${peer.online ? "bg-green-400" : "bg-gray-500"}`} />
+          {!isGroup && (
+            <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-gray-900 ${peer.online ? "bg-green-400" : "bg-gray-500"}`} />
+          )}
         </div>
         <div className="flex-1 min-w-0">
           <p className="text-white text-sm font-semibold truncate">{peer.username}</p>
-          <p className="text-xs text-gray-400">{peer.online ? `${peer.ip}:${peer.port}` : "群聊"}</p>
+          <p className="text-xs text-gray-400">{isGroup ? "群聊" : (peer.online ? `${peer.ip}:${peer.port}` : "离线")}</p>
         </div>
       </div>
 
@@ -407,7 +410,7 @@ export function ChatWindow({ peer, messages, myId, onSendMessage, onSendFile }: 
               );
             }
             return (
-              <MessageBubble key={item.id} message={item} isOwn={item.sender_id === myId} />
+              <MessageBubble key={item.id} message={item} isOwn={item.sender_id === myId} showSender={isGroup} />
             );
           })
         )}

@@ -76,6 +76,15 @@ export interface GroupInfo {
   creator_id: string;
   created_at: string;
   members: StoredPeer[];
+  last_message?: string | null;
+  last_message_at?: string | null;
+  last_message_sender?: string | null;
+  unread_count?: number;
+}
+
+export interface GroupUnread {
+  group_id: string;
+  count: number;
 }
 
 export async function createGroup(name: string, members: string[]): Promise<GroupInfo> {
@@ -88,6 +97,10 @@ export async function listGroups(): Promise<GroupInfo[]> {
 
 export async function sendGroupMessage(groupId: string, content: string): Promise<ChatMessage> {
   return await invoke("send_group_message", { groupId, content });
+}
+
+export async function sendGroupFile(groupId: string, filePath: string): Promise<ChatMessage> {
+  return await invoke("send_group_file", { groupId, filePath });
 }
 
 export async function getGroupMessages(groupId: string): Promise<ChatMessage[]> {
@@ -108,6 +121,14 @@ export async function inviteToGroup(groupId: string, members: string[]): Promise
 
 export async function dissolveGroup(groupId: string): Promise<void> {
   await invoke("dissolve_group", { groupId });
+}
+
+export async function getGroupUnreadCounts(): Promise<GroupUnread[]> {
+  return await invoke("get_group_unread_counts");
+}
+
+export async function markGroupRead(groupId: string): Promise<void> {
+  await invoke("mark_group_read", { groupId });
 }
 
 export async function saveTempFile(data: number[], filename: string): Promise<string> {

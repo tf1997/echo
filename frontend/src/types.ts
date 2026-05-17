@@ -58,4 +58,13 @@ export interface GroupInfo {
   creator_id: string;
   created_at: string;
   members: StoredPeer[];
+  last_message?: string | null;
+  last_message_at?: string | null;
+  last_message_sender?: string | null;
+  unread_count?: number;
+}
+
+export interface GroupUnread {
+  group_id: string;
+  count: number;
 }

@@ -204,11 +204,14 @@ pub fn run() {
             commands::create_group,
             commands::list_groups,
             commands::send_group_message,
+            commands::send_group_file,
             commands::get_group_messages,
             commands::rename_group,
             commands::leave_group,
             commands::invite_to_group,
             commands::dissolve_group,
+            commands::get_group_unread_counts,
+            commands::mark_group_read,
             commands::deliver_pending,
         ])
         .run(tauri::generate_context!())
