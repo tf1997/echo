@@ -339,12 +339,15 @@ function App() {
         peer={selectedGroupId ? { id: selectedGroupId, username: groups.find(g => g.group_id === selectedGroupId)?.name || "群聊", department: "", ip: "", port: 0, online: true } : selectedPeer}
         messages={messages}
         myId={appInfo.peer_id}
+        myName={appInfo.username}
         isGroup={!!selectedGroupId}
         groupId={selectedGroupId}
+        groupInfo={selectedGroupId ? groups.find(g => g.group_id === selectedGroupId) ?? null : null}
         peers={peers}
         groups={groups}
         onSendMessage={selectedGroupId ? ((content: string) => handleSendGroupMsg(selectedGroupId!, content)) : handleSendMessage}
         onSendFile={handleSendFile}
+        onGroupUpdated={() => listGroups().then(setGroups).catch(() => {})}
       />
     </div>
   );

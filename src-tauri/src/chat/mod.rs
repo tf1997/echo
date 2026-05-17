@@ -163,6 +163,14 @@ impl ChatServer {
                             // Always add members (covers re-broadcast after invite_to_group)
                             let _ = db.add_group_members(gid, &all_members).await;
                             info!("Synced group {} ({} members)", group_name, all_members.len());
+                        } else if msg.msg_type == "group_renamed" {
+                            // file_name carries the actual new name; content is the display message.
+                            // For offline-queued messages, fall back to parsing content.
+                            let new_name = msg.file_name.as_deref().unwrap_or_else(|| {
+                                msg.content.trim_start_matches("群名已修改为「").trim_end_matches('」')
+                            });
+                            let _ = db.rename_group(gid, new_name).await;
+                            info!("Group {} renamed to {}", gid, new_name);
                         } else if msg.msg_type == "group_dissolved" {
                             let _ = db.remove_group_member(gid, &my_id).await;
                             info!("Group {} dissolved — removed", gid);

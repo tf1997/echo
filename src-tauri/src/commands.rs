@@ -788,7 +788,7 @@ pub async fn create_group(
         &state.db, &online_peers, &all_members,
         &my_id, &my_name, &my_department, listen_port,
     ).await;
-
+    let timestamp = chrono::Utc::now().to_rfc3339();
     for m in &all_members {
         if m == &my_id { continue; }
         let Some((ip, port)) = resolve_peer_addr(m, &state.db, &online_peers).await else { continue; };
@@ -803,13 +803,16 @@ pub async fn create_group(
         });
         let json = serde_json::to_string(&notify).unwrap_or_default();
         let addr = format!("{}:{}", ip, port);
-        match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
+        let delivered = match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
             Ok(Ok(mut stream)) => {
                 use tokio::io::AsyncWriteExt;
-                let _ = stream.write_all(json.as_bytes()).await;
-                let _ = stream.write_all(b"\n").await;
+                stream.write_all(json.as_bytes()).await.is_ok() && stream.write_all(b"\n").await.is_ok()
             }
-            _ => {}
+            _ => false,
+        };
+        if !delivered {
+            let content = serde_json::json!({"name": payload.name, "member_ids": all_members}).to_string();
+            let _ = state.db.store_pending_group_msg(&gid, m, &my_id, &my_name, &content, "group_created", &timestamp).await;
         }
     }
 
@@ -900,7 +903,46 @@ pub async fn get_group_messages(state: State<'_, AppState>, group_id: String) ->
 
 #[tauri::command]
 pub async fn rename_group(state: State<'_, AppState>, group_id: String, new_name: String) -> Result<(), String> {
-    state.db.rename_group(&group_id, &new_name).await.map_err(|e| e.to_string())
+    state.db.rename_group(&group_id, &new_name).await.map_err(|e| e.to_string())?;
+
+    let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
+    let (my_id, my_name, my_department, listen_port, online_peers) = {
+        let runtime = state.runtime.lock().await;
+        let r = runtime.as_ref().ok_or("未初始化")?;
+        let my_name = state.profile.lock().await.as_ref().map(|p| p.username.clone()).unwrap_or_default();
+        let my_dept = state.profile.lock().await.as_ref().map(|p| p.department.clone()).unwrap_or_default();
+        let peers = r.discovery.lock().await.get_peers();
+        (r.my_id.clone(), my_name, my_dept, r.listen_port, peers)
+    };
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    for m in &members {
+        if m.peer_id == my_id { continue; }
+        let Some((ip, port)) = resolve_peer_addr(&m.peer_id, &state.db, &online_peers).await else { continue; };
+        let wm = crate::chat::WireMessage {
+            sender_id: my_id.clone(), sender_name: my_name.clone(),
+            sender_department: my_department.clone(), sender_port: listen_port,
+            receiver_id: m.peer_id.clone(),
+            content: format!("群名已修改为「{}」", new_name),
+            msg_type: "group_renamed".to_string(),
+            file_name: Some(new_name.clone()),
+            file_size: None, file_data: None,
+            known_peers: Vec::new(), group_id: Some(group_id.clone()),
+        };
+        let json = serde_json::to_string(&wm).unwrap_or_default();
+        let addr = format!("{}:{}", ip, port);
+        let delivered = match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
+            Ok(Ok(mut stream)) => {
+                use tokio::io::AsyncWriteExt;
+                stream.write_all(json.as_bytes()).await.is_ok() && stream.write_all(b"\n").await.is_ok()
+            }
+            _ => false,
+        };
+        if !delivered {
+            let _ = state.db.store_pending_group_msg(&group_id, &m.peer_id, &my_id, &my_name, &format!("群名已修改为「{}」", new_name), "group_renamed", &timestamp).await;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -935,25 +977,30 @@ pub async fn invite_to_group(state: State<'_, AppState>, group_id: String, membe
         &state.db, &online_peers, &all_member_ids,
         &my_id, &my_name, &my_department, listen_port,
     ).await;
+    let timestamp = chrono::Utc::now().to_rfc3339();
 
     // 3) Broadcast group_created to ALL current members (new + existing) so member tables converge
     for mid in &all_member_ids {
         if mid == &my_id { continue; }
         let Some((ip, port)) = resolve_peer_addr(mid, &state.db, &online_peers).await else { continue; };
+        let content = serde_json::json!({"name": group.name, "member_ids": all_member_ids}).to_string();
         let notify = serde_json::json!({
             "sender_id": my_id, "sender_name": my_name, "sender_department": my_department, "sender_port": listen_port,
-            "receiver_id": mid, "content": serde_json::json!({
-                "name": group.name, "member_ids": all_member_ids,
-            }).to_string(),
+            "receiver_id": mid, "content": content,
             "msg_type": "group_created", "group_id": group_id, "known_peers": directory,
             "file_name": null, "file_size": null, "file_data": null,
         });
         let json = serde_json::to_string(&notify).unwrap_or_default();
         let addr = format!("{}:{}", ip, port);
-        if let Ok(Ok(mut stream)) = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
-            use tokio::io::AsyncWriteExt;
-            let _ = stream.write_all(json.as_bytes()).await;
-            let _ = stream.write_all(b"\n").await;
+        let delivered = match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
+            Ok(Ok(mut stream)) => {
+                use tokio::io::AsyncWriteExt;
+                stream.write_all(json.as_bytes()).await.is_ok() && stream.write_all(b"\n").await.is_ok()
+            }
+            _ => false,
+        };
+        if !delivered {
+            let _ = state.db.store_pending_group_msg(&group_id, mid, &my_id, &my_name, &content, "group_created", &timestamp).await;
         }
     }
     Ok(())
