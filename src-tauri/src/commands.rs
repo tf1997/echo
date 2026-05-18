@@ -119,6 +119,33 @@ pub async fn save_profile(
             .update_profile(username, department)
             .await
             .map_err(|e| e.to_string())?;
+
+        // Notify peers we know about so their cached username/department updates.
+        // This includes online + stored peers, deduped. Offline peers get the
+        // change via the same pending_notifications queue used for group msgs.
+        let listen_port = runtime.listen_port;
+        let my_id = runtime.my_id.clone();
+        let online_peers = runtime.discovery.lock().await.get_peers();
+        drop(runtime_guard);
+
+        let stored = state.db.list_stored_peers().await.unwrap_or_default();
+        let mut targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for p in &online_peers { targets.insert(p.id.clone()); }
+        for sp in &stored { targets.insert(sp.peer_id.clone()); }
+        targets.remove(&my_id);
+        let target_ids: Vec<String> = targets.into_iter().collect();
+
+        let payload = serde_json::json!({
+            "username": username,
+            "department": department,
+        }).to_string();
+
+        let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
+        send_or_queue_notification(
+            &state.db, &online_peers, &target_ids,
+            &my_id, username, department, listen_port,
+            &payload, "profile_updated", None, None, &empty_dir,
+        ).await;
     } else {
         drop(runtime_guard);
 
@@ -771,7 +798,6 @@ pub async fn create_group(
     state.db.create_group(&gid, &payload.name, &my_id, &all_members).await.map_err(|e| e.to_string())?;
     let members = state.db.get_group_members(&gid).await.unwrap_or_default();
 
-    // Notify online members about the new group via TCP
     let (listen_port, online_peers) = {
         let runtime = state.runtime.lock().await;
         match runtime.as_ref() {
@@ -788,33 +814,13 @@ pub async fn create_group(
         &state.db, &online_peers, &all_members,
         &my_id, &my_name, &my_department, listen_port,
     ).await;
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    for m in &all_members {
-        if m == &my_id { continue; }
-        let Some((ip, port)) = resolve_peer_addr(m, &state.db, &online_peers).await else { continue; };
+    let content = serde_json::json!({"name": payload.name, "member_ids": all_members}).to_string();
 
-        let notify = serde_json::json!({
-            "sender_id": my_id, "sender_name": my_name, "sender_department": my_department, "sender_port": listen_port,
-            "receiver_id": m, "content": serde_json::json!({
-                "name": payload.name, "member_ids": all_members,
-            }).to_string(),
-            "msg_type": "group_created", "group_id": gid, "known_peers": directory,
-            "file_name": null, "file_size": null, "file_data": null,
-        });
-        let json = serde_json::to_string(&notify).unwrap_or_default();
-        let addr = format!("{}:{}", ip, port);
-        let delivered = match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
-            Ok(Ok(mut stream)) => {
-                use tokio::io::AsyncWriteExt;
-                stream.write_all(json.as_bytes()).await.is_ok() && stream.write_all(b"\n").await.is_ok()
-            }
-            _ => false,
-        };
-        if !delivered {
-            let content = serde_json::json!({"name": payload.name, "member_ids": all_members}).to_string();
-            let _ = state.db.store_pending_group_msg(&gid, m, &my_id, &my_name, &content, "group_created", &timestamp).await;
-        }
-    }
+    send_or_queue_notification(
+        &state.db, &online_peers, &all_members,
+        &my_id, &my_name, &my_department, listen_port,
+        &content, "group_created", Some(&gid), None, &directory,
+    ).await;
 
     Ok(crate::db::GroupInfo {
         group_id: gid, name: payload.name, creator_id: my_id,
@@ -847,15 +853,16 @@ pub async fn send_group_message(
 pub async fn send_group_message_typed(
     state: State<'_, AppState>, group_id: String, content: String, msg_type: String,
 ) -> Result<ChatMessage, String> {
-    let (my_id, my_name, listen_port, members) = {
+    let (my_id, my_name, my_department, listen_port, members) = {
         let runtime = state.runtime.lock().await;
         let r = runtime.as_ref().ok_or("未初始化")?;
-        let my_name = state.profile.lock().await.as_ref().map(|p| p.username.clone()).unwrap_or_default();
+        let prof = state.profile.lock().await;
+        let my_name = prof.as_ref().map(|p| p.username.clone()).unwrap_or_default();
+        let my_dept = prof.as_ref().map(|p| p.department.clone()).unwrap_or_default();
         let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
-        (r.my_id.clone(), my_name, r.listen_port, members)
+        (r.my_id.clone(), my_name, my_dept, r.listen_port, members)
     };
 
-    let timestamp = chrono::Utc::now().to_rfc3339();
     let msg = state.db.save_group_message(&group_id, &my_id, &my_name, &content, &msg_type, None, None, None, true).await.map_err(|e| e.to_string())?;
 
     let online_peers = {
@@ -866,33 +873,14 @@ pub async fn send_group_message_typed(
         }
     };
 
-    for member in &members {
-        if member.peer_id == my_id { continue; }
-        let Some((ip, port)) = resolve_peer_addr(&member.peer_id, &state.db, &online_peers).await else { continue; };
+    let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
+    let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
+    send_or_queue_notification(
+        &state.db, &online_peers, &target_ids,
+        &my_id, &my_name, &my_department, listen_port,
+        &content, &msg_type, Some(&group_id), None, &empty_dir,
+    ).await;
 
-        let mut delivered = false;
-        let addr = format!("{}:{}", ip, port);
-        let wm = crate::chat::WireMessage {
-            sender_id: my_id.clone(), sender_name: my_name.clone(),
-            sender_department: String::new(), sender_port: listen_port,
-            receiver_id: member.peer_id.clone(), content: content.clone(),
-            msg_type: msg_type.clone(), file_name: None, file_size: None, file_data: None,
-            known_peers: Vec::new(), group_id: Some(group_id.clone()),
-        };
-        let json = serde_json::to_string(&wm).map_err(|e| e.to_string())?;
-        match tokio::time::timeout(std::time::Duration::from_secs(3), tokio::net::TcpStream::connect(&addr)).await {
-            Ok(Ok(mut stream)) => {
-                use tokio::io::AsyncWriteExt;
-                if stream.write_all(json.as_bytes()).await.is_ok() && stream.write_all(b"\n").await.is_ok() {
-                    delivered = true;
-                }
-            }
-            _ => {}
-        }
-        if !delivered {
-            let _ = state.db.store_pending_group_msg(&group_id, &member.peer_id, &my_id, &my_name, &content, &msg_type, &timestamp).await;
-        }
-    }
     Ok(msg)
 }
 
@@ -909,48 +897,28 @@ pub async fn rename_group(state: State<'_, AppState>, group_id: String, new_name
     let (my_id, my_name, my_department, listen_port, online_peers) = {
         let runtime = state.runtime.lock().await;
         let r = runtime.as_ref().ok_or("未初始化")?;
-        let my_name = state.profile.lock().await.as_ref().map(|p| p.username.clone()).unwrap_or_default();
-        let my_dept = state.profile.lock().await.as_ref().map(|p| p.department.clone()).unwrap_or_default();
+        let prof = state.profile.lock().await;
+        let my_name = prof.as_ref().map(|p| p.username.clone()).unwrap_or_default();
+        let my_dept = prof.as_ref().map(|p| p.department.clone()).unwrap_or_default();
         let peers = r.discovery.lock().await.get_peers();
         (r.my_id.clone(), my_name, my_dept, r.listen_port, peers)
     };
-    let timestamp = chrono::Utc::now().to_rfc3339();
 
-    for m in &members {
-        if m.peer_id == my_id { continue; }
-        let Some((ip, port)) = resolve_peer_addr(&m.peer_id, &state.db, &online_peers).await else { continue; };
-        let wm = crate::chat::WireMessage {
-            sender_id: my_id.clone(), sender_name: my_name.clone(),
-            sender_department: my_department.clone(), sender_port: listen_port,
-            receiver_id: m.peer_id.clone(),
-            content: format!("群名已修改为「{}」", new_name),
-            msg_type: "group_renamed".to_string(),
-            file_name: Some(new_name.clone()),
-            file_size: None, file_data: None,
-            known_peers: Vec::new(), group_id: Some(group_id.clone()),
-        };
-        let json = serde_json::to_string(&wm).unwrap_or_default();
-        let addr = format!("{}:{}", ip, port);
-        let delivered = match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
-            Ok(Ok(mut stream)) => {
-                use tokio::io::AsyncWriteExt;
-                stream.write_all(json.as_bytes()).await.is_ok() && stream.write_all(b"\n").await.is_ok()
-            }
-            _ => false,
-        };
-        if !delivered {
-            let _ = state.db.store_pending_group_msg(&group_id, &m.peer_id, &my_id, &my_name, &format!("群名已修改为「{}」", new_name), "group_renamed", &timestamp).await;
-        }
-    }
+    let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
+    let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
+    send_or_queue_notification(
+        &state.db, &online_peers, &target_ids,
+        &my_id, &my_name, &my_department, listen_port,
+        &format!("群名已修改为「{}」", new_name),
+        "group_renamed", Some(&group_id), Some(&new_name), &empty_dir,
+    ).await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn invite_to_group(state: State<'_, AppState>, group_id: String, members: Vec<String>) -> Result<(), String> {
-    // 1) Persist new members locally
     state.db.add_group_members(&group_id, &members).await.map_err(|e| e.to_string())?;
 
-    // 2) Fetch group info + full member list for the broadcast payload
     let groups = {
         let my_id_opt = state.runtime.lock().await.as_ref().map(|r| r.my_id.clone());
         let my_id = my_id_opt.unwrap_or_default();
@@ -963,46 +931,24 @@ pub async fn invite_to_group(state: State<'_, AppState>, group_id: String, membe
     let (my_id, listen_port, online_peers) = {
         let runtime = state.runtime.lock().await;
         let r = runtime.as_ref().ok_or("未初始化")?;
-        let my_id = r.my_id.clone();
-        let listen_port = r.listen_port;
         let peers = r.discovery.lock().await.get_peers();
-        (my_id, listen_port, peers)
+        (r.my_id.clone(), r.listen_port, peers)
     };
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
-        p.as_ref().map(|p| (p.username.clone(), p.department.clone()))
-            .unwrap_or_default()
+        p.as_ref().map(|p| (p.username.clone(), p.department.clone())).unwrap_or_default()
     };
     let directory = build_member_directory(
         &state.db, &online_peers, &all_member_ids,
         &my_id, &my_name, &my_department, listen_port,
     ).await;
-    let timestamp = chrono::Utc::now().to_rfc3339();
+    let content = serde_json::json!({"name": group.name, "member_ids": all_member_ids}).to_string();
 
-    // 3) Broadcast group_created to ALL current members (new + existing) so member tables converge
-    for mid in &all_member_ids {
-        if mid == &my_id { continue; }
-        let Some((ip, port)) = resolve_peer_addr(mid, &state.db, &online_peers).await else { continue; };
-        let content = serde_json::json!({"name": group.name, "member_ids": all_member_ids}).to_string();
-        let notify = serde_json::json!({
-            "sender_id": my_id, "sender_name": my_name, "sender_department": my_department, "sender_port": listen_port,
-            "receiver_id": mid, "content": content,
-            "msg_type": "group_created", "group_id": group_id, "known_peers": directory,
-            "file_name": null, "file_size": null, "file_data": null,
-        });
-        let json = serde_json::to_string(&notify).unwrap_or_default();
-        let addr = format!("{}:{}", ip, port);
-        let delivered = match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
-            Ok(Ok(mut stream)) => {
-                use tokio::io::AsyncWriteExt;
-                stream.write_all(json.as_bytes()).await.is_ok() && stream.write_all(b"\n").await.is_ok()
-            }
-            _ => false,
-        };
-        if !delivered {
-            let _ = state.db.store_pending_group_msg(&group_id, mid, &my_id, &my_name, &content, "group_created", &timestamp).await;
-        }
-    }
+    send_or_queue_notification(
+        &state.db, &online_peers, &all_member_ids,
+        &my_id, &my_name, &my_department, listen_port,
+        &content, "group_created", Some(&group_id), None, &directory,
+    ).await;
     Ok(())
 }
 
@@ -1016,7 +962,6 @@ pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result
         (r.my_id.clone(), r.listen_port, online, members)
     };
 
-    // Group creator cannot leave — must dissolve instead
     let groups = state.db.list_groups(&my_id).await.map_err(|e| e.to_string())?;
     if let Some(g) = groups.iter().find(|g| g.group_id == group_id) {
         if g.creator_id == my_id {
@@ -1025,28 +970,16 @@ pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result
     }
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
-        p.as_ref().map(|p| (p.username.clone(), p.department.clone()))
-            .unwrap_or_default()
+        p.as_ref().map(|p| (p.username.clone(), p.department.clone())).unwrap_or_default()
     };
 
-    // Notify remaining members BEFORE removing ourselves
-    for m in &members {
-        if m.peer_id == my_id { continue; }
-        let Some((ip, port)) = resolve_peer_addr(&m.peer_id, &state.db, &online_peers).await else { continue; };
-        let notify = serde_json::json!({
-            "sender_id": my_id, "sender_name": my_name, "sender_department": my_department, "sender_port": listen_port,
-            "receiver_id": m.peer_id, "content": "",
-            "msg_type": "group_member_left", "group_id": group_id, "known_peers": [],
-            "file_name": null, "file_size": null, "file_data": null,
-        });
-        let json = serde_json::to_string(&notify).unwrap_or_default();
-        let addr = format!("{}:{}", ip, port);
-        if let Ok(Ok(mut stream)) = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
-            use tokio::io::AsyncWriteExt;
-            let _ = stream.write_all(json.as_bytes()).await;
-            let _ = stream.write_all(b"\n").await;
-        }
-    }
+    let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
+    let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
+    send_or_queue_notification(
+        &state.db, &online_peers, &target_ids,
+        &my_id, &my_name, &my_department, listen_port,
+        "", "group_member_left", Some(&group_id), None, &empty_dir,
+    ).await;
 
     state.db.remove_group_member(&group_id, &my_id).await.map_err(|e| e.to_string())
 }
@@ -1057,34 +990,23 @@ pub async fn dissolve_group(state: State<'_, AppState>, group_id: String) -> Res
     let (my_id, listen_port, online_peers) = {
         let runtime = state.runtime.lock().await;
         let r = runtime.as_ref().ok_or("未初始化")?;
-        let online = r.discovery.lock().await.get_peers();
-        (r.my_id.clone(), r.listen_port, online)
+        let peers = r.discovery.lock().await.get_peers();
+        (r.my_id.clone(), r.listen_port, peers)
     };
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
-        p.as_ref().map(|p| (p.username.clone(), p.department.clone()))
-            .unwrap_or_default()
+        p.as_ref().map(|p| (p.username.clone(), p.department.clone())).unwrap_or_default()
     };
 
     state.db.dissolve_group(&group_id).await.map_err(|e| e.to_string())?;
 
-    // Notify members via TCP
-    for m in &members {
-        if m.peer_id == my_id { continue; }
-        let Some((ip, port)) = resolve_peer_addr(&m.peer_id, &state.db, &online_peers).await else { continue; };
-        let wm = serde_json::json!({
-            "sender_id": my_id, "sender_name": my_name, "sender_department": my_department, "sender_port": listen_port,
-            "receiver_id": m.peer_id, "content": "群组已解散", "msg_type": "group_dissolved",
-            "group_id": group_id, "known_peers": [], "file_name": null, "file_size": null, "file_data": null,
-        });
-        let addr = format!("{}:{}", ip, port);
-        if let Ok(Ok(mut stream)) = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
-            use tokio::io::AsyncWriteExt;
-            let json = serde_json::to_string(&wm).unwrap_or_default();
-            let _ = stream.write_all(json.as_bytes()).await;
-            let _ = stream.write_all(b"\n").await;
-        }
-    }
+    let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
+    let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
+    send_or_queue_notification(
+        &state.db, &online_peers, &target_ids,
+        &my_id, &my_name, &my_department, listen_port,
+        "群组已解散", "group_dissolved", Some(&group_id), None, &empty_dir,
+    ).await;
     Ok(())
 }
 
@@ -1233,54 +1155,54 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
     Ok(())
 }
 
-/// Deliver pending group messages to a peer (can be called from anywhere with DB access).
+/// Deliver pending notifications (any kind) to a peer that just came back online.
 pub async fn deliver_pending_to_peer(db: &crate::db::Database, peer_id_str: &str) {
-    let pending = match db.get_pending_for_peer(peer_id_str).await {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    if pending.is_empty() { return; }
-    let peer_opt = match db.get_stored_peer(peer_id_str).await {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let stored = match peer_opt {
-        Some(p) => p,
-        None => return,
+    // Resolve peer address.
+    let stored = match db.get_stored_peer(peer_id_str).await {
+        Ok(Some(p)) => p,
+        _ => return,
     };
     let ip: std::net::IpAddr = match stored.ip.parse() {
         Ok(ip) => ip,
         Err(_) => return,
     };
     if ip.is_unspecified() || stored.port == 0 { return; }
+    let addr = format!("{}:{}", ip, stored.port);
 
-    let port = stored.port;
-    let addr = format!("{}:{}", ip, port);
+    // 1) Generic pending_notifications (preferred — payload is a full WireMessage).
+    let notifs = db.get_pending_notifications(peer_id_str).await.unwrap_or_default();
+    let mut delivered_notif_ids = Vec::new();
+    for (id, _kind, payload) in &notifs {
+        if deliver_over_tcp(&addr, payload).await {
+            delivered_notif_ids.push(*id);
+        }
+    }
+    if !delivered_notif_ids.is_empty() {
+        let _ = db.delete_pending_notifications(&delivered_notif_ids).await;
+        log::info!("Delivered {} pending notifs to {}", delivered_notif_ids.len(), peer_id_str);
+    }
+
+    // 2) Legacy pending_group_messages — still drained for backward-compat with
+    // any data queued by previous app versions.
+    let pending = db.get_pending_for_peer(peer_id_str).await.unwrap_or_default();
+    if pending.is_empty() { return; }
     let mut delivered = Vec::new();
     for p in &pending {
         let wm = serde_json::json!({
             "sender_id": p.sender_id, "sender_name": p.sender_name,
-            "sender_department": "", "sender_port": port,
+            "sender_department": "", "sender_port": stored.port,
             "receiver_id": peer_id_str, "content": p.content,
             "msg_type": p.msg_type, "group_id": p.group_id,
             "known_peers": [], "file_name": null, "file_size": null, "file_data": null,
         });
         let json = serde_json::to_string(&wm).unwrap_or_default();
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3), tokio::net::TcpStream::connect(&addr)
-        ).await {
-            Ok(Ok(mut stream)) => {
-                use tokio::io::AsyncWriteExt;
-                if stream.write_all(json.as_bytes()).await.is_ok() && stream.write_all(b"\n").await.is_ok() {
-                    delivered.push(p.id);
-                }
-            }
-            _ => {}
+        if deliver_over_tcp(&addr, &json).await {
+            delivered.push(p.id);
         }
     }
     if !delivered.is_empty() {
         let _ = db.delete_pending_msgs(&delivered).await;
-        log::info!("Delivered {} pending msgs to {}", delivered.len(), peer_id_str);
+        log::info!("Delivered {} legacy pending msgs to {}", delivered.len(), peer_id_str);
     }
 }
 
@@ -1296,6 +1218,99 @@ fn echo_files_dir() -> std::path::PathBuf {
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/tmp".to_string());
     std::path::PathBuf::from(home).join("Echo").join("files")
+}
+
+/// Build a WireMessage JSON for a notification.
+fn build_notification_json(
+    sender_id: &str, sender_name: &str, sender_department: &str, sender_port: u16,
+    receiver_id: &str, content: &str, msg_type: &str,
+    group_id: Option<&str>, file_name: Option<&str>,
+    known_peers: &[crate::discovery::PeerEntry],
+) -> String {
+    serde_json::json!({
+        "sender_id": sender_id,
+        "sender_name": sender_name,
+        "sender_department": sender_department,
+        "sender_port": sender_port,
+        "receiver_id": receiver_id,
+        "content": content,
+        "msg_type": msg_type,
+        "group_id": group_id,
+        "file_name": file_name,
+        "file_size": null,
+        "file_data": null,
+        "known_peers": known_peers,
+    }).to_string()
+}
+
+/// Try a TCP delivery with a 2s timeout. Returns true if both header bytes
+/// and the trailing newline were written successfully.
+async fn deliver_over_tcp(addr: &str, json: &str) -> bool {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(addr),
+    ).await {
+        Ok(Ok(mut stream)) => {
+            use tokio::io::AsyncWriteExt;
+            stream.write_all(json.as_bytes()).await.is_ok()
+                && stream.write_all(b"\n").await.is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// Generic "fan-out a notification to a set of peers, queue if offline".
+///
+/// `kind` is the logical type used for offline queueing (matches the wire
+/// `msg_type`). The receiver's TCP handler dispatches by `msg_type` inside the
+/// payload, so we don't need separate tables per kind.
+///
+/// Returns the count of (delivered, queued).
+pub async fn send_or_queue_notification(
+    db: &crate::db::Database,
+    online_peers: &[Peer],
+    target_peer_ids: &[String],
+    self_id: &str,
+    self_name: &str,
+    self_department: &str,
+    self_port: u16,
+    content: &str,
+    kind: &str,
+    group_id: Option<&str>,
+    file_name: Option<&str>,
+    known_peers: &[crate::discovery::PeerEntry],
+) -> (usize, usize) {
+    let mut delivered = 0usize;
+    let mut queued = 0usize;
+
+    for pid in target_peer_ids {
+        if pid == self_id { continue; }
+
+        let json = build_notification_json(
+            self_id, self_name, self_department, self_port,
+            pid, content, kind, group_id, file_name, known_peers,
+        );
+
+        let ok = match resolve_peer_addr(pid, db, online_peers).await {
+            Some((ip, port)) => {
+                let addr = format!("{}:{}", ip, port);
+                deliver_over_tcp(&addr, &json).await
+            }
+            None => false,
+        };
+
+        if ok {
+            delivered += 1;
+        } else {
+            let _ = db.queue_pending_notification(pid, kind, &json).await;
+            queued += 1;
+        }
+    }
+
+    if queued > 0 {
+        log::info!("Notification '{}' delivered={} queued={}", kind, delivered, queued);
+    }
+    (delivered, queued)
 }
 
 async fn resolve_peer_addr(

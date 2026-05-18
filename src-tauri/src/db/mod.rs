@@ -251,6 +251,24 @@ impl Database {
         .execute(&self.pool).await
         .context("Failed to create pending_group_messages table")?;
 
+        // Generic offline-delivery queue. `payload` is a full WireMessage JSON
+        // (any msg_type). On the receiver, the same TCP handler dispatches by
+        // msg_type, so we don't need a per-kind table.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pending_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool).await
+        .context("Failed to create pending_notifications table")?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_notif_peer ON pending_notifications(peer_id)")
+            .execute(&self.pool).await.ok();
+
         info!("Database initialized successfully.");
         Ok(())
     }
@@ -387,6 +405,46 @@ impl Database {
     pub async fn delete_pending_msgs(&self, ids: &[i64]) -> Result<()> {
         for id in ids {
             sqlx::query("DELETE FROM pending_group_messages WHERE id = ?").bind(id).execute(&self.pool).await.ok();
+        }
+        Ok(())
+    }
+
+    // ── Generic offline-notification queue ──
+    //
+    // Any wire-protocol message that needs to be delivered to a peer who's
+    // currently unreachable can be queued here. The receiver's normal TCP
+    // handler dispatches by `msg_type` inside the payload, so a single table
+    // covers private messages, group control messages, profile updates, etc.
+
+    pub async fn queue_pending_notification(
+        &self, peer_id: &str, kind: &str, payload: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        // Dedupe profile_updated — only one queued copy per peer makes sense.
+        if kind == "profile_updated" {
+            sqlx::query("DELETE FROM pending_notifications WHERE peer_id = ? AND kind = 'profile_updated'")
+                .bind(peer_id).execute(&self.pool).await.ok();
+        }
+        sqlx::query("INSERT INTO pending_notifications (peer_id, kind, payload, created_at) VALUES (?, ?, ?, ?)")
+            .bind(peer_id).bind(kind).bind(payload).bind(&now)
+            .execute(&self.pool).await.context("Failed to queue pending notification")?;
+        Ok(())
+    }
+
+    pub async fn get_pending_notifications(&self, peer_id: &str) -> Result<Vec<(i64, String, String)>> {
+        let rows = sqlx::query("SELECT id, kind, payload FROM pending_notifications WHERE peer_id = ? ORDER BY id ASC")
+            .bind(peer_id).fetch_all(&self.pool).await.context("Failed to load pending notifications")?;
+        Ok(rows.iter().map(|r| (
+            r.get::<i64, _>("id"),
+            r.get::<String, _>("kind"),
+            r.get::<String, _>("payload"),
+        )).collect())
+    }
+
+    pub async fn delete_pending_notifications(&self, ids: &[i64]) -> Result<()> {
+        for id in ids {
+            sqlx::query("DELETE FROM pending_notifications WHERE id = ?")
+                .bind(id).execute(&self.pool).await.ok();
         }
         Ok(())
     }

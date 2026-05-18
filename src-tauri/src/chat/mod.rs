@@ -181,6 +181,15 @@ impl ChatServer {
                         }
                     }
 
+                    // Handle profile_updated (no group_id, just updates the peer record).
+                    // Receiver-side merge happens via the upsert_peer call below using
+                    // sender_name/sender_department from the wire message — so we just
+                    // need to skip persisting it as a chat message.
+                    if msg.msg_type == "profile_updated" {
+                        info!("Peer {} profile updated → {} ({})",
+                            msg.sender_id, msg.sender_name, msg.sender_department);
+                    }
+
                     // Register the sender as a peer in DB
                     if let Err(e) = db
                         .upsert_peer(
