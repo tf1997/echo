@@ -330,7 +330,7 @@ impl ChatServer {
                             file_sender_name = None;
                             file_group_id = None;
                         }
-                        "group_created" | "group_dissolved" | "group_member_left" => {
+                        "group_created" | "group_dissolved" | "group_member_left" | "profile_updated" => {
                             // System notifications — already handled above, don't save as message
                         }
                         _ => {

@@ -515,17 +515,36 @@ impl Database {
     }
 
     pub async fn get_group_members(&self, group_id: &str) -> Result<Vec<StoredPeer>> {
+        // Always return gm.peer_id (never NULL) so callers don't see phantom rows.
+        // For "myself" we have no row in `peers` — fall back to `user_profile`.
         let rows = sqlx::query(
-            "SELECT p.peer_id, p.username, p.department, p.ip, p.port, p.is_online, p.first_seen_at, p.last_seen_at
-             FROM group_members gm LEFT JOIN peers p ON gm.peer_id = p.peer_id WHERE gm.group_id = ?"
+            "SELECT gm.peer_id AS peer_id,
+                    COALESCE(NULLIF(p.username, ''), up.username, '') AS username,
+                    COALESCE(NULLIF(p.department, ''), up.department, '') AS department,
+                    COALESCE(p.ip, '') AS ip,
+                    COALESCE(p.port, 0) AS port,
+                    COALESCE(p.is_online, 0) AS is_online,
+                    COALESCE(p.first_seen_at, '') AS first_seen_at,
+                    COALESCE(p.last_seen_at, '') AS last_seen_at,
+                    CASE WHEN up.peer_id IS NOT NULL THEN 1 ELSE 0 END AS is_self
+             FROM group_members gm
+             LEFT JOIN peers p ON gm.peer_id = p.peer_id
+             LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = gm.peer_id
+             WHERE gm.group_id = ?"
         ).bind(group_id).fetch_all(&self.pool).await.context("Failed to get group members")?;
-        Ok(rows.iter().map(|r| StoredPeer {
-            peer_id: r.get("peer_id"), username: r.try_get("username").unwrap_or_default(),
-            department: r.try_get("department").unwrap_or_default(), ip: r.try_get("ip").unwrap_or_default(),
-            port: r.try_get::<i64, _>("port").unwrap_or(0) as u16,
-            is_online: r.try_get::<bool, _>("is_online").unwrap_or(false),
-            first_seen_at: r.try_get("first_seen_at").unwrap_or_default(),
-            last_seen_at: r.try_get("last_seen_at").unwrap_or_default(),
+        Ok(rows.iter().map(|r| {
+            let is_self: i64 = r.try_get("is_self").unwrap_or(0);
+            StoredPeer {
+                peer_id: r.get("peer_id"),
+                username: r.try_get("username").unwrap_or_default(),
+                department: r.try_get("department").unwrap_or_default(),
+                ip: r.try_get("ip").unwrap_or_default(),
+                port: r.try_get::<i64, _>("port").unwrap_or(0) as u16,
+                // Treat self as always online — UI uses this to render the green dot.
+                is_online: is_self == 1 || r.try_get::<bool, _>("is_online").unwrap_or(false),
+                first_seen_at: r.try_get("first_seen_at").unwrap_or_default(),
+                last_seen_at: r.try_get("last_seen_at").unwrap_or_default(),
+            }
         }).collect())
     }
 
