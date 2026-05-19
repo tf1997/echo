@@ -1,13 +1,13 @@
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::chat::ChatServer;
 use crate::db::{Database, UserProfile};
 use crate::discovery::{DiscoveryConfig, DiscoveryService};
 
 pub struct RuntimeServices {
-    pub discovery: Mutex<DiscoveryService>,
+    pub discovery: RwLock<DiscoveryService>,
     pub chat: Mutex<ChatServer>,
     pub my_id: String,
     pub listen_port: u16,
@@ -55,7 +55,7 @@ impl RuntimeServices {
         chat.start().await?;
 
         Ok(Self {
-            discovery: Mutex::new(discovery),
+            discovery: RwLock::new(discovery),
             chat: Mutex::new(chat),
             my_id,
             listen_port,
@@ -64,13 +64,13 @@ impl RuntimeServices {
 
     #[allow(dead_code)]
     pub async fn shutdown(&self) {
-        let discovery = self.discovery.lock().await;
+        let discovery = self.discovery.write().await;
         let _ = discovery.stop();
     }
 
     pub async fn update_profile(&self, username: &str, department: &str) -> Result<()> {
         self.discovery
-            .lock()
+            .write()
             .await
             .update_identity(username, department)
             .await?;
@@ -85,5 +85,6 @@ impl RuntimeServices {
 pub struct AppState {
     pub db: Arc<Database>,
     pub profile: Mutex<Option<UserProfile>>,
-    pub runtime: Mutex<Option<RuntimeServices>>,
+    // Use RwLock for runtime: multiple readers (clone Arc handle), single writer (initialization)
+    pub runtime: RwLock<Option<Arc<RuntimeServices>>>,
 }

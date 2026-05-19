@@ -1,6 +1,7 @@
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use tauri::State;
+use std::sync::Arc;
 
 use crate::chat::send_file_in_background;
 use crate::db::{ChatMessage, StoredPeer, UnreadCount, UserProfile};
@@ -26,7 +27,7 @@ pub struct SaveProfilePayload {
 #[tauri::command]
 pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String> {
     let profile = state.profile.lock().await.clone();
-    let runtime = state.runtime.lock().await;
+    let runtime = { state.runtime.read().await.clone() };
 
     if let (Some(profile), Some(runtime)) = (profile, runtime.as_ref()) {
         let my_ip = local_ip_address::local_ip()
@@ -60,8 +61,8 @@ pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String>
 pub async fn get_departments(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let mut departments = state.db.get_departments().await.map_err(|e| e.to_string())?;
 
-    if let Some(runtime) = state.runtime.lock().await.as_ref() {
-        let peers = runtime.discovery.lock().await.get_peers();
+    if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
+        let peers = runtime.discovery.read().await.get_peers();
         for peer in peers {
             let dep = peer.department.trim();
             if !dep.is_empty() && !departments.iter().any(|d| d == dep) {
@@ -113,8 +114,8 @@ pub async fn save_profile(
 
     *state.profile.lock().await = Some(profile.clone());
 
-    let runtime_guard = state.runtime.lock().await;
-    if let Some(runtime) = runtime_guard.as_ref() {
+    let runtime_opt = { state.runtime.read().await.clone() };
+    if let Some(runtime) = runtime_opt.as_ref() {
         runtime
             .update_profile(username, department)
             .await
@@ -125,8 +126,7 @@ pub async fn save_profile(
         // change via the same pending_notifications queue used for group msgs.
         let listen_port = runtime.listen_port;
         let my_id = runtime.my_id.clone();
-        let online_peers = runtime.discovery.lock().await.get_peers();
-        drop(runtime_guard);
+        let online_peers = runtime.discovery.read().await.get_peers();
 
         let stored = state.db.list_stored_peers().await.unwrap_or_default();
         let mut targets: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -147,8 +147,6 @@ pub async fn save_profile(
             &payload, "profile_updated", None, None, &empty_dir,
         ).await;
     } else {
-        drop(runtime_guard);
-
         let listen_port = std::env::var("ECHO_PORT")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
@@ -158,7 +156,7 @@ pub async fn save_profile(
         let runtime = RuntimeServices::start(state.db.clone(), &profile, listen_port)
             .await
             .map_err(|e| e.to_string())?;
-        *state.runtime.lock().await = Some(runtime);
+        *state.runtime.write().await = Some(Arc::new(runtime));
     }
 
     Ok(())
@@ -171,11 +169,11 @@ pub async fn list_stored_peers(state: State<'_, AppState>) -> Result<Vec<StoredP
 
 #[tauri::command]
 pub async fn get_peers(state: State<'_, AppState>) -> Result<Vec<Peer>, String> {
-    let runtime = state.runtime.lock().await;
-    let Some(runtime) = runtime.as_ref() else {
+    let runtime_opt = { state.runtime.read().await.clone() };
+    let Some(runtime) = runtime_opt.as_ref() else {
         return Ok(vec![]);
     };
-    let discovery = runtime.discovery.lock().await;
+    let discovery = runtime.discovery.read().await;
     Ok(discovery.get_peers())
 }
 
@@ -195,12 +193,12 @@ pub async fn send_message_typed(
     content: String,
     msg_type: String,
 ) -> Result<ChatMessage, String> {
-    let runtime = state.runtime.lock().await;
-    let Some(runtime) = runtime.as_ref() else {
+    let runtime_opt = { state.runtime.read().await.clone() };
+    let Some(runtime) = runtime_opt.as_ref() else {
         return Err("应用尚未初始化用户信息".to_string());
     };
 
-    let discovery = runtime.discovery.lock().await;
+    let discovery = runtime.discovery.read().await;
     let peer = if let Some(peer) = discovery.get_peer(&peer_id) {
         peer
     } else if let Some(stored_peer) = state
@@ -236,12 +234,12 @@ pub async fn send_file(
 ) -> Result<ChatMessage, String> {
     info!("send_file: start");
     let t0 = std::time::Instant::now();
-    let runtime = state.runtime.lock().await;
-    let Some(runtime) = runtime.as_ref() else {
+    let runtime_opt = { state.runtime.read().await.clone() };
+    let Some(runtime) = runtime_opt.as_ref() else {
         return Err("应用尚未初始化用户信息".to_string());
     };
 
-    let discovery = runtime.discovery.lock().await;
+    let discovery = runtime.discovery.read().await;
     let peer = if let Some(peer) = discovery.get_peer(&peer_id) {
         peer
     } else if let Some(stored_peer) = state
@@ -267,7 +265,7 @@ pub async fn send_file(
         let chat = runtime.chat.lock().await;
         (chat.my_id().to_string(), chat.my_name().to_string(), chat.my_department().to_string(), chat.listen_port(), chat.db().clone(), chat.peers().clone())
     };
-    drop(runtime);
+    let _ = runtime;
 
     let file_name = std::path::Path::new(&file_path)
         .file_name()
@@ -342,8 +340,8 @@ pub async fn discover_by_ip(
     // Read my profile and runtime info
     let my_profile = state.profile.lock().await.clone();
     let (my_id, my_port) = {
-        let runtime = state.runtime.lock().await;
-        match runtime.as_ref() {
+        let runtime_opt = { state.runtime.read().await.clone() };
+        match runtime_opt.as_ref() {
             Some(r) => (r.my_id.clone(), r.listen_port),
             None => return Err("应用尚未初始化".to_string()),
         }
@@ -352,9 +350,9 @@ pub async fn discover_by_ip(
     // Send our announce as a unicast UDP probe to the remote peer's discovery port.
     // Include our own known_peers so they also get our contacts (bidirectional relay).
     let our_known: Vec<serde_json::Value> = {
-        let runtime = state.runtime.lock().await;
-        if let Some(runtime) = runtime.as_ref() {
-            runtime.discovery.lock().await.get_peers().into_iter()
+        let runtime_opt = { state.runtime.read().await.clone() };
+        if let Some(runtime) = runtime_opt.as_ref() {
+            runtime.discovery.read().await.get_peers().into_iter()
                 .filter(|p| p.online)
                 .map(|p| serde_json::json!({
                     "id": p.id, "username": p.username, "department": p.department,
@@ -390,9 +388,9 @@ pub async fn discover_by_ip(
 
         // Check if the peer was auto-registered from the unicast response
         let found = {
-            let runtime = state.runtime.lock().await;
-            if let Some(runtime) = runtime.as_ref() {
-                runtime.discovery.lock().await
+            let runtime_opt = { state.runtime.read().await.clone() };
+            if let Some(runtime) = runtime_opt.as_ref() {
+                runtime.discovery.read().await
                     .get_peers().into_iter()
                     .find(|p| p.ip == parsed_ip && p.port == port)
             } else { None }
@@ -423,9 +421,9 @@ pub async fn discover_by_ip(
     );
 
     {
-        let runtime = state.runtime.lock().await;
-        if let Some(runtime) = runtime.as_ref() {
-            let disc = runtime.discovery.lock().await;
+        let runtime_opt = { state.runtime.read().await.clone() };
+        if let Some(runtime) = runtime_opt.as_ref() {
+            let disc = runtime.discovery.read().await;
             // Don't duplicate: check by IP:port first
             let already = disc
                 .get_peers()
@@ -469,8 +467,8 @@ pub async fn get_conversation(
     state: State<'_, AppState>,
     peer_id: String,
 ) -> Result<Vec<ChatMessage>, String> {
-    let runtime = state.runtime.lock().await;
-    let Some(runtime) = runtime.as_ref() else {
+    let runtime_opt = { state.runtime.read().await.clone() };
+    let Some(runtime) = runtime_opt.as_ref() else {
         return Ok(vec![]);
     };
 
@@ -483,8 +481,8 @@ pub async fn get_conversation(
 
 #[tauri::command]
 pub async fn get_unread_counts(state: State<'_, AppState>) -> Result<Vec<UnreadCount>, String> {
-    let runtime = state.runtime.lock().await;
-    let Some(runtime) = runtime.as_ref() else {
+    let runtime_opt = { state.runtime.read().await.clone() };
+    let Some(runtime) = runtime_opt.as_ref() else {
         return Ok(vec![]);
     };
 
@@ -500,8 +498,8 @@ pub async fn mark_read(
     state: State<'_, AppState>,
     peer_id: String,
 ) -> Result<(), String> {
-    let runtime = state.runtime.lock().await;
-    let Some(runtime) = runtime.as_ref() else {
+    let runtime_opt = { state.runtime.read().await.clone() };
+    let Some(runtime) = runtime_opt.as_ref() else {
         return Ok(());
     };
 
@@ -624,8 +622,8 @@ pub async fn search_messages(
     state: State<'_, AppState>,
     query: String,
 ) -> Result<Vec<SearchResult>, String> {
-    let runtime = state.runtime.lock().await;
-    let Some(runtime) = runtime.as_ref() else {
+    let runtime_opt = { state.runtime.read().await.clone() };
+    let Some(runtime) = runtime_opt.as_ref() else {
         return Ok(vec![]);
     };
 
@@ -675,8 +673,8 @@ pub async fn search_messages(
 #[tauri::command]
 pub async fn get_scan_subnets(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     // Return from in-memory config (more up-to-date), fallback to DB
-    if let Some(runtime) = state.runtime.lock().await.as_ref() {
-        let disc = runtime.discovery.lock().await;
+    if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
+        let disc = runtime.discovery.read().await;
         let subnets = disc.get_scan_subnets();
         if !subnets.is_empty() {
             return Ok(subnets);
@@ -697,8 +695,8 @@ pub async fn set_scan_subnets(
         .await
         .map_err(|e| e.to_string())?;
 
-    if let Some(runtime) = state.runtime.lock().await.as_ref() {
-        runtime.discovery.lock().await.update_scan_subnets(&subnets);
+    if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
+        runtime.discovery.write().await.update_scan_subnets(&subnets);
     }
 
     Ok(())
@@ -788,8 +786,8 @@ pub async fn create_group(
 ) -> Result<crate::db::GroupInfo, String> {
     let gid = format!("group-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
     let my_id = {
-        let runtime = state.runtime.lock().await;
-        runtime.as_ref().map(|r| r.my_id.clone()).unwrap_or_default()
+        let runtime_opt = { state.runtime.read().await.clone() };
+        runtime_opt.as_ref().map(|r| r.my_id.clone()).unwrap_or_default()
     };
     let mut all_members = payload.members.clone();
     if !all_members.iter().any(|m| m == &my_id) {
@@ -799,9 +797,9 @@ pub async fn create_group(
     let members = state.db.get_group_members(&gid).await.unwrap_or_default();
 
     let (listen_port, online_peers) = {
-        let runtime = state.runtime.lock().await;
-        match runtime.as_ref() {
-            Some(r) => (r.listen_port, r.discovery.lock().await.get_peers()),
+        let runtime_opt = { state.runtime.read().await.clone() };
+        match runtime_opt.as_ref() {
+            Some(r) => (r.listen_port, r.discovery.read().await.get_peers()),
             None => (9527, vec![]),
         }
     };
@@ -832,8 +830,8 @@ pub async fn create_group(
 #[tauri::command]
 pub async fn list_groups(state: State<'_, AppState>) -> Result<Vec<crate::db::GroupInfo>, String> {
     let my_id = {
-        let runtime = state.runtime.lock().await;
-        runtime.as_ref().map(|r| r.my_id.clone()).unwrap_or_default()
+        let runtime_opt = { state.runtime.read().await.clone() };
+        runtime_opt.as_ref().map(|r| r.my_id.clone()).unwrap_or_default()
     };
     let mut groups = state.db.list_groups(&my_id).await.map_err(|e| e.to_string())?;
     for g in &mut groups {
@@ -854,8 +852,8 @@ pub async fn send_group_message_typed(
     state: State<'_, AppState>, group_id: String, content: String, msg_type: String,
 ) -> Result<ChatMessage, String> {
     let (my_id, my_name, my_department, listen_port, members) = {
-        let runtime = state.runtime.lock().await;
-        let r = runtime.as_ref().ok_or("未初始化")?;
+        let runtime_opt = { state.runtime.read().await.clone() };
+        let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let prof = state.profile.lock().await;
         let my_name = prof.as_ref().map(|p| p.username.clone()).unwrap_or_default();
         let my_dept = prof.as_ref().map(|p| p.department.clone()).unwrap_or_default();
@@ -866,9 +864,9 @@ pub async fn send_group_message_typed(
     let msg = state.db.save_group_message(&group_id, &my_id, &my_name, &content, &msg_type, None, None, None, true).await.map_err(|e| e.to_string())?;
 
     let online_peers = {
-        let runtime = state.runtime.lock().await;
-        match runtime.as_ref() {
-            Some(r) => r.discovery.lock().await.get_peers(),
+        let runtime_opt = { state.runtime.read().await.clone() };
+        match runtime_opt.as_ref() {
+            Some(r) => r.discovery.read().await.get_peers(),
             None => vec![],
         }
     };
@@ -895,12 +893,12 @@ pub async fn rename_group(state: State<'_, AppState>, group_id: String, new_name
 
     let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
     let (my_id, my_name, my_department, listen_port, online_peers) = {
-        let runtime = state.runtime.lock().await;
-        let r = runtime.as_ref().ok_or("未初始化")?;
+        let runtime_opt = { state.runtime.read().await.clone() };
+        let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let prof = state.profile.lock().await;
         let my_name = prof.as_ref().map(|p| p.username.clone()).unwrap_or_default();
         let my_dept = prof.as_ref().map(|p| p.department.clone()).unwrap_or_default();
-        let peers = r.discovery.lock().await.get_peers();
+        let peers = r.discovery.read().await.get_peers();
         (r.my_id.clone(), my_name, my_dept, r.listen_port, peers)
     };
 
@@ -920,7 +918,7 @@ pub async fn invite_to_group(state: State<'_, AppState>, group_id: String, membe
     state.db.add_group_members(&group_id, &members).await.map_err(|e| e.to_string())?;
 
     let groups = {
-        let my_id_opt = state.runtime.lock().await.as_ref().map(|r| r.my_id.clone());
+        let my_id_opt = { state.runtime.read().await.clone() }.as_ref().map(|r| r.my_id.clone());
         let my_id = my_id_opt.unwrap_or_default();
         state.db.list_groups(&my_id).await.map_err(|e| e.to_string())?
     };
@@ -929,9 +927,9 @@ pub async fn invite_to_group(state: State<'_, AppState>, group_id: String, membe
     let all_member_ids: Vec<String> = member_records.iter().map(|m| m.peer_id.clone()).collect();
 
     let (my_id, listen_port, online_peers) = {
-        let runtime = state.runtime.lock().await;
-        let r = runtime.as_ref().ok_or("未初始化")?;
-        let peers = r.discovery.lock().await.get_peers();
+        let runtime_opt = { state.runtime.read().await.clone() };
+        let r = runtime_opt.as_ref().ok_or("未初始化")?;
+        let peers = r.discovery.read().await.get_peers();
         (r.my_id.clone(), r.listen_port, peers)
     };
     let (my_name, my_department) = {
@@ -955,10 +953,10 @@ pub async fn invite_to_group(state: State<'_, AppState>, group_id: String, membe
 #[tauri::command]
 pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result<(), String> {
     let (my_id, listen_port, online_peers, members) = {
-        let runtime = state.runtime.lock().await;
-        let r = runtime.as_ref().ok_or("未初始化")?;
+        let runtime_opt = { state.runtime.read().await.clone() };
+        let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
-        let online = r.discovery.lock().await.get_peers();
+        let online = r.discovery.read().await.get_peers();
         (r.my_id.clone(), r.listen_port, online, members)
     };
 
@@ -988,9 +986,9 @@ pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result
 pub async fn dissolve_group(state: State<'_, AppState>, group_id: String) -> Result<(), String> {
     let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
     let (my_id, listen_port, online_peers) = {
-        let runtime = state.runtime.lock().await;
-        let r = runtime.as_ref().ok_or("未初始化")?;
-        let peers = r.discovery.lock().await.get_peers();
+        let runtime_opt = { state.runtime.read().await.clone() };
+        let r = runtime_opt.as_ref().ok_or("未初始化")?;
+        let peers = r.discovery.read().await.get_peers();
         (r.my_id.clone(), r.listen_port, peers)
     };
     let (my_name, my_department) = {
@@ -1019,8 +1017,8 @@ pub async fn send_group_file(
 ) -> Result<ChatMessage, String> {
     use chrono::Utc;
     let (my_id, my_name, my_department, listen_port, db, peers_arc, members) = {
-        let runtime = state.runtime.lock().await;
-        let r = runtime.as_ref().ok_or("未初始化")?;
+        let runtime_opt = { state.runtime.read().await.clone() };
+        let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let my_name = state.profile.lock().await.as_ref().map(|p| p.username.clone()).unwrap_or_default();
         let my_department = state.profile.lock().await.as_ref().map(|p| p.department.clone()).unwrap_or_default();
         let chat = r.chat.lock().await;
@@ -1042,9 +1040,9 @@ pub async fn send_group_file(
 
     // Get online peer snapshot once
     let online_peers = {
-        let runtime = state.runtime.lock().await;
-        match runtime.as_ref() {
-            Some(r) => r.discovery.lock().await.get_peers(),
+        let runtime_opt = { state.runtime.read().await.clone() };
+        match runtime_opt.as_ref() {
+            Some(r) => r.discovery.read().await.get_peers(),
             None => vec![],
         }
     };
@@ -1096,8 +1094,8 @@ pub async fn send_group_file(
 
 #[tauri::command]
 pub async fn get_group_unread_counts(state: State<'_, AppState>) -> Result<Vec<crate::db::GroupUnread>, String> {
-    let runtime = state.runtime.lock().await;
-    let Some(runtime) = runtime.as_ref() else {
+    let runtime_opt = { state.runtime.read().await.clone() };
+    let Some(runtime) = runtime_opt.as_ref() else {
         return Ok(vec![]);
     };
     state.db.get_group_unread_counts(&runtime.my_id).await.map_err(|e| e.to_string())
@@ -1105,8 +1103,8 @@ pub async fn get_group_unread_counts(state: State<'_, AppState>) -> Result<Vec<c
 
 #[tauri::command]
 pub async fn mark_group_read(state: State<'_, AppState>, group_id: String) -> Result<(), String> {
-    let runtime = state.runtime.lock().await;
-    let Some(runtime) = runtime.as_ref() else {
+    let runtime_opt = { state.runtime.read().await.clone() };
+    let Some(runtime) = runtime_opt.as_ref() else {
         return Ok(());
     };
     state.db.mark_group_read(&group_id, &runtime.my_id).await.map_err(|e| e.to_string())
@@ -1118,8 +1116,8 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
     if pending.is_empty() { return Ok(()); }
 
     let (_my_id, listen_port) = {
-        let runtime = state.runtime.lock().await;
-        let r = runtime.as_ref().ok_or("未初始化")?;
+        let runtime_opt = { state.runtime.read().await.clone() };
+        let r = runtime_opt.as_ref().ok_or("未初始化")?;
         (r.my_id.clone(), r.listen_port)
     };
 

@@ -11,7 +11,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{Emitter, Manager};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use state::AppState;
 
@@ -59,7 +59,7 @@ pub fn run() {
                         .expect("Failed to start runtime services")
                 });
                 info!("Runtime started with saved profile: {}", profile.username);
-                Some(runtime)
+                Some(Arc::new(runtime))
             } else {
                 info!("No saved profile found, waiting for first-time setup.");
                 None
@@ -68,7 +68,7 @@ pub fn run() {
             app.manage(AppState {
                 db: db.clone(),
                 profile: Mutex::new(profile),
-                runtime: Mutex::new(runtime_services),
+                runtime: RwLock::new(runtime_services),
             });
 
             // Load stored peers from DB into DiscoveryService memory on startup
@@ -82,8 +82,10 @@ pub fn run() {
                 // Wait until state is available
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 if let Some(state) = app_handle_for_load.try_state::<AppState>() {
-                    if let Some(runtime) = state.runtime.lock().await.as_ref() {
-                        let disc = runtime.discovery.lock().await;
+                    // clone runtime handle quickly to avoid holding AppState lock
+                    let runtime_opt = { state.runtime.read().await.clone() };
+                    if let Some(runtime) = runtime_opt.as_ref() {
+                        let disc = runtime.discovery.write().await;
                         for sp in &stored {
                             if let Ok(ip) = sp.ip.parse::<IpAddr>() {
                                 let peer = Peer::new(
@@ -101,10 +103,11 @@ pub fn run() {
                 }
             });
 
-            // Health check: TCP connect refreshes last_seen, timeout marks offline
+            // Health check: concurrent TCP checks with proper lock handling
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 use tokio::net::TcpStream;
+                use std::net::SocketAddr;
 
                 loop {
                     if let Some(state) = app_handle.try_state::<AppState>() {
@@ -113,60 +116,77 @@ pub fn run() {
                             .unwrap_or_default()
                             .as_secs() as i64;
 
-                        let snapshot: Vec<(String, String, String, IpAddr, u16)> =
-                            if let Some(runtime) = state.runtime.lock().await.as_ref() {
-                                runtime.discovery.lock().await.get_peers()
+                        // Snapshot peers, then release all locks
+                        let snapshot: Vec<(String, String, String, IpAddr, u16)> = {
+                            let runtime_opt = { state.runtime.read().await.clone() };
+                            if let Some(runtime) = runtime_opt.as_ref() {
+                                runtime.discovery.read().await.get_peers()
                                     .into_iter()
                                     .map(|p| (p.id, p.username, p.department, p.ip, p.port))
                                     .collect()
                             } else {
                                 vec![]
-                            };
+                            }
+                        };
 
-                        log::info!("HealthCheck cycle: {} peer(s)", snapshot.len());
+                        if !snapshot.is_empty() {
+                            log::info!("HealthCheck cycle: {} peer(s)", snapshot.len());
+                        }
 
-                        for (id, username, department, ip, port) in &snapshot {
-                            let addr = format!("{}:{}", ip, port);
-                            let tcp_ok = tokio::time::timeout(
-                                Duration::from_secs(2),
-                                TcpStream::connect(&addr),
-                            )
-                            .await
-                            .map(|r| r.is_ok())
-                            .unwrap_or(false);
+                        // Concurrent TCP detection using JoinSet to prevent blocking
+                        let mut tasks = tokio::task::JoinSet::new();
 
-                            if tcp_ok {
-                                // TCP success → peer is alive, refresh last_seen
-                                if let Some(runtime) = state.runtime.lock().await.as_ref() {
-                                    runtime.discovery.lock().await.touch_peer(id);
-                                }
-                                let _ = state.db.upsert_peer(id, username, department, &ip.to_string(), *port, true).await;
-                                // Deliver pending group messages
-                                let db = state.db.clone();
-                                let pid = id.clone();
-                                tauri::async_runtime::spawn(async move {
-                                    crate::commands::deliver_pending_to_peer(&db, &pid).await;
-                                });
-                                log::debug!("HealthCheck: {} TCP OK → online", id);
-                            } else {
-                                // TCP fail → check if last_seen is too old
-                                let should_offline = if let Some(runtime) = state.runtime.lock().await.as_ref() {
-                                    let disc = runtime.discovery.lock().await;
-                                    disc.get_peer(id)
-                                        .map(|p| p.online && (now - p.last_seen) >= 15)
-                                        .unwrap_or(false)
-                                } else {
-                                    false
-                                };
+                        for (id, username, department, ip, port) in snapshot {
+                            tasks.spawn(async move {
+                                // Support both IPv4 and IPv6 with SocketAddr
+                                let addr = SocketAddr::new(ip, port);
+                                let tcp_ok = tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    TcpStream::connect(&addr),
+                                )
+                                .await
+                                .map(|r| r.is_ok())
+                                .unwrap_or(false);
 
-                                if should_offline {
-                                    if let Some(runtime) = state.runtime.lock().await.as_ref() {
-                                        runtime.discovery.lock().await.set_online(id, false);
+                                (id, username, department, ip, port, tcp_ok)
+                            });
+                        }
+
+                        // Process concurrent check results
+                        while let Some(res) = tasks.join_next().await {
+                            if let Ok((id, username, department, ip, port, tcp_ok)) = res {
+                                if tcp_ok {
+                                    // TCP success → peer is alive, refresh last_seen
+                                    if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
+                                        runtime.discovery.write().await.touch_peer(&id);
                                     }
-                                    let _ = state.db.upsert_peer(id, username, department, &ip.to_string(), *port, false).await;
-                                    let updated = Peer::with_online(id.clone(), username.clone(), department.clone(), *ip, *port, false, now);
-                                    let _ = app_handle.emit("peer-discovered", &updated);
-                                    log::info!("HealthCheck: {} → OFFLINE (tcp failed, age>15s)", username);
+                                    let _ = state.db.upsert_peer(&id, &username, &department, &ip.to_string(), port, true).await;
+                                    let db = state.db.clone();
+                                    let pid = id.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        crate::commands::deliver_pending_to_peer(&db, &pid).await;
+                                    });
+                                    log::debug!("HealthCheck: {} TCP OK → deliver pending", username);
+                                } else {
+                                    // TCP fail → check if last_seen is too old
+                                    let should_offline = if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
+                                        let disc = runtime.discovery.read().await;
+                                        disc.get_peer(&id)
+                                            .map(|p| p.online && (now - p.last_seen) >= 15)
+                                            .unwrap_or(false)
+                                    } else {
+                                        false
+                                    };
+
+                                    if should_offline {
+                                        if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
+                                            runtime.discovery.write().await.set_online(&id, false);
+                                        }
+                                        let _ = state.db.upsert_peer(&id, &username, &department, &ip.to_string(), port, false).await;
+                                        let updated = Peer::with_online(id.clone(), username.clone(), department.clone(), ip, port, false, now);
+                                        let _ = app_handle.emit("peer-discovered", &updated);
+                                        log::info!("HealthCheck: {} → OFFLINE (tcp failed, age>15s)", username);
+                                    }
                                 }
                             }
                         }
