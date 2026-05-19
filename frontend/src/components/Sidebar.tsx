@@ -37,6 +37,16 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
   const [newGroupMembers, setNewGroupMembers] = useState<string[]>([]);
+  const [expandedDepts, setExpandedDepts] = useState<Set<string>>(new Set());
+
+  const toggleDept = useCallback((dept: string) => {
+    setExpandedDepts((prev) => {
+      const next = new Set(prev);
+      if (next.has(dept)) next.delete(dept);
+      else next.add(dept);
+      return next;
+    });
+  }, []);
 
   useEffect(() => { listRecentContacts().then(setRecentContacts).catch(() => {}); }, [peers, tab]);
 
@@ -388,14 +398,33 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
               </>
             ) : (
               <>
-                {sortedDepts.map(dept => (
-                  <div key={dept}>
-                    <p className="px-4 py-2 text-xs text-gray-400 font-medium uppercase tracking-wider">{dept} — {(deptGroups.get(dept) || []).length}</p>
-                    {(deptGroups.get(dept) || []).map(peer => (
-                      <PeerItem key={peer.id} peer={peer} isSelected={selectedPeerId === peer.id} unread={unreadMap.get(peer.id) ?? 0} onClick={() => onSelectPeer(peer)} />
-                    ))}
-                  </div>
-                ))}
+                {sortedDepts.map(dept => {
+                  const expanded = expandedDepts.has(dept);
+                  const deptPeers = deptGroups.get(dept) || [];
+                  const onlineCount = deptPeers.filter(p => p.online).length;
+                  return (
+                    <div key={dept}>
+                      <button
+                        onClick={() => toggleDept(dept)}
+                        className="w-full flex items-center gap-2 px-4 py-2 text-xs text-gray-400 font-medium hover:bg-gray-800 transition-colors"
+                      >
+                        <svg
+                          className={`w-3 h-3 text-gray-500 transition-transform flex-shrink-0 ${expanded ? "rotate-90" : ""}`}
+                          fill="none" viewBox="0 0 24 24" stroke="currentColor"
+                        >
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                        </svg>
+                        <span className="uppercase tracking-wider truncate">{dept}</span>
+                        <span className="text-gray-500 normal-case text-[10px] flex-shrink-0">
+                          {onlineCount}/{deptPeers.length}
+                        </span>
+                      </button>
+                      {expanded && deptPeers.map(peer => (
+                        <PeerItem key={peer.id} peer={peer} isSelected={selectedPeerId === peer.id} unread={unreadMap.get(peer.id) ?? 0} onClick={() => onSelectPeer(peer)} />
+                      ))}
+                    </div>
+                  );
+                })}
                 {peers.length === 0 && <p className="px-4 py-8 text-xs text-gray-500 text-center">暂无联系人</p>}
               </>
             )}
