@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import type { Peer, ChatMessage, AppInfo, StoredPeer, UnreadCount } from "./types";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
@@ -41,6 +41,97 @@ function App() {
   const [scanSubnets, setScanSubnetsState] = useState<string[]>([]);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [groups, setGroups] = useState<GroupInfo[]>([]);
+
+  // ── notification sound ────────────────────────────────────────────────
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const prevUnreadTotalRef = useRef(0);
+  const prevGroupUnreadRef = useRef(new Map<string, number>());
+  const unreadInitRef = useRef(true);
+  const groupUnreadInitRef = useRef(true);
+
+  // Silent WAV (1 sample) — used only to unlock autoplay policy on first click
+  const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+
+  // Unlock audio on first user click — create AudioContext SYNCHRONOUSLY
+  // during the gesture so it starts in "running" state.
+  useEffect(() => {
+    const warmup = () => {
+      // Create during user gesture — required for running state
+      if (!audioCtxRef.current) {
+        const Ctor = window.AudioContext || (window as any).webkitAudioContext;
+        audioCtxRef.current = new Ctor();
+      }
+      // Belt-and-suspenders: also play a silent sound through an Audio element
+      const a = new Audio(SILENT_WAV);
+      a.play().catch(() => {});
+    };
+    document.addEventListener("click", warmup, { once: true });
+    return () => document.removeEventListener("click", warmup);
+  }, []);
+
+  // Pleasant two-tone chime: C5→E5, soft and clear
+  const playChime = useCallback((ctx: AudioContext) => {
+    const now = ctx.currentTime;
+
+    const tone = (freq: number, delay: number, vol: number) => {
+      const t = now + delay;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0, t);
+      gain.gain.linearRampToValueAtTime(vol, t + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+      osc.start(t);
+      osc.stop(t + 0.42);
+    };
+
+    tone(523, 0, 0.18);    // C5
+    tone(659, 0.08, 0.14); // E5 — major third, overlapping
+  }, []);
+
+  const playNotificationSound = useCallback(async () => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    if (ctx.state === "suspended") {
+      await ctx.resume();
+    }
+    if (ctx.state !== "running") return;
+    playChime(ctx);
+  }, [playChime]);
+
+  // Detect new incoming CONTACT messages via unread-count changes
+  // (same data that drives the sidebar red badges)
+  useEffect(() => {
+    const total = unreadCounts.reduce((sum, uc) => sum + uc.count, 0);
+    if (unreadInitRef.current) {
+      unreadInitRef.current = false;
+    } else if (total > prevUnreadTotalRef.current) {
+      console.log("[Echo] unread ↑ " + prevUnreadTotalRef.current + "→" + total);
+      playNotificationSound();
+    }
+    prevUnreadTotalRef.current = total;
+  }, [unreadCounts, playNotificationSound]);
+
+  // Detect new incoming GROUP messages via per-group unread-count changes
+  useEffect(() => {
+    if (groupUnreadInitRef.current) {
+      groupUnreadInitRef.current = false;
+      for (const g of groups) prevGroupUnreadRef.current.set(g.group_id, g.unread_count || 0);
+      return;
+    }
+    for (const g of groups) {
+      const prev = prevGroupUnreadRef.current.get(g.group_id) || 0;
+      const cur = g.unread_count || 0;
+      if (cur > prev) {
+        console.log("[Echo] group unread ↑ " + g.group_id.slice(0, 8) + " " + prev + "→" + cur);
+        playNotificationSound();
+      }
+      prevGroupUnreadRef.current.set(g.group_id, cur);
+    }
+  }, [groups, playNotificationSound]);
 
   const mergePeers = useCallback((onlinePeers: Peer[], stored: StoredPeer[]): Peer[] => {
     const map = new Map<string, Peer>();
@@ -136,6 +227,7 @@ function App() {
     };
   }, [appInfo?.initialized, loadPeerState]);
 
+  // Poll contact messages
   useEffect(() => {
     if (!appInfo?.initialized || !selectedPeer) return;
     const interval = setInterval(() => {
