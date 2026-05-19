@@ -41,6 +41,8 @@ pub struct LanDiscoveryConfig {
     pub local_ip: IpAddr,
     pub scan_subnets: Vec<String>,
     pub discovery_port: u16,
+    /// Channel to forward relayed peers to async DB layer for contact sync.
+    pub relay_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<super::peer::PeerEntry>>>,
 }
 
 /// Manages UDP broadcast + multicast + unicast subnet scan + unicast-response discovery.
@@ -51,6 +53,8 @@ pub struct LanDiscovery {
     scanner_handle: Option<JoinHandle<()>>,
     socket: Option<Arc<UdpSocket>>,
     scan_subnets: Arc<RwLock<Vec<String>>>,
+    #[allow(dead_code)]
+    relay_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<super::peer::PeerEntry>>>,
 }
 
 impl LanDiscovery {
@@ -103,6 +107,8 @@ impl LanDiscovery {
             known_peers: Vec::new(),
         };
 
+        let relay_tx = config.relay_tx.clone();
+
         // Sender thread — rebuilds known_peers each cycle
         let sender_socket = Arc::clone(&socket);
         let sender_cancel = Arc::clone(&cancel);
@@ -117,6 +123,7 @@ impl LanDiscovery {
         let listener_cancel = Arc::clone(&cancel);
         let listener_my_info = base_announce.clone();
         let listener_peers = Arc::clone(&peers);
+        let listener_relay_tx = relay_tx.clone();
         let listener_handle = thread::spawn(move || {
             Self::listener_loop(
                 listener_socket,
@@ -124,6 +131,7 @@ impl LanDiscovery {
                 listener_peers,
                 listener_cancel,
                 discovery_port,
+                listener_relay_tx,
             );
         });
 
@@ -165,6 +173,7 @@ impl LanDiscovery {
             scanner_handle: Some(scanner_handle),
             socket: Some(socket),
             scan_subnets,
+            relay_tx,
         })
     }
 
@@ -366,6 +375,7 @@ impl LanDiscovery {
         peers: Arc<RwLock<HashMap<String, Peer>>>,
         cancel: Arc<AtomicBool>,
         discovery_port: u16,
+        relay_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<PeerEntry>>>,
     ) {
         let mut buf = [0u8; 4096];
 
@@ -425,6 +435,7 @@ impl LanDiscovery {
                     );
 
                     // Process peer relay: register all known_peers too
+                    let mut relayed: Vec<PeerEntry> = Vec::new();
                     for entry in &packet.known_peers {
                         if entry.id != my_info.id && !peers_map.contains_key(&entry.id) {
                             if let Ok(ip) = entry.ip.parse::<IpAddr>() {
@@ -440,11 +451,18 @@ impl LanDiscovery {
                                         last_seen: now,
                                     },
                                 );
+                                relayed.push(entry.clone());
                                 info!(
                                     "Peer relay discovered: {} ({}) @ {}:{}",
                                     entry.username, entry.id, entry.ip, entry.port
                                 );
                             }
+                        }
+                    }
+                    // Bridge to async DB layer for contact persistence
+                    if !relayed.is_empty() {
+                        if let Some(ref tx) = relay_tx {
+                            let _ = tx.send(relayed);
                         }
                     }
                     // Collect existing contacts BEFORE dropping the write lock

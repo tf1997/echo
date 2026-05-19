@@ -153,7 +153,8 @@ pub async fn save_profile(
             .unwrap_or(9527);
 
         let profile = state.profile.lock().await.clone().unwrap();
-        let runtime = RuntimeServices::start(state.db.clone(), &profile, listen_port)
+        let relay_tx = state.relay_tx.clone();
+        let runtime = RuntimeServices::start(state.db.clone(), &profile, listen_port, relay_tx)
             .await
             .map_err(|e| e.to_string())?;
         *state.runtime.write().await = Some(Arc::new(runtime));
@@ -404,6 +405,17 @@ pub async fn discover_by_ip(
     }
 
     if let Some(found) = existing {
+        // Mechanism 1: ice-breaking — exchange contact summaries in background
+        let runtime_arc = { state.runtime.read().await.clone() };
+        if let Some(runtime) = runtime_arc {
+            let found_ip = found.ip.to_string();
+            let found_port = found.port;
+            let found_id = found.id.clone();
+            tauri::async_runtime::spawn(async move {
+                let chat = runtime.chat.lock().await;
+                chat.exchange_contacts(&found_ip, found_port, &found_id).await;
+            });
+        }
         return Ok(DiscoverResult {
             online: true,
             message: format!("已连接 {} ({}) @ {}:{}", found.username, found.department, found.ip, found.port),
@@ -439,6 +451,19 @@ pub async fn discover_by_ip(
         .db
         .upsert_peer(&pid, "手动添加", "", &ip, port, true)
         .await;
+
+    // Mechanism 1: ice-breaking — exchange contact summaries in background
+    {
+        let runtime_arc = { state.runtime.read().await.clone() };
+        if let Some(runtime) = runtime_arc {
+            let ip_copy = ip.clone();
+            let pid_copy = pid.clone();
+            tauri::async_runtime::spawn(async move {
+                let chat = runtime.chat.lock().await;
+                chat.exchange_contacts(&ip_copy, port, &pid_copy).await;
+            });
+        }
+    }
 
     Ok(DiscoverResult {
         online: true,

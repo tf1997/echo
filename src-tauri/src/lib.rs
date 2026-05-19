@@ -1,17 +1,18 @@
 mod chat;
 mod commands;
+mod contact_sync;
 mod db;
 mod discovery;
 mod state;
 
 use db::Database;
 use log::info;
-use crate::discovery::Peer;
+use crate::discovery::{Peer, PeerEntry};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{Emitter, Manager};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use state::AppState;
 
@@ -52,9 +53,12 @@ pub fn run() {
                     .expect("Failed to load user profile")
             });
 
+            // Channel to bridge UDP-discovered relay peers → async DB contact sync
+            let (relay_tx, mut relay_rx) = mpsc::unbounded_channel::<Vec<PeerEntry>>();
+
             let runtime_services = if let Some(profile) = profile.as_ref() {
                 let runtime = tauri::async_runtime::block_on(async {
-                    state::RuntimeServices::start(Arc::clone(&db), profile, listen_port)
+                    state::RuntimeServices::start(Arc::clone(&db), profile, listen_port, Some(relay_tx.clone()))
                         .await
                         .expect("Failed to start runtime services")
                 });
@@ -69,6 +73,39 @@ pub fn run() {
                 db: db.clone(),
                 profile: Mutex::new(profile),
                 runtime: RwLock::new(runtime_services),
+                relay_tx: Some(relay_tx),
+            });
+
+            // ── UDP relay → contact sync processor ───────────────────
+            // Receives PeerEntry batches forwarded from the UDP discovery
+            // listener and persists them to peers + recent_contacts.
+            let processor_db = db.clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some(batch) = relay_rx.recv().await {
+                    for entry in &batch {
+                        if entry.ip.is_empty() || entry.port == 0 {
+                            continue;
+                        }
+                        if entry.ip.parse::<IpAddr>().is_err() {
+                            continue;
+                        }
+                        let _ = processor_db
+                            .upsert_peer(
+                                &entry.id,
+                                &entry.username,
+                                &entry.department,
+                                &entry.ip,
+                                entry.port,
+                                false,
+                            )
+                            .await;
+                        let _ = processor_db.add_recent_contact(&entry.id).await;
+                    }
+                    info!(
+                        "RelaySync: persisted {} relayed peer(s) to contacts",
+                        batch.len()
+                    );
+                }
             });
 
             // Load stored peers from DB into DiscoveryService memory on startup
@@ -192,6 +229,104 @@ pub fn run() {
                         }
                     }
                     tokio::time::sleep(Duration::from_secs(8)).await;
+                }
+            });
+
+            // ── Mechanism 2: Anti-entropy contact sync ──────────────────
+            // Every 5–8 min (with jitter), randomly pick 2-3 online + 1 offline
+            // peer and exchange full contact summaries for delta reconciliation.
+            let ae_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use rand::seq::SliceRandom;
+                use rand::Rng;
+
+                loop {
+                    // Jittered interval: 300–480 s
+                    let delay_secs = {
+                        let mut rng = rand::thread_rng();
+                        rng.gen_range(300..=480)
+                    };
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+
+                    let Some(state) = ae_handle.try_state::<AppState>() else {
+                        continue;
+                    };
+
+                    // Snapshot online + offline peers (read lock, quick)
+                    let (online_peers, offline_peers): (Vec<Peer>, Vec<Peer>) = {
+                        let runtime_opt = { state.runtime.read().await.clone() };
+                        let Some(runtime) = runtime_opt.as_ref() else { continue };
+                        let all = runtime.discovery.read().await.get_peers();
+                        all.into_iter().partition(|p| p.online)
+                    };
+
+                    if online_peers.is_empty() && offline_peers.is_empty() {
+                        continue;
+                    }
+
+                    // Pick 2–3 online + 1 offline. ThreadRng is !Send;
+                    // scope it so it drops before the first .await below.
+                    let selected: Vec<Peer> = {
+                        let mut rng = rand::thread_rng();
+                        let online_limit = rng.gen_range(2..=3).min(online_peers.len());
+                        let mut sel: Vec<Peer> = online_peers
+                            .choose_multiple(&mut rng, online_limit)
+                            .cloned()
+                            .collect();
+                        if let Some(p) = offline_peers.choose(&mut rng) {
+                            sel.push(p.clone());
+                        }
+                        sel
+                    };
+
+                    if selected.is_empty() {
+                        continue;
+                    }
+
+                    // Extract sync params once; release locks before I/O
+                    let (db, peers, my_id, my_name, my_department, my_port, my_ip) = {
+                        let runtime_opt = { state.runtime.read().await.clone() };
+                        let Some(runtime) = runtime_opt.as_ref() else { continue };
+                        let chat = runtime.chat.lock().await;
+                        let my_ip = chat
+                            .my_id()
+                            .rsplitn(2, ':')
+                            .nth(1)
+                            .unwrap_or("127.0.0.1")
+                            .to_string();
+                        (
+                            chat.db().clone(),
+                            chat.peers().clone(),
+                            chat.my_id().to_string(),
+                            chat.my_name().to_string(),
+                            chat.my_department().to_string(),
+                            chat.listen_port(),
+                            my_ip,
+                        )
+                    };
+
+                    info!(
+                        "AntiEntropy: exchanging with {} peer(s) ({} online, {} offline)",
+                        selected.len(),
+                        selected.iter().filter(|p| p.online).count(),
+                        selected.iter().filter(|p| !p.online).count(),
+                    );
+
+                    for p in &selected {
+                        contact_sync::exchange_with_peer(
+                            &db,
+                            &peers,
+                            &my_id,
+                            &my_name,
+                            &my_department,
+                            my_port,
+                            &my_ip,
+                            &p.ip.to_string(),
+                            p.port,
+                            &p.id,
+                        )
+                        .await;
+                    }
                 }
             });
 

@@ -6,6 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
+use crate::contact_sync;
 use crate::db::Database;
 use crate::discovery::{Peer, PeerEntry};
 use tauri::Emitter;
@@ -97,6 +98,9 @@ impl ChatServer {
         let incoming_tx = self.incoming_tx.clone();
         let peers = Arc::clone(&self.peers);
         let my_id = self.my_id.clone();
+        let my_name = self.my_name.clone();
+        let my_department = self.my_department.clone();
+        let my_port = self.listen_port;
 
         tauri::async_runtime::spawn(async move {
             loop {
@@ -107,8 +111,10 @@ impl ChatServer {
                         let tx = incoming_tx.clone();
                         let peers = Arc::clone(&peers);
                         let my_id = my_id.clone();
+                        let my_name = my_name.clone();
+                        let my_department = my_department.clone();
                         tauri::async_runtime::spawn(async move {
-                            if let Err(e) = Self::handle_incoming(stream, peer_addr, db, tx, peers, my_id).await {
+                            if let Err(e) = Self::handle_incoming(stream, peer_addr, db, tx, peers, my_id, my_name, my_department, my_port).await {
                                 error!("Error handling connection: {}", e);
                             }
                         });
@@ -130,6 +136,9 @@ impl ChatServer {
         incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
         peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
         my_id: String,
+        my_name: String,
+        my_department: String,
+        my_port: u16,
     ) -> Result<()> {
         let (reader, _writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
@@ -143,6 +152,35 @@ impl ChatServer {
             match serde_json::from_str::<WireMessage>(&line) {
                 Ok(msg) => {
                     let msg_type = msg.msg_type.as_str();
+
+                    // ── Contact sync delegation ──────────────────────────
+                    if msg_type == "contact_summary" {
+                        let my_ip = my_id.rsplitn(2, ':').nth(1).unwrap_or("127.0.0.1");
+                        contact_sync::handle_contact_summary(
+                            &db,
+                            &peers,
+                            &my_id,
+                            &my_name,
+                            &my_department,
+                            my_port,
+                            my_ip,
+                            &msg.sender_id,
+                            msg.sender_port,
+                            &peer_addr.ip().to_string(),
+                            &msg.content,
+                        ).await;
+                        continue;
+                    }
+
+                    if msg_type == "contact_sync_res" {
+                        contact_sync::handle_contact_sync_res(
+                            &db,
+                            &peers,
+                            &my_id,
+                            &msg.content,
+                        ).await;
+                        continue;
+                    }
 
                     // Mark sender as recent contact
                     let _ = db.add_recent_contact(&msg.sender_id).await;
@@ -530,6 +568,25 @@ impl ChatServer {
         } else {
             Vec::new()
         }
+    }
+
+    /// Initiate a contact-summary exchange with a peer.
+    /// Sends our full contact summary; the response arrives asynchronously
+    /// through the normal TCP listener via `contact_sync_res`.
+    pub async fn exchange_contacts(&self, target_ip: &str, target_port: u16, target_id: &str) {
+        let my_ip = self.my_id.rsplitn(2, ':').nth(1).unwrap_or("127.0.0.1");
+        contact_sync::exchange_with_peer(
+            &self.db,
+            &self.peers,
+            &self.my_id,
+            &self.my_name,
+            &self.my_department,
+            self.listen_port,
+            my_ip,
+            target_ip,
+            target_port,
+            target_id,
+        ).await;
     }
 
     fn bump_last_seen(&self, peer: &Peer) {

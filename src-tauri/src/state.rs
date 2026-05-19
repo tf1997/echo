@@ -1,10 +1,10 @@
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::chat::ChatServer;
 use crate::db::{Database, UserProfile};
-use crate::discovery::{DiscoveryConfig, DiscoveryService};
+use crate::discovery::{DiscoveryConfig, DiscoveryService, PeerEntry};
 
 pub struct RuntimeServices {
     pub discovery: RwLock<DiscoveryService>,
@@ -14,7 +14,12 @@ pub struct RuntimeServices {
 }
 
 impl RuntimeServices {
-    pub async fn start(db: Arc<Database>, profile: &UserProfile, listen_port: u16) -> Result<Self> {
+    pub async fn start(
+        db: Arc<Database>,
+        profile: &UserProfile,
+        listen_port: u16,
+        relay_tx: Option<mpsc::UnboundedSender<Vec<PeerEntry>>>,
+    ) -> Result<Self> {
         // Identity = IP:port — no UUID, the network address IS the identity
         let local_ip = local_ip_address::local_ip()
             .map_err(|e| anyhow::anyhow!("Failed to get local IP: {}", e))?;
@@ -32,13 +37,14 @@ impl RuntimeServices {
             .await
             .unwrap_or_default();
 
-        let config = DiscoveryConfig::new(
+        let mut config = DiscoveryConfig::new(
             &my_id,
             &profile.username,
             &profile.department,
             listen_port,
             scan_subnets,
         );
+        config.relay_tx = relay_tx;
         let discovery = DiscoveryService::new(config)?;
         discovery.start().await?;
 
@@ -87,4 +93,6 @@ pub struct AppState {
     pub profile: Mutex<Option<UserProfile>>,
     // Use RwLock for runtime: multiple readers (clone Arc handle), single writer (initialization)
     pub runtime: RwLock<Option<Arc<RuntimeServices>>>,
+    /// Channel to forward UDP-relayed peers to the async contact-sync processor.
+    pub relay_tx: Option<mpsc::UnboundedSender<Vec<PeerEntry>>>,
 }

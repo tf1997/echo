@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 
 use super::broadcast::{LanDiscovery, LanDiscoveryConfig};
-use super::peer::Peer;
+use super::peer::{Peer, PeerEntry};
 
 const SERVICE_TYPE: &str = "_echo-p2p._tcp.local.";
 
@@ -18,6 +18,8 @@ pub struct DiscoveryConfig {
     pub department: String,
     pub listen_port: u16,
     pub scan_subnets: Vec<String>,
+    /// Channel to forward UDP-relayed peers to async DB layer.
+    pub relay_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<PeerEntry>>>,
 }
 
 impl DiscoveryConfig {
@@ -34,6 +36,7 @@ impl DiscoveryConfig {
             department: department.into(),
             listen_port,
             scan_subnets,
+            relay_tx: None,
         }
     }
 }
@@ -202,6 +205,7 @@ impl DiscoveryService {
             local_ip,
             scan_subnets: self.config.scan_subnets.clone(),
             discovery_port,
+            relay_tx: self.config.relay_tx.clone(),
         };
         let lan = LanDiscovery::new(lan_config, Arc::clone(&self.peers))
             .context("Failed to start LAN discovery")?;
