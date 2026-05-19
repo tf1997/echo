@@ -17,8 +17,33 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use state::AppState;
 
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .init();
+    // ── File logger with size-based truncation ─────────────────────────
+    let log_dir = std::env::var("ECHO_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".echo"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
+    std::fs::create_dir_all(&log_dir).ok();
+
+    flexi_logger::Logger::try_with_str("info")
+        .expect("failed to parse log level")
+        .log_to_file(
+            flexi_logger::FileSpec::default()
+                .directory(&log_dir)
+                .basename("echo"),
+        )
+        .rotate(
+            flexi_logger::Criterion::Size(5 * 1024 * 1024), // 5 MB
+            flexi_logger::Naming::Numbers,
+            flexi_logger::Cleanup::KeepLogFiles(0), // don't keep old — clear & restart
+        )
+        .duplicate_to_stderr(flexi_logger::Duplicate::All)
+        .format_for_files(flexi_logger::detailed_format)
+        .format_for_stderr(flexi_logger::colored_default_format)
+        .start()
+        .expect("failed to start logger");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
