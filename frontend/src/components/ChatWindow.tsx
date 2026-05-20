@@ -215,6 +215,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
   // Listen for file send progress
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
     import("@tauri-apps/api/event").then(({ listen }) => {
       listen<{ fileName: string; sent: number; total: number; speed: number }>("file-progress", (event) => {
         const { fileName, sent, total, speed } = event.payload;
@@ -233,8 +234,19 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
           }, 2000);
         }
       }).then((fn) => { unlisten = fn; });
+
+      listen<{ fileName: string; error: string }>("file-error", (event) => {
+        const { fileName, error } = event.payload;
+        setPendingMessages((prev) =>
+          prev.map((p) =>
+            p.file_name === fileName
+              ? { ...p, status: "failed", error }
+              : p
+          )
+        );
+      }).then((fn) => { unlistenError = fn; });
     });
-    return () => { unlisten?.(); };
+    return () => { unlisten?.(); unlistenError?.(); };
   }, []);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -393,17 +405,47 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     }
   }, [sendFileToPeer]);
 
-  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(true); };
-  const handleDragLeave = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(false); };
-
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
+  // Tauri native file-drop events (HTML5 dataTransfer.files is empty in Tauri webview)
+  useEffect(() => {
     if (!peer) return;
-    for (let i = 0; i < e.dataTransfer.files.length; i++) {
-      sendFileToPeer(e.dataTransfer.files[i]);
-    }
-  }, [peer, sendFileToPeer]);
+    let unlistenHover: (() => void) | undefined;
+    let unlistenDrop: (() => void) | undefined;
+    let unlistenCancelled: (() => void) | undefined;
+
+    import("@tauri-apps/api/event").then(({ listen }) => {
+      listen("tauri://file-drop-hover", () => {
+        setIsDragging(true);
+      }).then((fn) => { unlistenHover = fn; });
+
+      listen("tauri://file-drop-cancelled", () => {
+        setIsDragging(false);
+      }).then((fn) => { unlistenCancelled = fn; });
+
+      listen("tauri://file-drop", (event) => {
+        setIsDragging(false);
+        const paths = event.payload as string[];
+        for (const filePath of paths) {
+          const name = filePath.replace(/\\/g, "/").split("/").pop() || "file";
+          nearBottomRef.current = true;
+          const tempId = ++pendingId;
+          setPendingMessages((prev) => [...prev, {
+            id: tempId, content: `📎 ${name}`, msg_type: "file", file_name: name, status: "sending",
+          }]);
+          onSendFile(filePath).catch((e) => {
+            setPendingMessages((prev) => prev.map((p) =>
+              p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
+            ));
+          });
+        }
+      }).then((fn) => { unlistenDrop = fn; });
+    });
+
+    return () => {
+      unlistenHover?.();
+      unlistenDrop?.();
+      unlistenCancelled?.();
+    };
+  }, [peer?.id, onSendFile]);
 
   const handlePickFile = async () => {
     const selected = await open({ multiple: true });
@@ -459,9 +501,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     <div className="flex-1 flex h-full min-w-0">
     <div
       className="flex-1 flex flex-col bg-gray-800 h-full relative min-w-0"
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
+      onDragOver={(e) => e.preventDefault()}
     >
       {isDragging && (
         <div className="absolute inset-0 z-50 bg-indigo-600/20 border-2 border-dashed border-indigo-400 flex items-center justify-center backdrop-blur-sm">
