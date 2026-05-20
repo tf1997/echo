@@ -1,13 +1,26 @@
 {
-  "$schema": "https://raw.githubusercontent.com/nicehash/tauri/dev/packages/api/schema.json",
-  "productName": "Echo",
-  "version": "0.1.0",
-  "identifier": "com.echo.p2p",
   "build": {
-    "frontendDist": "../frontend/dist",
-    "beforeBuildCommand": "cd ../frontend && npm run build"
+    "distDir": "../frontend/dist",
+    "beforeBuildCommand": "",
+    "devPath": "../frontend/dist",
+    "beforeDevCommand": "",
+    "withGlobalTauri": true
   },
-  "app": {
+  "package": {
+    "productName": "Echo",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": {
+        "open": true
+      },
+      "dialog": {
+        "all": true,
+        "open": true
+      }
+    },
     "windows": [
       {
         "title": "Echo - P2P Chat",
@@ -19,14 +32,10 @@
     ],
     "security": {
       "csp": null
+    },
+    "bundle": {
+      "active": false,
+      "identifier": "com.echo.p2p"
     }
-  },
-  "plugins": {
-    "shell": {
-      "open": true
-    }
-  },
-  "bundle": {
-    "active": false
   }
 }

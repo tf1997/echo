@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/tauri";
 import type { Peer, ChatMessage, AppInfo, SaveProfilePayload, StoredPeer, UnreadCount } from "./types";
 
 export async function getAppInfo(): Promise<AppInfo> {

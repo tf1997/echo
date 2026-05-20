@@ -11,7 +11,7 @@ use crate::discovery::{Peer, PeerEntry};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use state::AppState;
@@ -46,8 +46,6 @@ pub fn run() {
         .expect("failed to start logger");
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let listen_port = std::env::var("ECHO_PORT")
                 .ok()
@@ -57,7 +55,7 @@ pub fn run() {
             let app_data_dir = std::env::var("ECHO_DATA_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| {
-                    app.path()
+                    app.path_resolver()
                         .app_data_dir()
                         .expect("Failed to get app data dir")
                 });
@@ -246,7 +244,7 @@ pub fn run() {
                                         }
                                         let _ = state.db.upsert_peer(&id, &username, &department, &ip.to_string(), port, false).await;
                                         let updated = Peer::with_online(id.clone(), username.clone(), department.clone(), ip, port, false, now);
-                                        let _ = app_handle.emit("peer-discovered", &updated);
+                                        let _ = app_handle.emit_all("peer-discovered", &updated);
                                         log::info!("HealthCheck: {} → OFFLINE (tcp failed, age>15s)", username);
                                     }
                                 }

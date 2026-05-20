@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use crate::contact_sync;
 use crate::db::Database;
 use crate::discovery::{Peer, PeerEntry};
-use tauri::Emitter;
+use tauri::Manager;
 
 /// Wire protocol message sent between peers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,7 +498,7 @@ impl ChatServer {
 
             // Emit progress
             let sent = std::cmp::min((i as usize) * CHUNK_SIZE, file_size as usize) as u64;
-            let _ = app_handle.emit("file-progress", serde_json::json!({
+            let _ = app_handle.emit_all("file-progress", serde_json::json!({
                 "fileName": file_name,
                 "sent": sent,
                 "total": file_size,
@@ -507,7 +507,7 @@ impl ChatServer {
         stream.flush().await?;
 
         // Emit complete
-        let _ = app_handle.emit("file-progress", serde_json::json!({
+        let _ = app_handle.emit_all("file-progress", serde_json::json!({
             "fileName": file_name,
             "sent": file_size,
             "total": file_size,
@@ -708,7 +708,7 @@ async fn send_file_in_background_inner(
     } else { Vec::new() };
 
     // Emit start event immediately so UI shows progress bar
-    let _ = app_handle.emit("file-progress", serde_json::json!({
+    let _ = app_handle.emit_all("file-progress", serde_json::json!({
         "fileName": file_name, "sent": 0, "total": file_size, "speed": 0,
     }));
 
@@ -742,7 +742,7 @@ async fn send_file_in_background_inner(
         let sent = std::cmp::min((i as usize) * CHUNK_SIZE, file_size as usize) as u64;
         let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
         let speed = (sent as f64 / elapsed) as u64; // bytes/sec
-        let _ = app_handle.emit("file-progress", serde_json::json!({
+        let _ = app_handle.emit_all("file-progress", serde_json::json!({
             "fileName": file_name, "sent": sent, "total": file_size, "speed": speed,
         }));
     }
@@ -750,7 +750,7 @@ async fn send_file_in_background_inner(
 
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
     let speed = (file_size as f64 / elapsed) as u64;
-    let _ = app_handle.emit("file-progress", serde_json::json!({
+    let _ = app_handle.emit_all("file-progress", serde_json::json!({
         "fileName": file_name, "sent": file_size, "total": file_size, "speed": speed,
     }));
 

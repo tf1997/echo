@@ -4,7 +4,18 @@ import tailwindcss from "@tailwindcss/vite";
 
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    // Tauri v1's custom protocol doesn't return CORS headers, so we must
+    // strip the `crossorigin` attribute that Vite adds to module scripts.
+    {
+      name: "strip-crossorigin",
+      transformIndexHtml(html) {
+        return html.replace(/\s*crossorigin\b\s*/g, " ");
+      },
+    },
+  ],
   base: "./",
   clearScreen: false,
   server: {

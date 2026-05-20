@@ -4,7 +4,7 @@ import type { GroupInfo } from "../api";
 import { MessageBubble, DateDivider, formatDateLabel } from "./MessageBubble";
 import { saveTempFile, listEmojiFiles, addEmojiFile, readFileBase64, sendMessage, sendMessageTyped, sendGroupMessage, sendGroupMessageTyped, renameGroup, leaveGroup, dissolveGroup, inviteToGroup } from "../api";
 import type { ForwardCardData } from "./MessageBubble";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/api/dialog";
 
 export interface PendingMessage {
   id: number;
