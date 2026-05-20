@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import type { ChatMessage } from "../types";
 import { readFileBase64, openFile, openFolder } from "../api";
 
@@ -74,6 +74,14 @@ function handleOpenFolder(filePath: string | null) {
 function ImagePreview({ filePath, fileSize }: { filePath: string; fileSize: number | null }) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  // Zoom & pan state
+  const [scale, setScale] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const dragStart = useRef({ x: 0, y: 0 });
+  const panStart = useRef({ x: 0, y: 0 });
 
   useEffect(() => {
     if (fileSize !== null && fileSize > MAX_PREVIEW_BYTES) { setFailed(true); return; }
@@ -82,10 +90,107 @@ function ImagePreview({ filePath, fileSize }: { filePath: string; fileSize: numb
       .catch(() => setFailed(true));
   }, [filePath, fileSize]);
 
+  // Reset zoom/pan when opening
+  useEffect(() => {
+    if (expanded) {
+      setScale(1);
+      setPan({ x: 0, y: 0 });
+    }
+  }, [expanded]);
+
+  useEffect(() => {
+    if (!expanded) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setExpanded(false); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [expanded]);
+
+  const handleWheel = useCallback((e: React.WheelEvent) => {
+    e.stopPropagation();
+    const delta = e.deltaY > 0 ? -0.15 : 0.15;
+    setScale((prev) => Math.min(10, Math.max(0.1, prev + delta)));
+  }, []);
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (scale <= 1) return;
+    e.stopPropagation();
+    setDragging(true);
+    dragStart.current = { x: e.clientX, y: e.clientY };
+    panStart.current = { ...pan };
+  }, [scale, pan]);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!dragging) return;
+    const dx = e.clientX - dragStart.current.x;
+    const dy = e.clientY - dragStart.current.y;
+    setPan({ x: panStart.current.x + dx, y: panStart.current.y + dy });
+  }, [dragging]);
+
+  const handleMouseUp = useCallback(() => {
+    setDragging(false);
+  }, []);
+
+  // Close lightbox only when clicking the backdrop (not the image)
+  const handleBackdropClick = useCallback(() => {
+    setExpanded(false);
+  }, []);
+
   if (failed || !src) return null;
   return (
-    <img src={src} alt="" className="w-full max-h-[320px] object-contain cursor-pointer rounded"
-      onClick={() => handleOpenFile(filePath)} onError={() => setFailed(true)} />
+    <>
+      <img src={src} alt="" className="w-full max-h-[320px] object-contain cursor-pointer rounded hover:opacity-90 transition-opacity"
+        onClick={() => setExpanded(true)} onError={() => setFailed(true)} />
+      {expanded && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/10 backdrop-blur-sm select-none"
+          onClick={handleBackdropClick}
+          onMouseMove={handleMouseMove}
+          onMouseUp={handleMouseUp}
+          onMouseLeave={handleMouseUp}>
+          {/* Top bar */}
+          <div className="absolute top-0 left-0 right-0 flex items-center justify-between px-4 py-3 bg-gradient-to-b from-black/60 to-transparent z-10">
+            <span className="text-white/70 text-xs">{Math.round(scale * 100)}%</span>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={(e) => { e.stopPropagation(); setScale((s) => Math.min(10, s + 0.25)); }}
+                className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 flex items-center justify-center text-white text-lg transition-colors"
+                title="放大"
+              >+</button>
+              <button
+                onClick={(e) => { e.stopPropagation(); setScale((s) => Math.max(0.1, s - 0.25)); }}
+                className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 flex items-center justify-center text-white text-lg transition-colors"
+                title="缩小"
+              >−</button>
+              <button
+                onClick={(e) => { e.stopPropagation(); setScale(1); setPan({ x: 0, y: 0 }); }}
+                className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 flex items-center justify-center text-white text-sm transition-colors"
+                title="重置"
+              >1:1</button>
+              <button
+                onClick={(e) => { e.stopPropagation(); setExpanded(false); }}
+                className="w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white text-xl transition-colors"
+              >×</button>
+            </div>
+          </div>
+          <img
+            src={src}
+            alt=""
+            className={`rounded-lg shadow-2xl ${scale > 1 ? "cursor-grab" : ""} ${dragging ? "cursor-grabbing" : ""}`}
+            style={{
+              transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`,
+              maxWidth: "95vw",
+              maxHeight: "95vh",
+              objectFit: "contain",
+              transition: dragging ? "none" : "transform 0.15s ease-out",
+            }}
+            onClick={(e) => e.stopPropagation()}
+            onDoubleClick={() => { setScale(1); setPan({ x: 0, y: 0 }); }}
+            onWheel={handleWheel}
+            onMouseDown={handleMouseDown}
+            draggable={false}
+          />
+        </div>
+      )}
+    </>
   );
 }
 
