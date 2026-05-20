@@ -16,9 +16,17 @@
       "shell": {
         "open": true
       },
+      "window": {
+        "all": true,
+        "create": true
+      },
       "dialog": {
         "all": true,
         "open": true
+      },
+      "protocol": {
+        "asset": true,
+        "assetScope": ["**"]
       }
     },
     "windows": [
