@@ -284,10 +284,17 @@ pub async fn send_file(
     let bg_name = file_name.clone();
     let bg_peer = peer.clone();
     let handle = app_handle.clone();
+    let error_handle = app_handle.clone();
     tauri::async_runtime::spawn(async move {
         match send_file_in_background(&bg_path, &bg_name, &bg_peer, my_id, my_name, my_department, listen_port, db, peers_arc, handle).await {
             Ok(msg) => info!("File sent: {}", msg.content),
-            Err(e) => error!("File send failed: {}", e),
+            Err(e) => {
+                error!("File send failed: {}", e);
+                let _ = error_handle.emit_all("file-error", serde_json::json!({
+                    "fileName": bg_name,
+                    "error": e.to_string(),
+                }));
+            }
         }
     });
 
@@ -1083,6 +1090,7 @@ pub async fn send_group_file(
         let bg_db = db.clone();
         let bg_peers = peers_arc.clone();
         let bg_handle = app_handle.clone();
+        let bg_error_handle = app_handle.clone();
         let bg_gid = group_id.clone();
         let bg_pending_cache = pending_cache.clone();
         let target_id = member.peer_id.clone();
@@ -1103,13 +1111,21 @@ pub async fn send_group_file(
                 ).await {
                     Ok(_) => log::info!("Group file sent to {}", peer.id),
                     Err(e) => {
-                        log::error!("Group file send failed to {}: {}", peer.id, e);
-                        if let Err(queue_err) = queue_group_file_for_peer(
+                        let send_error = e.to_string();
+                        log::error!("Group file send failed to {}: {}", peer.id, send_error);
+                        match queue_group_file_for_peer(
                             &bg_db, &bg_path, &bg_name, file_size, bg_pending_cache,
                             &peer.id, &bg_my_id, &bg_my_name, &bg_my_dep,
                             listen_port, &bg_gid,
                         ).await {
-                            log::error!("Failed to queue group file for {}: {}", peer.id, queue_err);
+                            Ok(()) => log::info!("Queued group file for {} after send failure", peer.id),
+                            Err(queue_err) => {
+                                log::error!("Failed to queue group file for {}: {}", peer.id, queue_err);
+                                let _ = bg_error_handle.emit_all("file-error", serde_json::json!({
+                                    "fileName": bg_name,
+                                    "error": format!("{}; queue failed: {}", send_error, queue_err),
+                                }));
+                            }
                         }
                     }
                 }
