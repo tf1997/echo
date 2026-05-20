@@ -74,14 +74,6 @@ function handleOpenFolder(filePath: string | null) {
 function ImagePreview({ filePath, fileSize }: { filePath: string; fileSize: number | null }) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
-  const [expanded, setExpanded] = useState(false);
-
-  // Zoom & pan state
-  const [scale, setScale] = useState(1);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [dragging, setDragging] = useState(false);
-  const dragStart = useRef({ x: 0, y: 0 });
-  const panStart = useRef({ x: 0, y: 0 });
 
   useEffect(() => {
     if (fileSize !== null && fileSize > MAX_PREVIEW_BYTES) { setFailed(true); return; }
@@ -90,106 +82,225 @@ function ImagePreview({ filePath, fileSize }: { filePath: string; fileSize: numb
       .catch(() => setFailed(true));
   }, [filePath, fileSize]);
 
-  // Reset zoom/pan when opening
-  useEffect(() => {
-    if (expanded) {
-      setScale(1);
-      setPan({ x: 0, y: 0 });
+  const openInNewWindow = useCallback(() => {
+    if (!src) return;
+    const win = window.open("", "_blank", "width=900,height=700,menubar=no,toolbar=no,resizable=yes");
+    if (!win) return;
+
+    // Extract filename from filePath for title
+    const fileName = filePath.replace(/\\/g, "/").split("/").pop() || "图片预览";
+
+    win.document.write(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>${fileName}</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background: rgba(0,0,0,0.85);
+      font-family: system-ui, -apple-system, sans-serif;
+      user-select: none;
+      cursor: default;
     }
-  }, [expanded]);
+    .container {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .topbar {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.6), transparent);
+      z-index: 10;
+    }
+    .zoom-label {
+      color: rgba(255,255,255,0.7);
+      font-size: 12px;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn {
+      width: 32px;
+      height: 32px;
+      border: none;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.1);
+      color: white;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      transition: background 0.15s;
+    }
+    .btn:hover { background: rgba(255,255,255,0.2); }
+    .close-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      font-size: 20px;
+    }
+    img {
+      max-width: 95%;
+      max-height: 95vh;
+      object-fit: contain;
+      cursor: grab;
+      transition: transform 0.15s ease-out;
+      transform-origin: center center;
+    }
+    img.dragging { cursor: grabbing; transition: none; }
+    img.scaled { cursor: grab; }
+  </style>
+</head>
+<body>
+  <div class="container" id="container">
+    <div class="topbar">
+      <span class="zoom-label" id="zoomLabel">100%</span>
+      <div class="controls">
+        <button class="btn" id="zoomIn" title="放大">+</button>
+        <button class="btn" id="zoomOut" title="缩小">−</button>
+        <button class="btn" id="reset" title="重置">1:1</button>
+        <button class="btn close-btn" id="close" title="关闭">×</button>
+      </div>
+    </div>
+    <img id="img" src="${src}" />
+  </div>
+  <script>
+    (function() {
+      const img = document.getElementById('img');
+      const container = document.getElementById('container');
+      const zoomLabel = document.getElementById('zoomLabel');
+      const zoomIn = document.getElementById('zoomIn');
+      const zoomOut = document.getElementById('zoomOut');
+      const reset = document.getElementById('reset');
+      const close = document.getElementById('close');
 
-  useEffect(() => {
-    if (!expanded) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setExpanded(false); };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [expanded]);
+      let scale = 1;
+      let panX = 0;
+      let panY = 0;
+      let dragging = false;
+      let dragStartX = 0;
+      let dragStartY = 0;
+      let panStartX = 0;
+      let panStartY = 0;
 
-  const handleWheel = useCallback((e: React.WheelEvent) => {
-    e.stopPropagation();
-    const delta = e.deltaY > 0 ? -0.15 : 0.15;
-    setScale((prev) => Math.min(10, Math.max(0.1, prev + delta)));
-  }, []);
+      function updateTransform() {
+        img.style.transform = 'translate(' + panX + 'px, ' + panY + 'px) scale(' + scale + ')';
+        zoomLabel.textContent = Math.round(scale * 100) + '%';
+      }
 
-  const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    if (scale <= 1) return;
-    e.stopPropagation();
-    setDragging(true);
-    dragStart.current = { x: e.clientX, y: e.clientY };
-    panStart.current = { ...pan };
-  }, [scale, pan]);
+      zoomIn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        scale = Math.min(10, scale + 0.25);
+        updateTransform();
+      });
 
-  const handleMouseMove = useCallback((e: React.MouseEvent) => {
-    if (!dragging) return;
-    const dx = e.clientX - dragStart.current.x;
-    const dy = e.clientY - dragStart.current.y;
-    setPan({ x: panStart.current.x + dx, y: panStart.current.y + dy });
-  }, [dragging]);
+      zoomOut.addEventListener('click', function(e) {
+        e.stopPropagation();
+        scale = Math.max(0.1, scale - 0.25);
+        updateTransform();
+      });
 
-  const handleMouseUp = useCallback(() => {
-    setDragging(false);
-  }, []);
+      reset.addEventListener('click', function(e) {
+        e.stopPropagation();
+        scale = 1;
+        panX = 0;
+        panY = 0;
+        updateTransform();
+      });
 
-  // Close lightbox only when clicking the backdrop (not the image)
-  const handleBackdropClick = useCallback(() => {
-    setExpanded(false);
-  }, []);
+      close.addEventListener('click', function() {
+        window.close();
+      });
+
+      img.addEventListener('wheel', function(e) {
+        e.preventDefault();
+        const delta = e.deltaY > 0 ? -0.15 : 0.15;
+        scale = Math.min(10, Math.max(0.1, scale + delta));
+        updateTransform();
+      });
+
+      img.addEventListener('mousedown', function(e) {
+        if (scale <= 1) return;
+        e.preventDefault();
+        dragging = true;
+        dragStartX = e.clientX;
+        dragStartY = e.clientY;
+        panStartX = panX;
+        panStartY = panY;
+        img.classList.add('dragging');
+      });
+
+      document.addEventListener('mousemove', function(e) {
+        if (!dragging) return;
+        panX = panStartX + (e.clientX - dragStartX);
+        panY = panStartY + (e.clientY - dragStartY);
+        updateTransform();
+      });
+
+      document.addEventListener('mouseup', function() {
+        dragging = false;
+        img.classList.remove('dragging');
+      });
+
+      img.addEventListener('dblclick', function() {
+        scale = 1;
+        panX = 0;
+        panY = 0;
+        updateTransform();
+      });
+
+      // Update cursor based on scale
+      function updateCursor() {
+        if (scale > 1) {
+          img.classList.add('scaled');
+        } else {
+          img.classList.remove('scaled');
+        }
+      }
+      updateCursor();
+
+      // Keyboard shortcuts
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') window.close();
+        if (e.key === '+' || e.key === '=') {
+          scale = Math.min(10, scale + 0.25);
+          updateTransform();
+        }
+        if (e.key === '-') {
+          scale = Math.max(0.1, scale - 0.25);
+          updateTransform();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>`);
+    win.document.close();
+  }, [src, filePath]);
 
   if (failed || !src) return null;
   return (
     <>
       <img src={src} alt="" className="w-full max-h-[320px] object-contain cursor-pointer rounded hover:opacity-90 transition-opacity"
-        onClick={() => setExpanded(true)} onError={() => setFailed(true)} />
-      {expanded && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/10 backdrop-blur-sm select-none"
-          onClick={handleBackdropClick}
-          onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
-          onMouseLeave={handleMouseUp}>
-          {/* Top bar */}
-          <div className="absolute top-0 left-0 right-0 flex items-center justify-between px-4 py-3 bg-gradient-to-b from-black/60 to-transparent z-10">
-            <span className="text-white/70 text-xs">{Math.round(scale * 100)}%</span>
-            <div className="flex items-center gap-1">
-              <button
-                onClick={(e) => { e.stopPropagation(); setScale((s) => Math.min(10, s + 0.25)); }}
-                className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 flex items-center justify-center text-white text-lg transition-colors"
-                title="放大"
-              >+</button>
-              <button
-                onClick={(e) => { e.stopPropagation(); setScale((s) => Math.max(0.1, s - 0.25)); }}
-                className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 flex items-center justify-center text-white text-lg transition-colors"
-                title="缩小"
-              >−</button>
-              <button
-                onClick={(e) => { e.stopPropagation(); setScale(1); setPan({ x: 0, y: 0 }); }}
-                className="w-8 h-8 rounded-lg bg-white/10 hover:bg-white/20 flex items-center justify-center text-white text-sm transition-colors"
-                title="重置"
-              >1:1</button>
-              <button
-                onClick={(e) => { e.stopPropagation(); setExpanded(false); }}
-                className="w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white text-xl transition-colors"
-              >×</button>
-            </div>
-          </div>
-          <img
-            src={src}
-            alt=""
-            className={`rounded-lg shadow-2xl ${scale > 1 ? "cursor-grab" : ""} ${dragging ? "cursor-grabbing" : ""}`}
-            style={{
-              transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`,
-              maxWidth: "95vw",
-              maxHeight: "95vh",
-              objectFit: "contain",
-              transition: dragging ? "none" : "transform 0.15s ease-out",
-            }}
-            onClick={(e) => e.stopPropagation()}
-            onDoubleClick={() => { setScale(1); setPan({ x: 0, y: 0 }); }}
-            onWheel={handleWheel}
-            onMouseDown={handleMouseDown}
-            draggable={false}
-          />
-        </div>
-      )}
+        onClick={openInNewWindow} onError={() => setFailed(true)} />
+      <div className="px-3 py-1.5 text-[10px] text-gray-400">点击查看大图</div>
     </>
   );
 }
