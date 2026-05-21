@@ -383,6 +383,8 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       // @ts-expect-error Tauri adds path property on drag events
       const filePath: string = file.path;
       if (filePath) {
+        // attach the real path so retries can use it and so pending matches final message
+        setPendingMessages((prev) => prev.map((p) => p.id === tempId ? { ...p, file_path: filePath } : p));
         onSendFile(filePath).catch((e) => {
           setPendingMessages((prev) => prev.map((p) =>
             p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
@@ -396,6 +398,9 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
 
     try {
       const savedPath = await readFileAndSave(file);
+      // Update pending entry to use the saved temp filename (it has a timestamp prefix)
+      const savedName = savedPath.replace(/\\/g, "/").split("/").pop() || file.name;
+      setPendingMessages((prev) => prev.map((p) => p.id === tempId ? { ...p, file_name: savedName, file_path: savedPath } : p));
       onSendFile(savedPath).catch((e) => {
         setPendingMessages((prev) => prev.map((p) =>
           p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
