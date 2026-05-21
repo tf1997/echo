@@ -400,7 +400,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       const savedPath = await readFileAndSave(file);
       // Update pending entry to use the saved temp filename (it has a timestamp prefix)
       const savedName = savedPath.replace(/\\/g, "/").split("/").pop() || file.name;
-      setPendingMessages((prev) => prev.map((p) => p.id === tempId ? { ...p, file_name: savedName, file_path: savedPath } : p));
+      setPendingMessages((prev) => prev.map((p) => p.id === tempId ? { ...p, file_name: savedName, file_path: savedPath, file_size: file.size } : p));
       onSendFile(savedPath).catch((e) => {
         setPendingMessages((prev) => prev.map((p) =>
           p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
