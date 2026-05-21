@@ -285,15 +285,16 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
 
   // Remove pending file bubbles when the real message arrives to avoid duplicates
   useEffect(() => {
-    const sentFileNames = new Set(
-      messages
-        .filter((m) => m.msg_type === "file" && m.file_name)
-        .map((m) => m.file_name as string)
-    );
-    if (sentFileNames.size === 0) return;
+    const sentFiles = messages
+      .filter((m) => m.msg_type === "file")
+      .map((m) => ({ file_path: m.file_path, file_name: m.file_name }));
+    if (sentFiles.length === 0) return;
     setPendingMessages((prev) => prev.filter((p) => {
-      if (p.msg_type !== "file" || !p.file_name) return true;
-      return !sentFileNames.has(p.file_name);
+      if (p.msg_type !== "file") return true;
+      return !sentFiles.some((m) => (
+        (p.file_path && m.file_path && p.file_path === m.file_path) ||
+        (p.file_name && m.file_name && p.file_name === m.file_name)
+      ));
     }));
   }, [messages]);
 
@@ -398,7 +399,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       const savedPath = await readFileAndSave(file);
       // Update pending entry to use the saved temp filename (it has a timestamp prefix)
       const savedName = savedPath.replace(/\\/g, "/").split("/").pop() || file.name;
-      setPendingMessages((prev) => prev.map((p) => p.id === tempId ? { ...p, file_name: savedName, file_path: savedPath } : p));
+      setPendingMessages((prev) => prev.map((p) => p.id === tempId ? { ...p, file_name: savedName, file_path: savedPath, file_size: file.size } : p));
       onSendFile(savedPath).catch((e) => {
         setPendingMessages((prev) => prev.map((p) =>
           p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
