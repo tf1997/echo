@@ -283,6 +283,20 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     }
   }, [messages, pendingMessages]);
 
+  // Remove pending file bubbles when the real message arrives to avoid duplicates
+  useEffect(() => {
+    const sentFileNames = new Set(
+      messages
+        .filter((m) => m.msg_type === "file" && m.file_name)
+        .map((m) => m.file_name as string)
+    );
+    if (sentFileNames.size === 0) return;
+    setPendingMessages((prev) => prev.filter((p) => {
+      if (p.msg_type !== "file" || !p.file_name) return true;
+      return !sentFileNames.has(p.file_name);
+    }));
+  }, [messages]);
+
   const retryText = useCallback(async (pending: PendingMessage) => {
     setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
     try {
@@ -367,6 +381,8 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       // @ts-expect-error Tauri adds path property on drag events
       const filePath: string = file.path;
       if (filePath) {
+        // attach the real path so retries can use it and so pending matches final message
+        setPendingMessages((prev) => prev.map((p) => p.id === tempId ? { ...p, file_path: filePath } : p));
         onSendFile(filePath).catch((e) => {
           setPendingMessages((prev) => prev.map((p) =>
             p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
@@ -380,6 +396,9 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
 
     try {
       const savedPath = await readFileAndSave(file);
+      // Update pending entry to use the saved temp filename (it has a timestamp prefix)
+      const savedName = savedPath.replace(/\\/g, "/").split("/").pop() || file.name;
+      setPendingMessages((prev) => prev.map((p) => p.id === tempId ? { ...p, file_name: savedName, file_path: savedPath } : p));
       onSendFile(savedPath).catch((e) => {
         setPendingMessages((prev) => prev.map((p) =>
           p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
