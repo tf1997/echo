@@ -24,6 +24,20 @@ pub struct PendingGroupMsg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingFileTransfer {
+    pub id: i64,
+    pub group_id: String,
+    pub peer_id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub sender_department: String,
+    pub sender_port: u16,
+    pub file_path: String,
+    pub file_name: String,
+    pub file_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupInfo {
     pub group_id: String,
     pub name: String,
@@ -269,6 +283,27 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_notif_peer ON pending_notifications(peer_id)")
             .execute(&self.pool).await.ok();
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pending_file_transfers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                sender_id TEXT NOT NULL,
+                sender_name TEXT NOT NULL,
+                sender_department TEXT NOT NULL,
+                sender_port INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool).await
+        .context("Failed to create pending_file_transfers table")?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_file_peer ON pending_file_transfers(peer_id)")
+            .execute(&self.pool).await.ok();
+
         info!("Database initialized successfully.");
         Ok(())
     }
@@ -450,6 +485,75 @@ impl Database {
     }
 
     // ── Group operations ──
+
+    pub async fn queue_pending_file_transfer(
+        &self,
+        group_id: &str,
+        peer_id: &str,
+        sender_id: &str,
+        sender_name: &str,
+        sender_department: &str,
+        sender_port: u16,
+        file_path: &str,
+        file_name: &str,
+        file_size: i64,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO pending_file_transfers
+             (group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(group_id)
+        .bind(peer_id)
+        .bind(sender_id)
+        .bind(sender_name)
+        .bind(sender_department)
+        .bind(sender_port as i64)
+        .bind(file_path)
+        .bind(file_name)
+        .bind(file_size)
+        .bind(&now)
+        .execute(&self.pool).await
+        .context("Failed to queue pending file transfer")?;
+        Ok(())
+    }
+
+    pub async fn get_pending_file_transfers(&self, peer_id: &str) -> Result<Vec<PendingFileTransfer>> {
+        let rows = sqlx::query(
+            "SELECT id, group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size
+             FROM pending_file_transfers WHERE peer_id = ? ORDER BY id ASC",
+        )
+        .bind(peer_id).fetch_all(&self.pool).await
+        .context("Failed to load pending file transfers")?;
+
+        Ok(rows.iter().map(|r| PendingFileTransfer {
+            id: r.get("id"),
+            group_id: r.get("group_id"),
+            peer_id: r.get("peer_id"),
+            sender_id: r.get("sender_id"),
+            sender_name: r.get("sender_name"),
+            sender_department: r.get("sender_department"),
+            sender_port: r.get::<i64, _>("sender_port") as u16,
+            file_path: r.get("file_path"),
+            file_name: r.get("file_name"),
+            file_size: r.get("file_size"),
+        }).collect())
+    }
+
+    pub async fn delete_pending_file_transfer(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM pending_file_transfers WHERE id = ?")
+            .bind(id).execute(&self.pool).await
+            .context("Failed to delete pending file transfer")?;
+        Ok(())
+    }
+
+    pub async fn count_pending_file_transfers_by_path(&self, file_path: &str) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM pending_file_transfers WHERE file_path = ?")
+            .bind(file_path).fetch_one(&self.pool).await
+            .context("Failed to count pending file transfers")?;
+        Ok(row.get("count"))
+    }
 
     pub async fn create_group(&self, group_id: &str, name: &str, creator_id: &str, member_ids: &[String]) -> Result<()> {
         let now = Utc::now().to_rfc3339();

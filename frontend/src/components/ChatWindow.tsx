@@ -271,6 +271,22 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     }
   }, [messages, pendingMessages]);
 
+  useEffect(() => {
+    setPendingMessages((prev) =>
+      prev.filter((pending) => {
+        if (pending.status === "failed") return true;
+        const hasRealMessage = messages.some((message) => {
+          if (message.sender_id !== myId || message.msg_type !== pending.msg_type) return false;
+          if (pending.msg_type === "file") {
+            return !!pending.file_name && message.file_name === pending.file_name;
+          }
+          return message.content === pending.content;
+        });
+        return !hasRealMessage;
+      })
+    );
+  }, [messages, myId]);
+
   const retryText = useCallback(async (pending: PendingMessage) => {
     setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
     try {
