@@ -283,20 +283,22 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     }
   }, [messages, pendingMessages]);
 
-  // Remove pending file bubbles when the real message arrives to avoid duplicates
+  // Remove pending bubbles when the real message arrives to avoid duplicates
   useEffect(() => {
-    const sentFiles = messages
-      .filter((m) => m.msg_type === "file")
-      .map((m) => ({ file_path: m.file_path, file_name: m.file_name }));
-    if (sentFiles.length === 0) return;
     setPendingMessages((prev) => prev.filter((p) => {
-      if (p.msg_type !== "file") return true;
-      return !sentFiles.some((m) => (
-        (p.file_path && m.file_path && p.file_path === m.file_path) ||
-        (p.file_name && m.file_name && p.file_name === m.file_name)
-      ));
+      if (p.status === "failed") return true;
+      return !messages.some((m) => {
+        if (m.sender_id !== myId || m.msg_type !== p.msg_type) return false;
+        if (p.msg_type === "file") {
+          return (
+            (p.file_path && m.file_path && p.file_path === m.file_path) ||
+            (p.file_name && m.file_name && p.file_name === m.file_name)
+          );
+        }
+        return m.content === p.content;
+      });
     }));
-  }, [messages]);
+  }, [messages, myId]);
 
   const retryText = useCallback(async (pending: PendingMessage) => {
     setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));

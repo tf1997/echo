@@ -185,6 +185,15 @@ impl ChatServer {
                     // Mark sender as recent contact
                     let _ = db.add_recent_contact(&msg.sender_id).await;
 
+                    for entry in &msg.known_peers {
+                        if entry.id == my_id || entry.ip.is_empty() || entry.port == 0 { continue; }
+                        if entry.ip.parse::<std::net::IpAddr>().is_err() { continue; }
+                        let _ = db.upsert_peer(
+                            &entry.id, &entry.username, &entry.department,
+                            &entry.ip, entry.port, false,
+                        ).await;
+                    }
+
                     // Auto-join/discover group for system messages
                     if let Some(ref gid) = msg.group_id {
                         if msg.msg_type == "group_created" {
@@ -216,6 +225,8 @@ impl ChatServer {
                             // sender_id is the leaving member's peer_id
                             let _ = db.remove_group_member(gid, &msg.sender_id).await;
                             info!("Member {} left group {}", msg.sender_id, gid);
+                        } else if msg.sender_id != my_id {
+                            let _ = db.add_group_members(gid, &[msg.sender_id.clone()]).await;
                         }
                     }
 
@@ -721,7 +732,7 @@ async fn send_file_in_background_inner(
             .with_context(|| format!("Failed to read file chunk {}", i))?;
         if n == 0 { break; }
 
-        let is_last = n < CHUNK_SIZE;
+        let is_last = n < CHUNK_SIZE || (file_size as usize) <= ((i as usize + 1) * CHUNK_SIZE);
         let msg = WireMessage {
             sender_id: my_id.clone(), sender_name: my_name.clone(),
             sender_department: my_department.clone(), sender_port: listen_port,

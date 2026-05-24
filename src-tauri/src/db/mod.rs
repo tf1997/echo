@@ -24,6 +24,20 @@ pub struct PendingGroupMsg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingFileTransfer {
+    pub id: i64,
+    pub group_id: String,
+    pub peer_id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub sender_department: String,
+    pub sender_port: u16,
+    pub file_path: String,
+    pub file_name: String,
+    pub file_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupInfo {
     pub group_id: String,
     pub name: String,
@@ -269,6 +283,27 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_notif_peer ON pending_notifications(peer_id)")
             .execute(&self.pool).await.ok();
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pending_file_transfers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                sender_id TEXT NOT NULL,
+                sender_name TEXT NOT NULL,
+                sender_department TEXT NOT NULL,
+                sender_port INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool).await
+        .context("Failed to create pending_file_transfers table")?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_file_peer ON pending_file_transfers(peer_id)")
+            .execute(&self.pool).await.ok();
+
         info!("Database initialized successfully.");
         Ok(())
     }
@@ -451,6 +486,75 @@ impl Database {
 
     // ── Group operations ──
 
+    pub async fn queue_pending_file_transfer(
+        &self,
+        group_id: &str,
+        peer_id: &str,
+        sender_id: &str,
+        sender_name: &str,
+        sender_department: &str,
+        sender_port: u16,
+        file_path: &str,
+        file_name: &str,
+        file_size: i64,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO pending_file_transfers
+             (group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(group_id)
+        .bind(peer_id)
+        .bind(sender_id)
+        .bind(sender_name)
+        .bind(sender_department)
+        .bind(sender_port as i64)
+        .bind(file_path)
+        .bind(file_name)
+        .bind(file_size)
+        .bind(&now)
+        .execute(&self.pool).await
+        .context("Failed to queue pending file transfer")?;
+        Ok(())
+    }
+
+    pub async fn get_pending_file_transfers(&self, peer_id: &str) -> Result<Vec<PendingFileTransfer>> {
+        let rows = sqlx::query(
+            "SELECT id, group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size
+             FROM pending_file_transfers WHERE peer_id = ? ORDER BY id ASC",
+        )
+        .bind(peer_id).fetch_all(&self.pool).await
+        .context("Failed to load pending file transfers")?;
+
+        Ok(rows.iter().map(|r| PendingFileTransfer {
+            id: r.get("id"),
+            group_id: r.get("group_id"),
+            peer_id: r.get("peer_id"),
+            sender_id: r.get("sender_id"),
+            sender_name: r.get("sender_name"),
+            sender_department: r.get("sender_department"),
+            sender_port: r.get::<i64, _>("sender_port") as u16,
+            file_path: r.get("file_path"),
+            file_name: r.get("file_name"),
+            file_size: r.get("file_size"),
+        }).collect())
+    }
+
+    pub async fn delete_pending_file_transfer(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM pending_file_transfers WHERE id = ?")
+            .bind(id).execute(&self.pool).await
+            .context("Failed to delete pending file transfer")?;
+        Ok(())
+    }
+
+    pub async fn count_pending_file_transfers_by_path(&self, file_path: &str) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM pending_file_transfers WHERE file_path = ?")
+            .bind(file_path).fetch_one(&self.pool).await
+            .context("Failed to count pending file transfers")?;
+        Ok(row.get("count"))
+    }
+
     pub async fn create_group(&self, group_id: &str, name: &str, creator_id: &str, member_ids: &[String]) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query("INSERT OR IGNORE INTO groups (group_id, name, creator_id, created_at) VALUES (?, ?, ?, ?)")
@@ -515,6 +619,17 @@ impl Database {
     }
 
     pub async fn get_group_members(&self, group_id: &str) -> Result<Vec<StoredPeer>> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at)
+             SELECT DISTINCT group_id, sender_id, timestamp
+             FROM messages
+             WHERE group_id = ? AND sender_id <> ''",
+        )
+        .bind(group_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to repair group members from messages")?;
+
         // Always return gm.peer_id (never NULL) so callers don't see phantom rows.
         // For "myself" we have no row in `peers` — fall back to `user_profile`.
         let rows = sqlx::query(
@@ -532,7 +647,7 @@ impl Database {
              LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = gm.peer_id
              WHERE gm.group_id = ?"
         ).bind(group_id).fetch_all(&self.pool).await.context("Failed to get group members")?;
-        Ok(rows.iter().map(|r| {
+        let mut members: Vec<StoredPeer> = rows.iter().map(|r| {
             let is_self: i64 = r.try_get("is_self").unwrap_or(0);
             StoredPeer {
                 peer_id: r.get("peer_id"),
@@ -545,7 +660,32 @@ impl Database {
                 first_seen_at: r.try_get("first_seen_at").unwrap_or_default(),
                 last_seen_at: r.try_get("last_seen_at").unwrap_or_default(),
             }
-        }).collect())
+        }).collect();
+
+        members.sort_by(|a, b| {
+            let a_key = if !a.username.is_empty() {
+                format!("{}\u{1f}{}", a.username, a.department)
+            } else {
+                a.peer_id.clone()
+            };
+            let b_key = if !b.username.is_empty() {
+                format!("{}\u{1f}{}", b.username, b.department)
+            } else {
+                b.peer_id.clone()
+            };
+            a_key.cmp(&b_key)
+                .then_with(|| b.is_online.cmp(&a.is_online))
+                .then_with(|| b.last_seen_at.cmp(&a.last_seen_at))
+        });
+        members.dedup_by(|a, b| {
+            if a.username.is_empty() || b.username.is_empty() {
+                a.peer_id == b.peer_id
+            } else {
+                a.username == b.username && a.department == b.department
+            }
+        });
+
+        Ok(members)
     }
 
     pub async fn rename_group(&self, group_id: &str, new_name: &str) -> Result<()> {
@@ -663,6 +803,18 @@ impl Database {
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
 
+        let endpoint_duplicates = sqlx::query("SELECT peer_id FROM peers WHERE ip = ? AND port = ? AND peer_id <> ?")
+            .bind(ip)
+            .bind(port as i64)
+            .bind(peer_id)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to load stale peer endpoints")?;
+        for row in endpoint_duplicates {
+            let old_peer_id: String = row.get("peer_id");
+            self.migrate_peer_references(&old_peer_id, peer_id).await?;
+        }
+
         // Cleanup duplicates at the same endpoint (different peer_id, same ip:port).
         sqlx::query("DELETE FROM peers WHERE ip = ? AND port = ? AND peer_id <> ?")
             .bind(ip)
@@ -675,6 +827,18 @@ impl Database {
         // Cleanup by identity (same name+dept under a different peer_id, e.g. peer IP changed)
         // only when username is known — otherwise we'd nuke other unnamed peers indiscriminately.
         if !username.is_empty() {
+            let identity_duplicates = sqlx::query("SELECT peer_id FROM peers WHERE username = ? AND department = ? AND peer_id <> ?")
+                .bind(username)
+                .bind(department)
+                .bind(peer_id)
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to load duplicate identity")?;
+            for row in identity_duplicates {
+                let old_peer_id: String = row.get("peer_id");
+                self.migrate_peer_references(&old_peer_id, peer_id).await?;
+            }
+
             sqlx::query("DELETE FROM peers WHERE username = ? AND department = ? AND peer_id <> ?")
                 .bind(username)
                 .bind(department)
@@ -709,6 +873,88 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("Failed to upsert peer")?;
+
+        Ok(())
+    }
+
+    async fn migrate_peer_references(&self, old_peer_id: &str, new_peer_id: &str) -> Result<()> {
+        if old_peer_id == new_peer_id {
+            return Ok(());
+        }
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at)
+             SELECT group_id, ?, joined_at FROM group_members WHERE peer_id = ?",
+        )
+        .bind(new_peer_id)
+        .bind(old_peer_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to migrate group members")?;
+
+        sqlx::query("DELETE FROM group_members WHERE peer_id = ?")
+            .bind(old_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to remove stale group member refs")?;
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO recent_contacts (peer_id, added_at)
+             SELECT ?, added_at FROM recent_contacts WHERE peer_id = ?",
+        )
+        .bind(new_peer_id)
+        .bind(old_peer_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to migrate recent contacts")?;
+
+        sqlx::query("DELETE FROM recent_contacts WHERE peer_id = ?")
+            .bind(old_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to remove stale recent contacts")?;
+
+        sqlx::query("UPDATE pending_group_messages SET peer_id = ? WHERE peer_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to migrate pending group messages")?;
+
+        sqlx::query("UPDATE pending_notifications SET peer_id = ? WHERE peer_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to migrate pending notifications")?;
+
+        sqlx::query("UPDATE pending_file_transfers SET peer_id = ? WHERE peer_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to migrate pending file transfers")?;
+
+        sqlx::query("UPDATE messages SET sender_id = ? WHERE sender_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to migrate message senders")?;
+
+        sqlx::query("UPDATE messages SET receiver_id = ? WHERE receiver_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to migrate message receivers")?;
+
+        sqlx::query("UPDATE groups SET creator_id = ? WHERE creator_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to migrate group creators")?;
 
         Ok(())
     }
@@ -756,6 +1002,32 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .context("Failed to get stored peer")?;
+
+        Ok(row.map(|row| StoredPeer {
+            peer_id: row.get("peer_id"),
+            username: row.get("username"),
+            department: row.get("department"),
+            ip: row.get("ip"),
+            port: row.get::<i64, _>("port") as u16,
+            is_online: row.get::<bool, _>("is_online"),
+            first_seen_at: row.get("first_seen_at"),
+            last_seen_at: row.get("last_seen_at"),
+        }))
+    }
+
+    pub async fn find_peer_by_identity(&self, username: &str, department: &str) -> Result<Option<StoredPeer>> {
+        let row = sqlx::query(
+            "SELECT peer_id, username, department, ip, port, is_online, first_seen_at, last_seen_at
+             FROM peers
+             WHERE username = ? AND department = ?
+             ORDER BY is_online DESC, last_seen_at DESC
+             LIMIT 1",
+        )
+        .bind(username)
+        .bind(department)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to find peer by identity")?;
 
         Ok(row.map(|row| StoredPeer {
             peer_id: row.get("peer_id"),

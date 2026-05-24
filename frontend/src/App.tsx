@@ -312,9 +312,7 @@ function App() {
 
   const handleSendFile = useCallback(async (filePath: string) => {
     if (selectedGroupId) {
-      // Fire-and-forget; poll will pick up the saved message
-      sendGroupFile(selectedGroupId, filePath).catch(console.error);
-      return;
+      return await sendGroupFile(selectedGroupId, filePath);
     }
     if (!selectedPeer) throw new Error("未选择联系人");
     sendFile(selectedPeer.id, filePath).catch(console.error);
