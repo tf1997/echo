@@ -109,7 +109,6 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   }
 
   const groupsTotalUnread = groups.reduce((sum, g) => sum + (g.unread_count || 0), 0);
-  const recentTotalUnread = recentContacts.reduce((sum, r) => sum + (unreadMap.get(r.peer_id) ?? 0), 0);
 
   const handleSearchChange = useCallback(async (value: string) => {
     setSearchQuery(value);
@@ -353,12 +352,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
         <div className="flex-1 flex flex-col min-h-0">
           {/* Tabs */}
           <div className="flex border-b border-gray-700">
-            <button onClick={() => { setTab("recent"); listRecentContacts().then(setRecentContacts).catch(() => {}); }} className={`flex-1 py-2 text-xs font-medium relative ${tab === "recent" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>
-              最近
-              {recentTotalUnread > 0 && (
-                <span className="absolute top-1 right-2 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center">{recentTotalUnread > 99 ? "99+" : recentTotalUnread}</span>
-              )}
-            </button>
+            <button onClick={() => { setTab("recent"); listRecentContacts().then(setRecentContacts).catch(() => {}); }} className={`flex-1 py-2 text-xs font-medium ${tab === "recent" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>最近</button>
             <button onClick={() => setTab("contacts")} className={`flex-1 py-2 text-xs font-medium ${tab === "contacts" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>联系人</button>
             <button onClick={() => setTab("groups")} className={`flex-1 py-2 text-xs font-medium relative ${tab === "groups" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>
               群组
