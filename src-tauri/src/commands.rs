@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 use std::sync::Arc;
 
-use crate::chat::send_file_in_background;
+use crate::chat::send_file_in_background_with_kind;
 use crate::db::{ChatMessage, StoredPeer, UnreadCount, UserProfile};
 use crate::discovery::Peer;
 use crate::state::{AppState, RuntimeServices};
@@ -233,7 +233,27 @@ pub async fn send_file(
     peer_id: String,
     file_path: String,
 ) -> Result<ChatMessage, String> {
-    info!("send_file: start");
+    send_file_with_kind(app_handle, state, peer_id, file_path, "file").await
+}
+
+#[tauri::command]
+pub async fn send_sticker(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+    peer_id: String,
+    file_path: String,
+) -> Result<ChatMessage, String> {
+    send_file_with_kind(app_handle, state, peer_id, file_path, "sticker").await
+}
+
+async fn send_file_with_kind(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+    peer_id: String,
+    file_path: String,
+    file_kind: &str,
+) -> Result<ChatMessage, String> {
+    info!("send_file: start ({})", file_kind);
     let t0 = std::time::Instant::now();
     let runtime_opt = { state.runtime.read().await.clone() };
     let Some(runtime) = runtime_opt.as_ref() else {
@@ -285,8 +305,9 @@ pub async fn send_file(
     let bg_peer = peer.clone();
     let handle = app_handle.clone();
     let error_handle = app_handle.clone();
+    let bg_kind = file_kind.to_string();
     tauri::async_runtime::spawn(async move {
-        match send_file_in_background(&bg_path, &bg_name, &bg_peer, my_id, my_name, my_department, listen_port, db, peers_arc, handle).await {
+        match send_file_in_background_with_kind(&bg_path, &bg_name, &bg_peer, my_id, my_name, my_department, listen_port, db, peers_arc, handle, &bg_kind).await {
             Ok(msg) => info!("File sent: {}", msg.content),
             Err(e) => {
                 error!("File send failed: {}", e);
@@ -298,6 +319,13 @@ pub async fn send_file(
         }
     });
 
+    let msg_kind = if file_kind == "sticker" { "sticker" } else { "file" };
+    let content = if msg_kind == "sticker" {
+        "[表情]".to_string()
+    } else {
+        format!("📎 {}", file_name)
+    };
+
     info!("send_file: returning placeholder ({:?} total)", t0.elapsed());
     use chrono::Utc;
     Ok(ChatMessage {
@@ -305,8 +333,8 @@ pub async fn send_file(
         sender_id: placeholder_my_id,
         sender_name: placeholder_my_name,
         receiver_id: placeholder_peer_id,
-        content: format!("📎 {}", file_name),
-        msg_type: "file".to_string(),
+        content,
+        msg_type: msg_kind.to_string(),
         file_name: Some(file_name),
         file_path: Some(file_path),
         file_size: None,
@@ -1047,6 +1075,26 @@ pub async fn send_group_file(
     group_id: String,
     file_path: String,
 ) -> Result<ChatMessage, String> {
+    send_group_file_with_kind(app_handle, state, group_id, file_path, "file").await
+}
+
+#[tauri::command]
+pub async fn send_group_sticker(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+    group_id: String,
+    file_path: String,
+) -> Result<ChatMessage, String> {
+    send_group_file_with_kind(app_handle, state, group_id, file_path, "sticker").await
+}
+
+async fn send_group_file_with_kind(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+    group_id: String,
+    file_path: String,
+    file_kind: &str,
+) -> Result<ChatMessage, String> {
     use chrono::Utc;
     let (my_id, my_name, my_department, listen_port, db, members) = {
         let runtime_opt = { state.runtime.read().await.clone() };
@@ -1062,11 +1110,17 @@ pub async fn send_group_file(
     let file_size = tokio::fs::metadata(&file_path).await
         .map(|m| m.len() as i64).map_err(|e| e.to_string())?;
     let pending_cache: Arc<tokio::sync::Mutex<Option<String>>> = Arc::new(tokio::sync::Mutex::new(None));
+    let msg_kind = if file_kind == "sticker" { "sticker" } else { "file" };
+    let content = if msg_kind == "sticker" {
+        "[表情]".to_string()
+    } else {
+        format!("📎 {}", file_name)
+    };
 
     // Save outgoing file message to the group conversation (read=true for sender)
     let saved = db.save_group_message(
         &group_id, &my_id, &my_name,
-        &format!("📎 {}", file_name), "file",
+        &content, msg_kind,
         Some(&file_path), Some(&file_name), Some(file_size), true,
     ).await.map_err(|e| e.to_string())?;
 
@@ -1091,6 +1145,7 @@ pub async fn send_group_file(
         let bg_error_handle = app_handle.clone();
         let bg_gid = group_id.clone();
         let bg_pending_cache = pending_cache.clone();
+        let bg_kind = msg_kind.to_string();
         let mut target_id = member.peer_id.clone();
         let target_name = member.username.clone();
         let target_department = member.department.clone();
@@ -1118,7 +1173,7 @@ pub async fn send_group_file(
             match send_group_file_to_peer_with_progress(
                 &bg_path, &bg_name, file_size, &peer,
                 &bg_my_id, &bg_my_name, &bg_my_dep, listen_port,
-                &bg_gid, &bg_handle,
+                &bg_gid, &bg_kind, &bg_handle,
             ).await {
                 Ok(_) => log::info!("Group file sent to {}", peer.id),
                 Err(e) => {
@@ -1126,7 +1181,7 @@ pub async fn send_group_file(
                     if let Err(queue_err) = queue_group_file_for_peer(
                         &bg_db, &bg_path, &bg_name, file_size, bg_pending_cache,
                         &peer.id, &bg_my_id, &bg_my_name, &bg_my_dep,
-                        listen_port, &bg_gid,
+                        listen_port, &bg_gid, &bg_kind,
                     ).await {
                         log::error!("Failed to queue group file for {}: {}", peer.id, queue_err);
                         let _ = bg_error_handle.emit_all("file-error", serde_json::json!({
@@ -1140,7 +1195,7 @@ pub async fn send_group_file(
             if let Err(e) = queue_group_file_for_peer(
                 &bg_db, &bg_path, &bg_name, file_size, bg_pending_cache,
                 &target_id, &bg_my_id, &bg_my_name, &bg_my_dep,
-                listen_port, &bg_gid,
+                listen_port, &bg_gid, &bg_kind,
             ).await {
                 log::error!("Failed to queue group file for {}: {}", target_id, e);
                 let _ = bg_error_handle.emit_all("file-error", serde_json::json!({
@@ -1165,8 +1220,8 @@ pub async fn send_group_file(
         sender_id: my_id,
         sender_name: my_name,
         receiver_id: String::new(),
-        content: format!("📎 {}", file_name),
-        msg_type: "file".to_string(),
+        content,
+        msg_type: msg_kind.to_string(),
         file_name: Some(file_name),
         file_path: Some(file_path),
         file_size: Some(file_size),
@@ -1185,6 +1240,7 @@ async fn send_group_file_to_peer_with_progress(
     my_department: &str,
     listen_port: u16,
     group_id: &str,
+    file_kind: &str,
     app_handle: &tauri::AppHandle,
 ) -> Result<(), String> {
     let transfer = crate::db::PendingFileTransfer {
@@ -1198,6 +1254,7 @@ async fn send_group_file_to_peer_with_progress(
         file_path: file_path.to_string(),
         file_name: file_name.to_string(),
         file_size,
+        file_kind: file_kind.to_string(),
     };
 
     let _ = app_handle.emit_all("file-progress", serde_json::json!({
@@ -1234,6 +1291,7 @@ async fn queue_group_file_for_peer(
     my_department: &str,
     listen_port: u16,
     group_id: &str,
+    file_kind: &str,
 ) -> Result<(), String> {
     let cached_file_path = get_or_create_pending_cache(file_path, file_name, &pending_cache).await?;
     db.queue_pending_file_transfer(
@@ -1246,6 +1304,7 @@ async fn queue_group_file_for_peer(
         &cached_file_path,
         file_name,
         file_size,
+        file_kind,
     ).await.map_err(|e| e.to_string())
 }
 
@@ -1319,6 +1378,7 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
                     sender_department: String::new(), sender_port: listen_port,
                     receiver_id: peer_id.clone(), content: p.content.clone(),
                     msg_type: p.msg_type.clone(), file_name: None, file_size: None, file_data: None,
+                    file_kind: None,
                     known_peers: Vec::new(), group_id: Some(p.group_id.clone()),
                 };
                 let json = serde_json::to_string(&wm).unwrap_or_default();
@@ -1461,6 +1521,7 @@ async fn send_group_file_payloads_over_tcp(
             file_name: Some(transfer.file_name.clone()),
             file_size: Some(transfer.file_size as u64),
             file_data: None,
+            file_kind: Some(transfer.file_kind.clone()),
             known_peers: Vec::new(),
             group_id: Some(transfer.group_id.clone()),
         };

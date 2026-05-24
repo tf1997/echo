@@ -251,6 +251,7 @@ pub async fn handle_contact_summary(
         file_name: None,
         file_size: None,
         file_data: None,
+        file_kind: None,
         known_peers: Vec::new(),
         group_id: None,
     };
@@ -373,6 +374,7 @@ pub async fn exchange_with_peer(
         file_name: None,
         file_size: None,
         file_data: None,
+        file_kind: None,
         known_peers: Vec::new(),
         group_id: None,
     };

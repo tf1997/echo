@@ -161,6 +161,7 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
 }
 
 export function MessageBubble({ message, isOwn, showSender = false, highlighted = false, selectMode = false, selected = false, onToggleSelect, onStartForward }: MessageBubbleProps) {
+  const isSticker = message.msg_type === "sticker";
   const isFile = message.msg_type === "file";
   const showPreview = isFile && isImageFile(message.file_name) && message.file_path;
   const [showMenu, setShowMenu] = useState(false);
@@ -208,7 +209,7 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
         {!isOwn && showSender && (
           <span className="text-xs text-indigo-300 mb-1 ml-1">{message.sender_name}</span>
         )}
-        <div className={`rounded-2xl overflow-hidden ${isOwn ? "bg-indigo-600 text-white rounded-br-md" : "bg-gray-700 text-gray-100 rounded-bl-md"} ${!showPreview && message.msg_type !== "forward_card" ? "px-4 py-2.5" : ""}`}>
+        <div className={`${isSticker ? "bg-transparent" : `rounded-2xl overflow-hidden ${isOwn ? "bg-indigo-600 text-white rounded-br-md" : "bg-gray-700 text-gray-100 rounded-bl-md"}`} ${!isSticker && !showPreview && message.msg_type !== "forward_card" ? "px-4 py-2.5" : ""}`}>
           {message.msg_type === "forward_card" ? (() => {
             try {
               const card: ForwardCardData = JSON.parse(message.content);
@@ -216,7 +217,11 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
             } catch {
               return <p className="text-sm px-4 py-2.5">[聊天记录]</p>;
             }
-          })() : showPreview ? (
+          })() : isSticker && message.file_path ? (
+            <div className="max-w-[160px]">
+              <ImagePreview filePath={message.file_path} fileSize={message.file_size} />
+            </div>
+          ) : showPreview ? (
             <div className="max-w-[260px]">
               <ImagePreview filePath={message.file_path!} fileSize={message.file_size} />
               <div className="flex items-center gap-1 px-3 py-2">

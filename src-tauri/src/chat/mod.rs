@@ -20,10 +20,12 @@ pub struct WireMessage {
     pub sender_port: u16,
     pub receiver_id: String,
     pub content: String,
-    pub msg_type: String,   // "text", "file", "file_chunk", "file_end"
+    pub msg_type: String,   // "text", "file", "sticker", "file_chunk", "file_end"
     pub file_name: Option<String>,
     pub file_size: Option<u64>,
     pub file_data: Option<Vec<u8>>, // base64 encoded in JSON
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_peers: Vec<PeerEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +149,7 @@ impl ChatServer {
         let mut file_sender_id: Option<String> = None;
         let mut file_sender_name: Option<String> = None;
         let mut file_group_id: Option<String> = None;
+        let mut file_kind: String = "file".to_string();
 
         while let Some(line) = lines.next_line().await? {
             match serde_json::from_str::<WireMessage>(&line) {
@@ -315,6 +318,7 @@ impl ChatServer {
                                 file_sender_id = Some(msg.sender_id.clone());
                                 file_sender_name = Some(msg.sender_name.clone());
                                 file_group_id = msg.group_id.clone();
+                                file_kind = msg.file_kind.as_deref().unwrap_or("file").to_string();
                             }
                             let decoded = base64_decode(&msg.content)
                                 .unwrap_or_default();
@@ -326,6 +330,7 @@ impl ChatServer {
                                 file_sender_name = Some(msg.sender_name.clone());
                                 file_group_id = msg.group_id.clone();
                             }
+                            file_kind = msg.file_kind.as_deref().unwrap_or(&file_kind).to_string();
                             let decoded = base64_decode(&msg.content)
                                 .unwrap_or_default();
                             file_buffer.extend_from_slice(&decoded);
@@ -335,11 +340,16 @@ impl ChatServer {
 
                             let sender_id = file_sender_id.as_deref().unwrap_or(&msg.sender_id);
                             let sender_name = file_sender_name.as_deref().unwrap_or(&msg.sender_name);
-                            let display_content = format!("📎 {}", file_name_display);
+                            let msg_kind = if file_kind == "sticker" { "sticker" } else { "file" };
+                            let display_content = if msg_kind == "sticker" {
+                                "[表情]".to_string()
+                            } else {
+                                format!("📎 {}", file_name_display)
+                            };
                             if let Some(ref gid) = file_group_id {
                                 // Group file message — is_read=false so unread fires
                                 if let Err(e) = db.save_group_message(
-                                    gid, sender_id, sender_name, &display_content, "file",
+                                    gid, sender_id, sender_name, &display_content, msg_kind,
                                     Some(&saved_path), Some(file_name_display),
                                     msg.file_size.map(|s| s as i64), false,
                                 ).await {
@@ -353,7 +363,7 @@ impl ChatServer {
                                         sender_name,
                                         receiver_id,
                                         &display_content,
-                                        "file",
+                                        msg_kind,
                                         Some(&saved_path),
                                         Some(file_name_display),
                                         msg.file_size.map(|s| s as i64),
@@ -368,7 +378,7 @@ impl ChatServer {
                                 sender_id: sender_id.to_string(),
                                 sender_name: sender_name.to_string(),
                                 content: display_content,
-                                msg_type: "file".to_string(),
+                                msg_type: msg_kind.to_string(),
                                 file_name: Some(file_name_display.to_string()),
                                 file_size: msg.file_size,
                                 timestamp: chrono::Utc::now().to_rfc3339(),
@@ -378,6 +388,7 @@ impl ChatServer {
                             file_sender_id = None;
                             file_sender_name = None;
                             file_group_id = None;
+                            file_kind = "file".to_string();
                         }
                         "group_created" | "group_dissolved" | "group_member_left" | "profile_updated" => {
                             // System notifications — already handled above, don't save as message
@@ -438,6 +449,7 @@ impl ChatServer {
             file_name: None,
             file_size: None,
             file_data: None,
+            file_kind: None,
             known_peers: self.build_known_peers(),
             group_id: None,
         };
@@ -497,6 +509,7 @@ impl ChatServer {
                 file_name: Some(file_name.clone()),
                 file_size: Some(file_size),
                 file_data: None,
+                file_kind: Some("file".to_string()),
                 // Only include known_peers in first chunk (relay info, not needed per chunk)
                 known_peers: if i == 0 { peers_list.clone() } else { Vec::new() },
                 group_id: None,
@@ -655,9 +668,28 @@ pub async fn send_file_in_background(
     peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
     app_handle: tauri::AppHandle,
 ) -> Result<crate::db::ChatMessage> {
+    send_file_in_background_with_kind(
+        file_path, file_name, peer, my_id, my_name, my_department,
+        listen_port, db, peers, app_handle, "file",
+    ).await
+}
+
+pub async fn send_file_in_background_with_kind(
+    file_path: &str,
+    file_name: &str,
+    peer: &Peer,
+    my_id: String,
+    my_name: String,
+    my_department: String,
+    listen_port: u16,
+    db: Arc<Database>,
+    peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
+    app_handle: tauri::AppHandle,
+    file_kind: &str,
+) -> Result<crate::db::ChatMessage> {
     send_file_in_background_inner(
         file_path, file_name, peer, my_id, my_name, my_department,
-        listen_port, db, peers, app_handle, None,
+        listen_port, db, peers, app_handle, None, file_kind,
     ).await
 }
 
@@ -678,7 +710,7 @@ pub async fn send_file_in_background_grouped(
 ) -> Result<()> {
     send_file_in_background_inner(
         file_path, file_name, peer, my_id, my_name, my_department,
-        listen_port, db, peers, app_handle, group_id,
+        listen_port, db, peers, app_handle, group_id, "file",
     ).await.map(|_| ())
 }
 
@@ -694,6 +726,7 @@ async fn send_file_in_background_inner(
     peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
     app_handle: tauri::AppHandle,
     group_id: Option<String>,
+    file_kind: &str,
 ) -> Result<crate::db::ChatMessage> {
     use tokio::fs::File;
     use tokio::io::AsyncReadExt;
@@ -741,6 +774,7 @@ async fn send_file_in_background_inner(
             msg_type: if is_last { "file_end".to_string() } else { "file_chunk".to_string() },
             file_name: Some(file_name.to_string()), file_size: Some(file_size),
             file_data: None,
+            file_kind: Some(file_kind.to_string()),
             known_peers: if i == 0 { peers_list.clone() } else { Vec::new() },
             group_id: group_id.clone(),
         };
@@ -774,8 +808,14 @@ async fn send_file_in_background_inner(
         // Mark as recent contact
         let _ = db.add_recent_contact(&peer.id).await;
 
+        let msg_kind = if file_kind == "sticker" { "sticker" } else { "file" };
+        let content = if msg_kind == "sticker" {
+            "[表情]".to_string()
+        } else {
+            format!("📎 {}", file_name)
+        };
         let saved = db.save_message(&my_id, &my_name, &peer.id,
-            &format!("📎 {}", file_name), "file",
+            &content, msg_kind,
             Some(file_path), Some(file_name), Some(file_size as i64),
         ).await?;
 

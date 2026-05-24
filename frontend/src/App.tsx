@@ -8,6 +8,7 @@ import {
   getConversation,
   sendMessage,
   sendFile,
+  sendSticker,
   markRead,
   checkPeerOnline,
   getDepartments,
@@ -19,6 +20,7 @@ import {
   getGroupMessages,
   sendGroupMessage,
   sendGroupFile,
+  sendGroupSticker,
   listGroups,
   markGroupRead,
 } from "./api";
@@ -318,6 +320,16 @@ function App() {
     sendFile(selectedPeer.id, filePath).catch(console.error);
   }, [selectedPeer, selectedGroupId]);
 
+  const handleSendSticker = useCallback(async (filePath: string) => {
+    if (selectedGroupId) {
+      const sent = await sendGroupSticker(selectedGroupId, filePath);
+      setMessages((prev) => [...prev, sent]);
+      return sent;
+    }
+    if (!selectedPeer) throw new Error("未选择联系人");
+    return await sendSticker(selectedPeer.id, filePath);
+  }, [selectedPeer, selectedGroupId]);
+
   const handleSaveProfile = useCallback(async () => {
     const trimmedUser = username.trim();
     const trimmedDepartment = department.trim();
@@ -437,6 +449,7 @@ function App() {
         groups={groups}
         onSendMessage={selectedGroupId ? ((content: string) => handleSendGroupMsg(selectedGroupId!, content)) : handleSendMessage}
         onSendFile={handleSendFile}
+        onSendSticker={handleSendSticker}
         onGroupUpdated={() => listGroups().then(setGroups).catch(() => {})}
       />
     </div>

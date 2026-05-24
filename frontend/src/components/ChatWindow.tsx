@@ -17,6 +17,7 @@ export interface PendingMessage {
   error?: string;
   progress?: number; // 0-100
   speed?: number; // bytes/sec
+  createdAt?: number;
 }
 
 interface ChatWindowProps {
@@ -31,6 +32,7 @@ interface ChatWindowProps {
   groups?: GroupInfo[];
   onSendMessage: (content: string) => Promise<ChatMessage>;
   onSendFile: (filePath: string) => Promise<void | ChatMessage>;
+  onSendSticker: (filePath: string) => Promise<ChatMessage>;
   onGroupUpdated?: () => void;
 }
 
@@ -50,7 +52,7 @@ function EmojiThumb({ path }: { path: string }) {
     readFileBase64(path).then((d) => setSrc(`data:${d.mime};base64,${d.base64}`)).catch(() => {});
   }, [path]);
   if (!src) return <div className="w-full h-full bg-gray-700 rounded" />;
-  return <img src={src} alt="" className="w-full h-full object-cover" />;
+  return <img src={src} alt="" className="w-full h-full object-contain" />;
 }
 
 function formatSpeed(bytesPerSec: number | undefined): string {
@@ -157,11 +159,12 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
   );
 }
 
-export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onGroupUpdated }: ChatWindowProps) {
+export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated }: ChatWindowProps) {
   const [inputText, setInputText] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
   const [showEmoji, setShowEmoji] = useState(false);
+  const [emojiTab, setEmojiTab] = useState<"default" | "custom">("default");
   const [customEmojis, setCustomEmojis] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [showSearch, setShowSearch] = useState(false);
@@ -200,15 +203,18 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
   }, []);
 
   const handleAddEmoji = useCallback(async () => {
-    const selected = await open({ filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }] });
+    const selected = await open({ multiple: true, filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }] });
     if (!selected) return;
-    const path = typeof selected === "string" ? selected : selected[0];
-    if (!path) return;
-    try {
-      const saved = await addEmojiFile(path);
-      setCustomEmojis((prev) => [...prev, saved]);
-    } catch (e) {
-      console.error("Failed to add emoji:", e);
+    const paths = Array.isArray(selected) ? selected : [selected];
+    for (const path of paths) {
+      if (!path) continue;
+      try {
+        const saved = await addEmojiFile(path);
+        setCustomEmojis((prev) => prev.includes(saved) ? prev : [...prev, saved]);
+        setEmojiTab("custom");
+      } catch (e) {
+        console.error("Failed to add emoji:", e);
+      }
     }
   }, []);
 
@@ -222,7 +228,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
         const pct = total > 0 ? Math.round((sent / total) * 100) : 0;
         setPendingMessages((prev) =>
           prev.map((p) =>
-            p.file_name === fileName
+            p.file_name === fileName && p.msg_type === "file"
               ? { ...p, progress: pct, speed, status: pct >= 100 ? "sent" as const : p.status }
               : p
           )
@@ -230,7 +236,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
         // Remove pending after 2s (real message will be in DB by then)
         if (pct >= 100) {
           setTimeout(() => {
-            setPendingMessages((prev) => prev.filter((p) => p.file_name !== fileName));
+            setPendingMessages((prev) => prev.filter((p) => p.file_name !== fileName || p.msg_type !== "file"));
           }, 2000);
         }
       }).then((fn) => { unlisten = fn; });
@@ -289,7 +295,11 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       if (p.status === "failed") return true;
       return !messages.some((m) => {
         if (m.sender_id !== myId || m.msg_type !== p.msg_type) return false;
-        if (p.msg_type === "file") {
+        if (p.msg_type === "file" || p.msg_type === "sticker") {
+          if (p.createdAt) {
+            const messageTime = new Date(m.timestamp).getTime();
+            if (!Number.isNaN(messageTime) && messageTime + 500 < p.createdAt) return false;
+          }
           return (
             (p.file_path && m.file_path && p.file_path === m.file_path) ||
             (p.file_name && m.file_name && p.file_name === m.file_name)
@@ -328,6 +338,64 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       }]);
     }
   }, [onSendFile]);
+
+  const retrySticker = useCallback(async (pending: PendingMessage) => {
+    if (!pending.file_path) return;
+    const name = pending.file_name || pending.file_path.replace(/\\/g, "/").split("/").pop() || "sticker";
+    setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
+    const tempId = ++pendingId;
+    setPendingMessages((prev) => [...prev, {
+      ...pending,
+      id: tempId,
+      file_name: name,
+      createdAt: Date.now(),
+      status: "sending",
+      error: undefined,
+    }]);
+    if (!isGroup && !peer?.online) {
+      setPendingMessages((prev) => prev.map((p) =>
+        p.id === tempId ? { ...p, status: "failed", error: "对方离线" } : p
+      ));
+      return;
+    }
+    try {
+      await onSendSticker(pending.file_path);
+    } catch (e) {
+      setPendingMessages((prev) => prev.map((p) =>
+        p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
+      ));
+    }
+  }, [isGroup, peer?.online, onSendSticker]);
+
+  const sendSticker = useCallback(async (filePath: string) => {
+    if (!peer) return;
+    setShowEmoji(false);
+    nearBottomRef.current = true;
+    const name = filePath.replace(/\\/g, "/").split("/").pop() || "sticker";
+    const tempId = ++pendingId;
+    setPendingMessages((prev) => [...prev, {
+      id: tempId,
+      content: "[表情]",
+      msg_type: "sticker",
+      file_name: name,
+      file_path: filePath,
+      createdAt: Date.now(),
+      status: "sending",
+    }]);
+    if (!isGroup && !peer.online) {
+      setPendingMessages((prev) => prev.map((p) =>
+        p.id === tempId ? { ...p, status: "failed", error: "对方离线" } : p
+      ));
+      return;
+    }
+    try {
+      await onSendSticker(filePath);
+    } catch (e) {
+      setPendingMessages((prev) => prev.map((p) =>
+        p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
+      ));
+    }
+  }, [peer, isGroup, onSendSticker]);
 
   const sendText = useCallback(async () => {
     const trimmed = inputText.trim();
@@ -638,13 +706,20 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
               }
             }
             if ("status" in item) {
+              const isPendingSticker = item.msg_type === "sticker" && !!item.file_path;
               elements.push(
                 <div key={`pending-${item.id}`} className="flex justify-end mb-3 px-4">
                   <div className="max-w-[70%] flex flex-col items-end">
-                    <div className={`rounded-2xl px-4 py-2.5 rounded-br-md ${
-                      item.status === "failed" ? "bg-red-600/30 border border-red-500/50" : "bg-indigo-600/50"
+                    <div className={`${isPendingSticker ? "overflow-hidden rounded-xl" : "rounded-2xl px-4 py-2.5 rounded-br-md"} ${
+                      item.status === "failed"
+                        ? isPendingSticker ? "ring-1 ring-red-500/70" : "bg-red-600/30 border border-red-500/50"
+                        : isPendingSticker ? "" : "bg-indigo-600/50"
                     } text-white`}>
-                      {item.msg_type === "file" ? (
+                      {isPendingSticker ? (
+                        <div className="w-32 h-32">
+                          <EmojiThumb path={item.file_path!} />
+                        </div>
+                      ) : item.msg_type === "file" ? (
                         <div className="flex items-center gap-2">
                           <svg className="w-5 h-5 flex-shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
@@ -666,7 +741,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
                       </span>
                       {item.status === "failed" && (
                         <button
-                          onClick={() => { if (item.msg_type === "file") retryFile(item); else retryText(item); }}
+                          onClick={() => { if (item.msg_type === "file") retryFile(item); else if (item.msg_type === "sticker") retrySticker(item); else retryText(item); }}
                           className="text-[10px] text-indigo-400 hover:text-indigo-300"
                         >重试</button>
                       )}
@@ -729,51 +804,79 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
               <span className="text-lg">😀</span>
             </button>
             {showEmoji && (
-              <div className="absolute bottom-full right-0 mb-2 bg-gray-800 border border-gray-600 rounded-xl p-3 shadow-2xl z-50 w-72">
-                <div className="grid grid-cols-10 gap-1 max-h-52 overflow-y-auto">
-                  {customEmojis.map((path) => {
-                    const name = path.replace(/\\/g, "/").split("/").pop() || "emoji";
-                    return (
+              <div className="absolute bottom-full right-0 mb-2 bg-gray-800 border border-gray-600 rounded-xl shadow-2xl z-50 w-80 overflow-hidden">
+                <div className="flex border-b border-gray-700">
+                  <button
+                    onClick={() => setEmojiTab("default")}
+                    className={`flex-1 py-2 text-xs font-medium ${emojiTab === "default" ? "text-indigo-300 border-b-2 border-indigo-400" : "text-gray-400 hover:text-gray-200"}`}
+                  >
+                    默认
+                  </button>
+                  <button
+                    onClick={() => setEmojiTab("custom")}
+                    className={`flex-1 py-2 text-xs font-medium ${emojiTab === "custom" ? "text-indigo-300 border-b-2 border-indigo-400" : "text-gray-400 hover:text-gray-200"}`}
+                  >
+                    自定义
+                  </button>
+                </div>
+                <div className="p-3">
+                  {emojiTab === "custom" ? (
+                    <>
+                      <div className="grid grid-cols-5 gap-2 max-h-56 overflow-y-auto pr-1">
+                        {customEmojis.map((path) => {
+                          const name = path.replace(/\\/g, "/").split("/").pop() || "emoji";
+                          return (
+                            <button
+                              key={path}
+                              onClick={() => sendSticker(path)}
+                              className="aspect-square rounded-lg hover:bg-gray-700 overflow-hidden border border-gray-700 bg-gray-900/60"
+                              title={name}
+                            >
+                              <EmojiThumb path={path} />
+                            </button>
+                          );
+                        })}
+                        <button
+                          onClick={handleAddEmoji}
+                          className="aspect-square flex items-center justify-center text-gray-400 hover:bg-gray-700 hover:text-white rounded-lg border border-dashed border-gray-600 text-2xl"
+                          title="添加自定义表情"
+                        >
+                          +
+                        </button>
+                      </div>
+                      {customEmojis.length === 0 && (
+                        <button onClick={handleAddEmoji} className="mt-3 w-full py-2 text-xs rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-200">
+                          上传表情
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <div className="grid grid-cols-10 gap-1 max-h-56 overflow-y-auto">
+                      {EMOJIS.map((emoji) => (
                       <button
-                        key={path}
+                        key={emoji}
                         onClick={() => {
-                          onSendFile(path).catch(console.error);
+                          const el = inputRef.current;
+                          if (el) {
+                            const start = el.selectionStart ?? el.value.length;
+                            const end = el.selectionEnd ?? el.value.length;
+                            const before = el.value.slice(0, start);
+                            const after = el.value.slice(end);
+                            setInputText(before + emoji + after);
+                            requestAnimationFrame(() => {
+                              el.selectionStart = el.selectionEnd = start + emoji.length;
+                              el.focus();
+                            });
+                          }
                           setShowEmoji(false);
                         }}
-                        className="w-7 h-7 rounded hover:bg-gray-600 overflow-hidden"
-                        title={name}
+                        className="w-7 h-7 flex items-center justify-center text-base hover:bg-gray-600 rounded"
                       >
-                        <EmojiThumb path={path} />
+                        {emoji}
                       </button>
-                    );
-                  })}
-                  {/* Add custom emoji button */}
-                  <button onClick={handleAddEmoji} className="w-7 h-7 flex items-center justify-center text-gray-400 hover:bg-gray-600 hover:text-white rounded text-lg" title="添加自定义表情">
-                    +
-                  </button>
-                  {EMOJIS.map((emoji) => (
-                    <button
-                      key={emoji}
-                      onClick={() => {
-                        const el = inputRef.current;
-                        if (el) {
-                          const start = el.selectionStart ?? el.value.length;
-                          const end = el.selectionEnd ?? el.value.length;
-                          const before = el.value.slice(0, start);
-                          const after = el.value.slice(end);
-                          setInputText(before + emoji + after);
-                          requestAnimationFrame(() => {
-                            el.selectionStart = el.selectionEnd = start + emoji.length;
-                            el.focus();
-                          });
-                        }
-                        setShowEmoji(false);
-                      }}
-                      className="w-7 h-7 flex items-center justify-center text-base hover:bg-gray-600 rounded"
-                    >
-                      {emoji}
-                    </button>
-                  ))}
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )}

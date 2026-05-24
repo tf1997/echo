@@ -35,6 +35,7 @@ pub struct PendingFileTransfer {
     pub file_path: String,
     pub file_name: String,
     pub file_size: i64,
+    pub file_kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,11 +296,21 @@ impl Database {
                 file_path TEXT NOT NULL,
                 file_name TEXT NOT NULL,
                 file_size INTEGER NOT NULL,
+                file_kind TEXT NOT NULL DEFAULT 'file',
                 created_at TEXT NOT NULL
             )",
         )
         .execute(&self.pool).await
         .context("Failed to create pending_file_transfers table")?;
+
+        if let Err(error) = sqlx::query("ALTER TABLE pending_file_transfers ADD COLUMN file_kind TEXT NOT NULL DEFAULT 'file'")
+            .execute(&self.pool).await
+        {
+            let msg = error.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(error).context("Failed to add file_kind to pending_file_transfers");
+            }
+        }
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_file_peer ON pending_file_transfers(peer_id)")
             .execute(&self.pool).await.ok();
@@ -497,12 +508,13 @@ impl Database {
         file_path: &str,
         file_name: &str,
         file_size: i64,
+        file_kind: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO pending_file_transfers
-             (group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, file_kind, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(group_id)
         .bind(peer_id)
@@ -513,6 +525,7 @@ impl Database {
         .bind(file_path)
         .bind(file_name)
         .bind(file_size)
+        .bind(file_kind)
         .bind(&now)
         .execute(&self.pool).await
         .context("Failed to queue pending file transfer")?;
@@ -521,7 +534,7 @@ impl Database {
 
     pub async fn get_pending_file_transfers(&self, peer_id: &str) -> Result<Vec<PendingFileTransfer>> {
         let rows = sqlx::query(
-            "SELECT id, group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size
+            "SELECT id, group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, file_kind
              FROM pending_file_transfers WHERE peer_id = ? ORDER BY id ASC",
         )
         .bind(peer_id).fetch_all(&self.pool).await
@@ -538,6 +551,7 @@ impl Database {
             file_path: r.get("file_path"),
             file_name: r.get("file_name"),
             file_size: r.get("file_size"),
+            file_kind: r.get("file_kind"),
         }).collect())
     }
 
@@ -587,6 +601,8 @@ impl Database {
                 let preview = if msg_type == "file" {
                     let fname: Option<String> = lr.try_get("file_name").ok();
                     format!("📎 {}", fname.unwrap_or_else(|| "文件".to_string()))
+                } else if msg_type == "sticker" {
+                    "[表情]".to_string()
                 } else {
                     lr.get::<String, _>("content")
                 };
