@@ -721,7 +721,7 @@ async fn send_file_in_background_inner(
             .with_context(|| format!("Failed to read file chunk {}", i))?;
         if n == 0 { break; }
 
-        let is_last = n < CHUNK_SIZE;
+        let is_last = n < CHUNK_SIZE || (file_size as usize) <= ((i as usize + 1) * CHUNK_SIZE);
         let msg = WireMessage {
             sender_id: my_id.clone(), sender_name: my_name.clone(),
             sender_department: my_department.clone(), sender_port: listen_port,

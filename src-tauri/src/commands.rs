@@ -1062,6 +1062,7 @@ pub async fn send_group_file(
         .file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
     let file_size = tokio::fs::metadata(&file_path).await
         .map(|m| m.len() as i64).map_err(|e| e.to_string())?;
+    let pending_cache: Arc<tokio::sync::Mutex<Option<String>>> = Arc::new(tokio::sync::Mutex::new(None));
 
     // Save outgoing file message to the group conversation (read=true for sender)
     let saved = db.save_group_message(
@@ -1081,13 +1082,6 @@ pub async fn send_group_file(
 
     for member in members {
         if member.peer_id == my_id { continue; }
-        let Some((ip, port)) = resolve_peer_addr(&member.peer_id, &db, &online_peers).await else { continue; };
-        let peer = crate::discovery::Peer::new(
-            member.peer_id.clone(),
-            member.username.clone(),
-            member.department.clone(),
-            ip, port,
-        );
         let bg_path = file_path.clone();
         let bg_name = file_name.clone();
         let bg_my_id = my_id.clone();
@@ -1098,23 +1092,65 @@ pub async fn send_group_file(
         let bg_handle = app_handle.clone();
         let bg_error_handle = app_handle.clone();
         let bg_gid = group_id.clone();
-        tauri::async_runtime::spawn(async move {
-            match crate::chat::send_file_in_background_grouped(
-                &bg_path, &bg_name, &peer,
-                bg_my_id, bg_my_name, bg_my_dep, listen_port,
-                bg_db, bg_peers, bg_handle, Some(bg_gid),
-            ).await {
-                Ok(_) => log::info!("Group file sent to {}", peer.id),
-                Err(e) => {
-                    log::error!("Group file send failed to {}: {}", peer.id, e);
-                    let _ = bg_error_handle.emit_all("file-error", serde_json::json!({
-                        "fileName": bg_name,
-                        "error": e.to_string(),
-                    }));
+        let bg_pending_cache = pending_cache.clone();
+        let target_id = member.peer_id.clone();
+        let target_name = member.username.clone();
+        let target_department = member.department.clone();
+        if let Some((ip, port)) = resolve_peer_addr(&target_id, &db, &online_peers).await {
+            let peer = crate::discovery::Peer::new(
+                target_id.clone(),
+                target_name,
+                target_department,
+                ip, port,
+            );
+            tauri::async_runtime::spawn(async move {
+                match crate::chat::send_file_in_background_grouped(
+                    &bg_path, &bg_name, &peer,
+                    bg_my_id.clone(), bg_my_name.clone(), bg_my_dep.clone(), listen_port,
+                    bg_db.clone(), bg_peers, bg_handle, Some(bg_gid.clone()),
+                ).await {
+                    Ok(_) => log::info!("Group file sent to {}", peer.id),
+                    Err(e) => {
+                        let send_error = e.to_string();
+                        log::error!("Group file send failed to {}: {}", peer.id, send_error);
+                        match queue_group_file_for_peer(
+                            &bg_db, &bg_path, &bg_name, file_size, bg_pending_cache,
+                            &peer.id, &bg_my_id, &bg_my_name, &bg_my_dep,
+                            listen_port, &bg_gid,
+                        ).await {
+                            Ok(()) => log::info!("Queued group file for {} after send failure", peer.id),
+                            Err(queue_err) => {
+                                log::error!("Failed to queue group file for {}: {}", peer.id, queue_err);
+                                let _ = bg_error_handle.emit_all("file-error", serde_json::json!({
+                                    "fileName": bg_name,
+                                    "error": format!("{}; queue failed: {}", send_error, queue_err),
+                                }));
+                            }
+                        }
+                    }
                 }
-            }
-        });
+            });
+        } else {
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = queue_group_file_for_peer(
+                    &bg_db, &bg_path, &bg_name, file_size, bg_pending_cache,
+                    &target_id, &bg_my_id, &bg_my_name, &bg_my_dep,
+                    listen_port, &bg_gid,
+                ).await {
+                    log::error!("Failed to queue group file for {}: {}", target_id, e);
+                } else {
+                    log::info!("Queued group file for offline member {}", target_id);
+                }
+            });
+        }
     }
+
+    let _ = app_handle.emit_all("file-progress", serde_json::json!({
+        "fileName": file_name,
+        "sent": file_size,
+        "total": file_size,
+        "speed": 0,
+    }));
 
     Ok(ChatMessage {
         id: saved.id,
@@ -1129,6 +1165,61 @@ pub async fn send_group_file(
         timestamp: Utc::now().to_rfc3339(),
         is_read: true,
     })
+}
+
+async fn queue_group_file_for_peer(
+    db: &crate::db::Database,
+    file_path: &str,
+    file_name: &str,
+    file_size: i64,
+    pending_cache: Arc<tokio::sync::Mutex<Option<String>>>,
+    peer_id: &str,
+    my_id: &str,
+    my_name: &str,
+    my_department: &str,
+    listen_port: u16,
+    group_id: &str,
+) -> Result<(), String> {
+    let cached_file_path = get_or_create_pending_cache(file_path, file_name, &pending_cache).await?;
+    db.queue_pending_file_transfer(
+        group_id,
+        peer_id,
+        my_id,
+        my_name,
+        my_department,
+        listen_port,
+        &cached_file_path,
+        file_name,
+        file_size,
+    ).await.map_err(|e| e.to_string())
+}
+
+async fn get_or_create_pending_cache(
+    file_path: &str,
+    file_name: &str,
+    pending_cache: &Arc<tokio::sync::Mutex<Option<String>>>,
+) -> Result<String, String> {
+    let mut guard = pending_cache.lock().await;
+    if let Some(path) = guard.as_ref() {
+        return Ok(path.clone());
+    }
+
+    let copied = copy_file_to_pending_cache(file_path, file_name).await?;
+    *guard = Some(copied.clone());
+    Ok(copied)
+}
+
+async fn copy_file_to_pending_cache(file_path: &str, file_name: &str) -> Result<String, String> {
+    let pending_dir = echo_files_dir().join("pending");
+    tokio::fs::create_dir_all(&pending_dir).await.map_err(|e| e.to_string())?;
+
+    let safe_name = std::path::Path::new(file_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let dest = pending_dir.join(format!("{}_{}", chrono::Utc::now().timestamp_millis(), safe_name));
+    tokio::fs::copy(file_path, &dest).await.map_err(|e| e.to_string())?;
+    Ok(dest.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1208,12 +1299,7 @@ pub async fn deliver_pending_to_peer(db: &crate::db::Database, peer_id_str: &str
 
     // 1) Generic pending_notifications (preferred — payload is a full WireMessage).
     let notifs = db.get_pending_notifications(peer_id_str).await.unwrap_or_default();
-    let mut delivered_notif_ids = Vec::new();
-    for (id, _kind, payload) in &notifs {
-        if deliver_over_tcp(&addr, payload).await {
-            delivered_notif_ids.push(*id);
-        }
-    }
+    let delivered_notif_ids = deliver_pending_payloads_over_tcp(&addr, &notifs).await;
     if !delivered_notif_ids.is_empty() {
         let _ = db.delete_pending_notifications(&delivered_notif_ids).await;
         log::info!("Delivered {} pending notifs to {}", delivered_notif_ids.len(), peer_id_str);
@@ -1221,6 +1307,8 @@ pub async fn deliver_pending_to_peer(db: &crate::db::Database, peer_id_str: &str
 
     // 2) Legacy pending_group_messages — still drained for backward-compat with
     // any data queued by previous app versions.
+    deliver_pending_file_transfers_to_peer(db, peer_id_str, &stored, ip).await;
+
     let pending = db.get_pending_for_peer(peer_id_str).await.unwrap_or_default();
     if pending.is_empty() { return; }
     let mut delivered = Vec::new();
@@ -1241,6 +1329,98 @@ pub async fn deliver_pending_to_peer(db: &crate::db::Database, peer_id_str: &str
         let _ = db.delete_pending_msgs(&delivered).await;
         log::info!("Delivered {} legacy pending msgs to {}", delivered.len(), peer_id_str);
     }
+}
+
+async fn deliver_pending_file_transfers_to_peer(
+    db: &crate::db::Database,
+    peer_id: &str,
+    stored: &StoredPeer,
+    ip: std::net::IpAddr,
+) {
+    let pending_files = db.get_pending_file_transfers(peer_id).await.unwrap_or_default();
+    if pending_files.is_empty() {
+        return;
+    }
+    let addr = format!("{}:{}", ip, stored.port);
+
+    for transfer in pending_files {
+        if !std::path::Path::new(&transfer.file_path).exists() {
+            log::error!("Pending group file missing for {}: {}", peer_id, transfer.file_path);
+            let _ = db.delete_pending_file_transfer(transfer.id).await;
+            continue;
+        }
+
+        let ok = send_group_file_payloads_over_tcp(&addr, &transfer).await;
+        if !ok {
+            log::error!("Failed to deliver pending group file {} to {}", transfer.file_name, peer_id);
+            break;
+        }
+
+        let file_path = transfer.file_path.clone();
+        let _ = db.delete_pending_file_transfer(transfer.id).await;
+        if db.count_pending_file_transfers_by_path(&file_path).await.unwrap_or(1) == 0 {
+            let _ = tokio::fs::remove_file(&file_path).await;
+        }
+        log::info!("Delivered pending group file {} to {}", transfer.file_name, peer_id);
+    }
+}
+
+async fn send_group_file_payloads_over_tcp(
+    addr: &str,
+    transfer: &crate::db::PendingFileTransfer,
+) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const CHUNK_SIZE: usize = 48 * 1024;
+
+    let mut file = match tokio::fs::File::open(&transfer.file_path).await {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect(addr),
+    ).await;
+    let Ok(Ok(mut stream)) = stream else {
+        return false;
+    };
+
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut chunk_index: usize = 0;
+    loop {
+        let n = match file.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        let is_last = n < CHUNK_SIZE
+            || (transfer.file_size as usize) <= ((chunk_index + 1) * CHUNK_SIZE);
+        let msg = crate::chat::WireMessage {
+            sender_id: transfer.sender_id.clone(),
+            sender_name: transfer.sender_name.clone(),
+            sender_department: transfer.sender_department.clone(),
+            sender_port: transfer.sender_port,
+            receiver_id: transfer.peer_id.clone(),
+            content: base64_encode_std(&buf[..n]),
+            msg_type: if is_last { "file_end".to_string() } else { "file_chunk".to_string() },
+            file_name: Some(transfer.file_name.clone()),
+            file_size: Some(transfer.file_size as u64),
+            file_data: None,
+            known_peers: Vec::new(),
+            group_id: Some(transfer.group_id.clone()),
+        };
+        let Ok(json) = serde_json::to_string(&msg) else {
+            return false;
+        };
+        if stream.write_all(json.as_bytes()).await.is_err()
+            || stream.write_all(b"\n").await.is_err()
+        {
+            return false;
+        }
+        chunk_index += 1;
+    }
+
+    stream.flush().await.is_ok()
 }
 
 fn emoji_dir() -> std::path::PathBuf {
@@ -1294,6 +1474,40 @@ async fn deliver_over_tcp(addr: &str, json: &str) -> bool {
         }
         _ => false,
     }
+}
+
+async fn deliver_pending_payloads_over_tcp(
+    addr: &str,
+    payloads: &[(i64, String, String)],
+) -> Vec<i64> {
+    if payloads.is_empty() {
+        return Vec::new();
+    }
+
+    let mut delivered = Vec::new();
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(addr),
+    ).await;
+
+    let Ok(Ok(mut stream)) = stream else {
+        return delivered;
+    };
+
+    use tokio::io::AsyncWriteExt;
+    for (id, _kind, payload) in payloads {
+        if stream.write_all(payload.as_bytes()).await.is_err()
+            || stream.write_all(b"\n").await.is_err()
+        {
+            break;
+        }
+        delivered.push(*id);
+    }
+    if stream.flush().await.is_err() {
+        return Vec::new();
+    }
+
+    delivered
 }
 
 /// Generic "fan-out a notification to a set of peers, queue if offline".
