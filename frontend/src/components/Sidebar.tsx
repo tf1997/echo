@@ -112,6 +112,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   for (const uc of unreadCounts) {
     unreadMap.set(uc.peer_id, uc.count);
   }
+  const peerById = new Map(peers.map((peer) => [peer.id, peer]));
 
   const recentTotalUnread = recentContacts.reduce((sum, contact) => sum + (unreadMap.get(contact.peer_id) ?? 0), 0);
   const groupsTotalUnread = groups.reduce((sum, g) => sum + (g.unread_count || 0), 0);
@@ -401,7 +402,8 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                 <p className="px-4 py-8 text-xs text-gray-500 text-center">暂无最近联系人</p>
               ) : (
                 recentContacts.map(r => {
-                  const peer: Peer = { id: r.peer_id, username: r.username, department: r.department, ip: r.ip, port: r.port, online: r.is_online, last_seen: r.last_seen_at ? new Date(r.last_seen_at).getTime() / 1000 : undefined };
+                  const livePeer = peerById.get(r.peer_id);
+                  const peer: Peer = livePeer ?? { id: r.peer_id, username: r.username, department: r.department, ip: r.ip, port: r.port, online: r.is_online, last_seen: r.last_seen_at ? new Date(r.last_seen_at).getTime() / 1000 : undefined };
                   return (
                     <div key={r.peer_id} className="group relative">
                       <PeerItem peer={peer} isSelected={selectedPeerId === r.peer_id} unread={unreadMap.get(r.peer_id) ?? 0} onClick={() => onSelectPeer(peer)} />

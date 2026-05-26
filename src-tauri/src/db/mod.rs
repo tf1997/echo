@@ -336,10 +336,20 @@ impl Database {
                     COALESCE(p.ip, '') as ip, COALESCE(p.port, 0) as port,
                     COALESCE(p.is_online, 0) as is_online,
                     COALESCE(p.first_seen_at, '') as first_seen_at,
-                    COALESCE(p.last_seen_at, '') as last_seen_at
+                    COALESCE(p.last_seen_at, '') as last_seen_at,
+                    (
+                        SELECT MAX(m.id)
+                        FROM messages m
+                        WHERE m.group_id IS NULL
+                          AND (m.sender_id = r.peer_id OR m.receiver_id = r.peer_id)
+                          AND m.msg_type NOT IN ('file_chunk', 'file_end')
+                    ) as last_message_id
              FROM recent_contacts r
              LEFT JOIN peers p ON r.peer_id = p.peer_id
-             ORDER BY r.added_at DESC",
+             ORDER BY
+                CASE WHEN last_message_id IS NULL THEN 1 ELSE 0 END,
+                last_message_id DESC,
+                r.added_at DESC",
         )
         .fetch_all(&self.pool).await
         .context("Failed to list recent contacts")?;

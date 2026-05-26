@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 use std::sync::Arc;
 
-use crate::chat::send_file_in_background_with_kind;
+use crate::chat::{send_file_in_background_with_kind, WireMessage};
 use crate::db::{ChatMessage, StoredPeer, UnreadCount, UserProfile};
 use crate::discovery::Peer;
 use crate::state::{AppState, RuntimeServices};
@@ -349,6 +349,76 @@ pub struct DiscoverResult {
     pub message: String,
 }
 
+#[derive(Clone)]
+struct RemoteIdentity {
+    peer_id: String,
+    username: String,
+    department: String,
+    ip: String,
+    port: u16,
+}
+
+async fn probe_identity(
+    addr: &str,
+    my_id: &str,
+    my_name: &str,
+    my_department: &str,
+    my_port: u16,
+) -> Option<RemoteIdentity> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let peer_addr = stream.peer_addr().ok();
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let probe = WireMessage {
+        sender_id: my_id.to_string(),
+        sender_name: my_name.to_string(),
+        sender_department: my_department.to_string(),
+        sender_port: my_port,
+        receiver_id: String::new(),
+        content: String::new(),
+        msg_type: "identity_probe".to_string(),
+        file_name: None,
+        file_size: None,
+        file_data: None,
+        file_kind: None,
+        known_peers: Vec::new(),
+        group_id: None,
+    };
+
+    let json = serde_json::to_string(&probe).ok()?;
+    writer.write_all(json.as_bytes()).await.ok()?;
+    writer.write_all(b"\n").await.ok()?;
+    writer.flush().await.ok()?;
+
+    let line = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+        .await
+        .ok()?
+        .ok()??;
+    let msg: WireMessage = serde_json::from_str(&line).ok()?;
+    if msg.msg_type != "identity_response" || msg.sender_id.trim().is_empty() {
+        return None;
+    }
+
+    Some(RemoteIdentity {
+        peer_id: msg.sender_id,
+        username: msg.sender_name,
+        department: msg.sender_department,
+        ip: peer_addr
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_else(|| addr.rsplit_once(':').map(|(ip, _)| ip.to_string()).unwrap_or_default()),
+        port: msg.sender_port,
+    })
+}
+
 #[tauri::command]
 pub async fn discover_by_ip(
     state: State<'_, AppState>,
@@ -414,6 +484,74 @@ pub async fn discover_by_ip(
     let parsed_ip: std::net::IpAddr = ip.parse().map_err(|e| format!("无效 IP: {}", e))?;
     let mut existing = None;
 
+    let my_name = my_profile
+        .as_ref()
+        .map(|p| p.username.as_str())
+        .unwrap_or("");
+    let my_department = my_profile
+        .as_ref()
+        .map(|p| p.department.as_str())
+        .unwrap_or("");
+
+    if let Some(identity) = probe_identity(&addr, &my_id, my_name, my_department, my_port).await {
+        let remote_port = if identity.port == 0 { port } else { identity.port };
+        let remote_ip = if identity.ip.is_empty() {
+            ip.clone()
+        } else {
+            identity.ip.clone()
+        };
+        let remote_parsed_ip = remote_ip
+            .parse::<std::net::IpAddr>()
+            .unwrap_or(parsed_ip);
+        let peer = crate::discovery::Peer::new(
+            identity.peer_id.clone(),
+            identity.username.clone(),
+            identity.department.clone(),
+            remote_parsed_ip,
+            remote_port,
+        );
+
+        {
+            let runtime_opt = { state.runtime.read().await.clone() };
+            if let Some(runtime) = runtime_opt.as_ref() {
+                let disc = runtime.discovery.read().await;
+                disc.register_peer(peer);
+            }
+        }
+
+        state
+            .db
+            .upsert_peer(
+                &identity.peer_id,
+                &identity.username,
+                &identity.department,
+                &remote_ip,
+                remote_port,
+                true,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = state.db.add_recent_contact(&identity.peer_id).await;
+
+        let runtime_arc = { state.runtime.read().await.clone() };
+        if let Some(runtime) = runtime_arc {
+            let found_ip = remote_ip.clone();
+            let found_id = identity.peer_id.clone();
+            tauri::async_runtime::spawn(async move {
+                let chat = runtime.chat.lock().await;
+                chat.exchange_contacts(&found_ip, remote_port, &found_id).await;
+            });
+        }
+
+        return Ok(DiscoverResult {
+            online: true,
+            message: format!(
+                "已连接 {} ({}) @ {}:{}",
+                identity.username, identity.department, remote_ip, remote_port
+            ),
+        });
+    }
+
     for attempt in 0..3 {
         if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
             let _ = sock.set_broadcast(true);
@@ -458,11 +596,33 @@ pub async fn discover_by_ip(
     }
 
     // Fallback: no unicast response received, register manually
-    let pid = format!("{}:{}", ip, port);
+    let stored_peer = state
+        .db
+        .list_stored_peers()
+        .await
+        .ok()
+        .and_then(|peers| {
+            peers
+                .into_iter()
+                .find(|peer| peer.ip == ip && peer.port == port)
+        });
+    let pid = stored_peer
+        .as_ref()
+        .map(|peer| peer.peer_id.clone())
+        .unwrap_or_else(|| format!("{}:{}", ip, port));
+    let display_name = stored_peer
+        .as_ref()
+        .map(|peer| peer.username.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "手动添加".to_string());
+    let display_department = stored_peer
+        .as_ref()
+        .map(|peer| peer.department.clone())
+        .unwrap_or_default();
     let peer = crate::discovery::Peer::new(
         pid.clone(),
-        "手动添加".to_string(),
-        String::new(),
+        display_name.clone(),
+        display_department.clone(),
         parsed_ip,
         port,
     );
@@ -481,11 +641,16 @@ pub async fn discover_by_ip(
             }
         }
     }
-    // Save to DB
-    let _ = state
-        .db
-        .upsert_peer(&pid, "手动添加", "", &ip, port, true)
-        .await;
+    // Save to DB only when this is a new temporary peer. If this endpoint is
+    // already known, keep the stored identity instead of overwriting it.
+    if stored_peer.is_none() {
+        let _ = state
+            .db
+            .upsert_peer(&pid, "手动添加", "", &ip, port, true)
+            .await;
+    } else {
+        let _ = state.db.add_recent_contact(&pid).await;
+    }
 
     // Mechanism 1: ice-breaking — exchange contact summaries in background
     {

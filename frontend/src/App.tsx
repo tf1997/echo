@@ -67,6 +67,7 @@ function App() {
   const prevGroupUnreadRef = useRef(new Map<string, number>());
   const unreadInitRef = useRef(true);
   const groupUnreadInitRef = useRef(true);
+  const onlineGraceUntilRef = useRef(new Map<string, number>());
 
   // Silent WAV (1 sample) — used only to unlock autoplay policy on first click
   const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
@@ -229,16 +230,22 @@ function App() {
   const mergePeers = useCallback((onlinePeers: Peer[], stored: StoredPeer[]): Peer[] => {
     const map = new Map<string, Peer>();
     const endpointToId = new Map<string, string>();
+    const now = Date.now();
+    const onlineGraceMs = 12000;
 
     for (const item of stored) {
+      const graceKey = onlineGraceUntilRef.current.get(item.peer_id) ?? 0;
       const peer: Peer = {
         id: item.peer_id,
         username: item.username,
         department: item.department,
         ip: item.ip,
         port: item.port,
-        online: item.is_online,
+        online: item.is_online || graceKey > now,
       };
+      if (peer.online) {
+        onlineGraceUntilRef.current.set(peer.id, now + onlineGraceMs);
+      }
       const endpointKey = `${peer.ip}:${peer.port}`;
       if (!endpointToId.has(endpointKey)) {
         endpointToId.set(endpointKey, peer.id);
@@ -251,9 +258,22 @@ function App() {
       const existingId = endpointToId.get(endpointKey);
       if (existingId && existingId !== peer.id) {
         map.delete(existingId);
+        onlineGraceUntilRef.current.delete(existingId);
       }
       endpointToId.set(endpointKey, peer.id);
-      map.set(peer.id, peer);
+      if (peer.online) {
+        onlineGraceUntilRef.current.set(peer.id, now + onlineGraceMs);
+      }
+      map.set(peer.id, {
+        ...peer,
+        online: peer.online || (onlineGraceUntilRef.current.get(peer.id) ?? 0) > now,
+      });
+    }
+
+    for (const [peerId, until] of onlineGraceUntilRef.current) {
+      if (until <= now || !map.has(peerId)) {
+        onlineGraceUntilRef.current.delete(peerId);
+      }
     }
 
     return Array.from(map.values()).sort((a, b) => {

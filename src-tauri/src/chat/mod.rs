@@ -142,7 +142,7 @@ impl ChatServer {
         my_department: String,
         my_port: u16,
     ) -> Result<()> {
-        let (reader, _writer) = stream.into_split();
+        let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
         let mut file_buffer: Vec<u8> = Vec::new();
@@ -182,6 +182,30 @@ impl ChatServer {
                             &my_id,
                             &msg.content,
                         ).await;
+                        continue;
+                    }
+
+                    if msg_type == "identity_probe" {
+                        let response = WireMessage {
+                            sender_id: my_id.clone(),
+                            sender_name: my_name.clone(),
+                            sender_department: my_department.clone(),
+                            sender_port: my_port,
+                            receiver_id: msg.sender_id.clone(),
+                            content: String::new(),
+                            msg_type: "identity_response".to_string(),
+                            file_name: None,
+                            file_size: None,
+                            file_data: None,
+                            file_kind: None,
+                            known_peers: Vec::new(),
+                            group_id: None,
+                        };
+                        let json = serde_json::to_string(&response)
+                            .context("Failed to serialize identity response")?;
+                        writer.write_all(json.as_bytes()).await?;
+                        writer.write_all(b"\n").await?;
+                        writer.flush().await?;
                         continue;
                     }
 
