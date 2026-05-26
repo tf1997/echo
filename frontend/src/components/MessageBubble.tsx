@@ -209,7 +209,7 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
         {!isOwn && showSender && (
           <span className="text-xs text-indigo-300 mb-1 ml-1">{message.sender_name}</span>
         )}
-        <div className={`${isSticker ? "bg-transparent" : `rounded-2xl overflow-hidden ${isOwn ? "bg-indigo-600 text-white rounded-br-md" : "bg-gray-700 text-gray-100 rounded-bl-md"}`} ${!isSticker && !showPreview && message.msg_type !== "forward_card" ? "px-4 py-2.5" : ""}`}>
+        <div className={`${isSticker ? "bg-transparent" : `rounded-2xl overflow-hidden ${isOwn ? "message-bubble-own bg-indigo-600 text-white rounded-br-md" : "message-bubble-other bg-gray-700 text-gray-100 rounded-bl-md"}`} ${!isSticker && !showPreview && message.msg_type !== "forward_card" ? "px-4 py-2.5" : ""}`}>
           {message.msg_type === "forward_card" ? (() => {
             try {
               const card: ForwardCardData = JSON.parse(message.content);

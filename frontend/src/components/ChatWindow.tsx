@@ -590,7 +590,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
   return (
     <div className="flex-1 flex h-full min-w-0">
     <div
-      className="flex-1 flex flex-col bg-gray-800 h-full relative min-w-0"
+      className="chat-surface flex-1 flex flex-col bg-gray-800 h-full relative min-w-0"
       onDragOver={(e) => e.preventDefault()}
     >
       {isDragging && (
@@ -605,7 +605,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
         </div>
       )}
 
-      <div className="flex items-center gap-3 px-5 py-3 bg-gray-900/80 border-b border-gray-700 backdrop-blur">
+      <div className="chat-header flex items-center gap-3 px-5 py-3 bg-gray-900/80 border-b border-gray-700 backdrop-blur">
         <div className="relative">
           <div className={`w-9 h-9 rounded-full flex items-center justify-center text-sm font-medium text-white ${isGroup ? "bg-indigo-700 text-base" : "bg-gray-600"}`}>
             {isGroup ? "👥" : peer.username.charAt(0).toUpperCase()}
@@ -713,7 +713,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
                     <div className={`${isPendingSticker ? "overflow-hidden rounded-xl" : "rounded-2xl px-4 py-2.5 rounded-br-md"} ${
                       item.status === "failed"
                         ? isPendingSticker ? "ring-1 ring-red-500/70" : "bg-red-600/30 border border-red-500/50"
-                        : isPendingSticker ? "" : "bg-indigo-600/50"
+                        : isPendingSticker ? "" : "message-bubble-own bg-indigo-600/50"
                     } text-white`}>
                       {isPendingSticker ? (
                         <div className="w-32 h-32">
@@ -797,7 +797,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
         />
       )}
 
-      <div className="px-4 py-3 border-t border-gray-700 bg-gray-900/50">
+      <div className="chat-composer px-4 py-3 border-t border-gray-700 bg-gray-900/50">
         <div className="flex items-end gap-2">
           <div className="relative flex-shrink-0">
             <button onClick={() => setShowEmoji(!showEmoji)} className="w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center" title="表情">

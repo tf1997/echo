@@ -1,6 +1,8 @@
 import { useState, useCallback, useEffect } from "react";
 import type { Peer, UnreadCount, StoredPeer } from "../types";
 import { searchMessages, discoverByIp, listRecentContacts, removeRecentContact, createGroup } from "../api";
+import { THEMES } from "../theme";
+import type { ThemeId } from "../theme";
 import type { GroupInfo } from "../api";
 import type { SearchResult } from "../api";
 
@@ -21,14 +23,17 @@ interface SidebarProps {
   selectedGroupId: string | null;
   onSelectGroup: (groupId: string) => void;
   groups: GroupInfo[];
+  themeId: ThemeId;
+  onThemeChange: (themeId: ThemeId) => void;
 }
 
-export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit, selectedGroupId, onSelectGroup, groups }: SidebarProps) {
+export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit, selectedGroupId, onSelectGroup, groups, themeId, onThemeChange }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
+  const [showThemeMenu, setShowThemeMenu] = useState(false);
   const [copied, setCopied] = useState("");
   const [subnetInput, setSubnetInput] = useState(scanSubnets.join(", "));
   const [savingSubnets, setSavingSubnets] = useState(false);
@@ -110,6 +115,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
 
   const recentTotalUnread = recentContacts.reduce((sum, contact) => sum + (unreadMap.get(contact.peer_id) ?? 0), 0);
   const groupsTotalUnread = groups.reduce((sum, g) => sum + (g.unread_count || 0), 0);
+  const currentTheme = THEMES.find((theme) => theme.id === themeId) ?? THEMES[0];
 
   const handleSearchChange = useCallback(async (value: string) => {
     setSearchQuery(value);
@@ -161,7 +167,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   }, [manualIp, manualPort]);
 
   return (
-    <div className="flex flex-col w-72 bg-gray-900 text-white h-full border-r border-gray-700">
+    <div className="app-sidebar flex flex-col w-72 bg-gray-900 text-white h-full border-r border-gray-700">
       <div className="p-4 border-b border-gray-700 relative">
         <div className="flex items-center gap-3">
           <button
@@ -257,6 +263,25 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                 留空则不扫描 · 5 分钟间隔 · IP 随机
               </p>
             </div>
+            <div className="border-t border-gray-700 my-3 pt-3">
+              <p className="text-xs text-gray-400 mb-2">皮肤</p>
+              <div className="flex items-center gap-1.5">
+                {THEMES.map((theme) => (
+                  <button
+                    key={theme.id}
+                    type="button"
+                    onClick={() => onThemeChange(theme.id)}
+                    className={`theme-swatch ${themeId === theme.id ? "theme-swatch-active" : ""}`}
+                    title={theme.name}
+                    aria-label={`切换到${theme.name}皮肤`}
+                  >
+                    <span style={{ background: theme.preview[0] }} />
+                    <span style={{ background: theme.preview[1] }} />
+                    <span style={{ background: theme.preview[2] }} />
+                  </button>
+                ))}
+              </div>
+            </div>
             <button
               onClick={() => setShowProfile(false)}
               className="mt-1 w-full text-center text-xs py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 transition-colors"
@@ -265,6 +290,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
             </button>
           </div>
         )}
+
       </div>
 
       {/* Search input */}
@@ -463,7 +489,44 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
         </div>
       )}
 
-      <div className="p-3 border-t border-gray-700 text-xs text-gray-500 text-center">Echo P2P Chat · 局域网通信</div>
+      <div className="relative p-3 border-t border-gray-700 text-xs text-gray-500 text-center">
+        Echo P2P Chat · 局域网通信
+        <button
+          type="button"
+          onClick={() => setShowThemeMenu((value) => !value)}
+          className="absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 rounded bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center"
+          title="切换皮肤"
+          aria-label="切换皮肤"
+        >
+          <span className="flex items-center gap-0.5">
+            {currentTheme.preview.map((color) => (
+              <span key={color} className="w-1.5 h-3 rounded-sm" style={{ background: color }} />
+            ))}
+          </span>
+        </button>
+        {showThemeMenu && (
+          <div className="absolute bottom-full right-2 mb-2 z-50 w-44 rounded-lg bg-gray-800 border border-gray-600 p-2 shadow-2xl text-left">
+            {THEMES.map((theme) => (
+              <button
+                key={theme.id}
+                type="button"
+                onClick={() => {
+                  onThemeChange(theme.id);
+                  setShowThemeMenu(false);
+                }}
+                className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs hover:bg-gray-700 ${themeId === theme.id ? "text-indigo-400" : "text-gray-300"}`}
+              >
+                <span className={`theme-swatch ${themeId === theme.id ? "theme-swatch-active" : ""}`}>
+                  <span style={{ background: theme.preview[0] }} />
+                  <span style={{ background: theme.preview[1] }} />
+                  <span style={{ background: theme.preview[2] }} />
+                </span>
+                <span>{theme.name}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

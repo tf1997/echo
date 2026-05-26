@@ -4,6 +4,8 @@ import { ask, message } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
+import { applyTheme, getInitialTheme } from "./theme";
+import type { ThemeId } from "./theme";
 import {
   checkForUpdates,
   downloadUpdate,
@@ -56,6 +58,7 @@ function App() {
   const [scanSubnets, setScanSubnetsState] = useState<string[]>([]);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [groups, setGroups] = useState<GroupInfo[]>([]);
+  const [themeId, setThemeId] = useState<ThemeId>(() => getInitialTheme());
   const checkingUpdateRef = useRef(false);
 
   // ── notification sound ────────────────────────────────────────────────
@@ -455,6 +458,11 @@ function App() {
     } catch { /* keep existing */ }
   }, []);
 
+  const handleThemeChange = useCallback((nextThemeId: ThemeId) => {
+    setThemeId(nextThemeId);
+    applyTheme(nextThemeId);
+  }, []);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-screen bg-gray-900">
@@ -524,6 +532,8 @@ function App() {
         selectedGroupId={selectedGroupId}
         onSelectGroup={handleSelectGroup}
         groups={groups}
+        themeId={themeId}
+        onThemeChange={handleThemeChange}
       />
       <ChatWindow
         peer={selectedGroupId ? { id: selectedGroupId, username: groups.find(g => g.group_id === selectedGroupId)?.name || "群聊", department: "", ip: "", port: 0, online: true } : selectedPeer}

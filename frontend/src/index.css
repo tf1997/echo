@@ -1,1 +1,485 @@
 @import "tailwindcss";
+
+:root,
+:root[data-theme="midnight"] {
+  color-scheme: dark;
+  --echo-bg: #0f172a;
+  --echo-bg-soft: #111827;
+  --echo-panel: #182033;
+  --echo-panel-strong: #0f1628;
+  --echo-control: #263248;
+  --echo-control-hover: #33415c;
+  --echo-border: #334155;
+  --echo-border-soft: #475569;
+  --echo-text: #f8fafc;
+  --echo-text-soft: #cbd5e1;
+  --echo-muted: #94a3b8;
+  --echo-muted-strong: #64748b;
+  --echo-accent: #6366f1;
+  --echo-accent-hover: #818cf8;
+  --echo-accent-soft: rgb(99 102 241 / 0.2);
+  --echo-accent-muted: #a5b4fc;
+  --echo-own-bubble: #4f46e5;
+  --echo-other-bubble: #334155;
+  --echo-danger: #ef4444;
+  --echo-success: #22c55e;
+  --echo-warning: #ca8a04;
+  --echo-shadow: rgb(2 6 23 / 0.35);
+}
+
+:root[data-theme="daylight"] {
+  color-scheme: light;
+  --echo-bg: #d8e1e8;
+  --echo-bg-soft: #e6edf2;
+  --echo-panel: #f1f5f6;
+  --echo-panel-strong: #cbd7df;
+  --echo-control: #dce7ec;
+  --echo-control-hover: #cfdee5;
+  --echo-border: #b7c7d0;
+  --echo-border-soft: #95aab6;
+  --echo-text: #26323a;
+  --echo-text-soft: #3d4c56;
+  --echo-muted: #61727d;
+  --echo-muted-strong: #82929c;
+  --echo-accent: #4e8396;
+  --echo-accent-hover: #467689;
+  --echo-accent-soft: rgb(78 131 150 / 0.15);
+  --echo-accent-muted: #477487;
+  --echo-own-bubble: #c8e1e7;
+  --echo-other-bubble: #eef3f0;
+  --echo-danger: #c65f5f;
+  --echo-success: #5f8f72;
+  --echo-warning: #9c7a40;
+  --echo-shadow: rgb(37 58 70 / 0.13);
+}
+
+:root[data-theme="wechat"] {
+  color-scheme: light;
+  --echo-bg: #f5f5f5;
+  --echo-bg-soft: #f7f7f7;
+  --echo-panel: #fbfbfb;
+  --echo-panel-strong: #ededed;
+  --echo-control: #ededed;
+  --echo-control-hover: #e5e5e5;
+  --echo-border: #d9d9d9;
+  --echo-border-soft: #aaaaaa;
+  --echo-text: #1f1f1f;
+  --echo-text-soft: #4d4d4d;
+  --echo-muted: #888888;
+  --echo-muted-strong: #aaaaaa;
+  --echo-accent: #1aad19;
+  --echo-accent-hover: #2ba245;
+  --echo-accent-soft: rgb(26 173 25 / 0.12);
+  --echo-accent-muted: #2ba245;
+  --echo-own-bubble: #95ec69;
+  --echo-other-bubble: #ffffff;
+  --echo-danger: #fa5151;
+  --echo-success: #1aad19;
+  --echo-warning: #9a7a43;
+  --echo-shadow: rgb(77 77 77 / 0.1);
+}
+
+:root[data-theme="aurora"] {
+  color-scheme: dark;
+  --echo-bg: #071113;
+  --echo-bg-soft: #0b1719;
+  --echo-panel: #122224;
+  --echo-panel-strong: #0d1c1f;
+  --echo-control: #192d31;
+  --echo-control-hover: #21383d;
+  --echo-border: #2a4146;
+  --echo-border-soft: #38565d;
+  --echo-text: #d6e4e6;
+  --echo-text-soft: #b7c9cd;
+  --echo-muted: #829aa0;
+  --echo-muted-strong: #637a80;
+  --echo-accent: #5d918b;
+  --echo-accent-hover: #6fa19b;
+  --echo-accent-soft: rgb(93 145 139 / 0.14);
+  --echo-accent-muted: #8ab8b2;
+  --echo-own-bubble: #315f5b;
+  --echo-other-bubble: #24393e;
+  --echo-danger: #c76a75;
+  --echo-success: #6fa67f;
+  --echo-warning: #b08a4b;
+  --echo-shadow: rgb(1 12 15 / 0.38);
+}
+
+:root[data-theme="carbon"] {
+  color-scheme: dark;
+  --echo-bg: #07080a;
+  --echo-bg-soft: #0b0d10;
+  --echo-panel: #15191f;
+  --echo-panel-strong: #101318;
+  --echo-control: #20242a;
+  --echo-control-hover: #2b3038;
+  --echo-border: #313741;
+  --echo-border-soft: #4b5563;
+  --echo-text: #e7e5e4;
+  --echo-text-soft: #c9c4bf;
+  --echo-muted: #968f89;
+  --echo-muted-strong: #78716c;
+  --echo-accent: #9b7a4d;
+  --echo-accent-hover: #a98758;
+  --echo-accent-soft: rgb(155 122 77 / 0.14);
+  --echo-accent-muted: #bea071;
+  --echo-own-bubble: #6f5634;
+  --echo-other-bubble: #30343b;
+  --echo-danger: #ef4444;
+  --echo-success: #6e946f;
+  --echo-warning: #b08a4b;
+  --echo-shadow: rgb(0 0 0 / 0.38);
+}
+
+:root[data-theme="plum"] {
+  color-scheme: dark;
+  --echo-bg: #171116;
+  --echo-bg-soft: #1e171d;
+  --echo-panel: #2a2028;
+  --echo-panel-strong: #211a20;
+  --echo-control: #362933;
+  --echo-control-hover: #42313d;
+  --echo-border: #4d3a47;
+  --echo-border-soft: #604c59;
+  --echo-text: #eadde4;
+  --echo-text-soft: #d0bcc6;
+  --echo-muted: #a28996;
+  --echo-muted-strong: #836b78;
+  --echo-accent: #9b5b70;
+  --echo-accent-hover: #aa687d;
+  --echo-accent-soft: rgb(155 91 112 / 0.14);
+  --echo-accent-muted: #c18a9d;
+  --echo-own-bubble: #6f4053;
+  --echo-other-bubble: #3a2a35;
+  --echo-danger: #c76a75;
+  --echo-success: #7fa070;
+  --echo-warning: #b08a4b;
+  --echo-shadow: rgb(20 8 16 / 0.4);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background: var(--echo-bg);
+  color: var(--echo-text);
+}
+
+body {
+  margin: 0;
+}
+
+* {
+  scrollbar-color: var(--echo-border-soft) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--echo-border-soft);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+.bg-gray-900,
+.bg-gray-900\/80,
+.bg-gray-900\/60,
+.bg-gray-900\/50 {
+  background-color: var(--echo-bg-soft) !important;
+}
+
+.bg-gray-800 {
+  background-color: var(--echo-panel) !important;
+}
+
+.bg-gray-700,
+.bg-gray-700\/60 {
+  background-color: var(--echo-control) !important;
+}
+
+.bg-gray-600 {
+  background-color: var(--echo-control-hover) !important;
+}
+
+.hover\:bg-gray-800:hover {
+  background-color: var(--echo-panel-strong) !important;
+}
+
+.hover\:bg-gray-700:hover,
+.hover\:bg-gray-700:hover {
+  background-color: var(--echo-control-hover) !important;
+}
+
+.hover\:bg-gray-600:hover {
+  background-color: var(--echo-control-hover) !important;
+}
+
+.border-gray-700 {
+  border-color: var(--echo-border) !important;
+}
+
+.border-gray-600,
+.border-gray-500 {
+  border-color: var(--echo-border-soft) !important;
+}
+
+.text-white,
+.text-gray-100,
+.text-gray-200 {
+  color: var(--echo-text) !important;
+}
+
+.text-gray-300 {
+  color: var(--echo-text-soft) !important;
+}
+
+.text-gray-400 {
+  color: var(--echo-muted) !important;
+}
+
+.text-gray-500,
+.text-gray-600 {
+  color: var(--echo-muted-strong) !important;
+}
+
+.placeholder-gray-400::placeholder,
+.placeholder-gray-500::placeholder {
+  color: var(--echo-muted-strong) !important;
+}
+
+.bg-indigo-700,
+.bg-indigo-600,
+.bg-indigo-500,
+.bg-indigo-600\/50 {
+  background-color: var(--echo-accent) !important;
+}
+
+.bg-indigo-700,
+.bg-indigo-600\/50 {
+  background-color: var(--echo-own-bubble) !important;
+}
+
+.bg-indigo-600\/30,
+.bg-indigo-600\/20,
+.bg-indigo-900\/30,
+.bg-indigo-900\/20 {
+  background-color: var(--echo-accent-soft) !important;
+}
+
+.hover\:bg-indigo-500:hover,
+.hover\:bg-indigo-400:hover {
+  background-color: var(--echo-accent-hover) !important;
+}
+
+.disabled\:hover\:bg-indigo-600:disabled:hover {
+  background-color: var(--echo-accent) !important;
+}
+
+.text-indigo-200,
+.text-indigo-300,
+.text-indigo-400 {
+  color: var(--echo-accent-muted) !important;
+}
+
+.border-indigo-400,
+.border-indigo-400\/30,
+.border-indigo-400\/20 {
+  border-color: var(--echo-accent) !important;
+}
+
+.bg-gray-700.text-gray-100,
+.bg-gray-700.text-white {
+  background-color: var(--echo-other-bubble) !important;
+}
+
+.message-bubble-own {
+  background-color: var(--echo-own-bubble) !important;
+}
+
+.message-bubble-other {
+  background-color: var(--echo-other-bubble) !important;
+}
+
+:root[data-theme="wechat"] .message-bubble-own,
+:root[data-theme="wechat"] .message-bubble-other {
+  border: 1px solid rgb(0 0 0 / 0.04);
+  border-radius: 6px !important;
+  color: #111111 !important;
+}
+
+:root[data-theme="wechat"] .message-bubble-own {
+  border-color: rgb(43 162 69 / 0.2);
+  box-shadow: 0 1px 1px rgb(43 162 69 / 0.08);
+}
+
+:root[data-theme="wechat"] .message-bubble-other {
+  box-shadow: 0 1px 1px rgb(0 0 0 / 0.03);
+}
+
+:root[data-theme="wechat"] .app-sidebar {
+  background-color: #f7f7f7 !important;
+  border-color: #d9d9d9 !important;
+  color: #1f1f1f !important;
+}
+
+:root[data-theme="wechat"] .chat-surface {
+  background-color: #f5f5f5 !important;
+}
+
+:root[data-theme="wechat"] .chat-header,
+:root[data-theme="wechat"] .chat-composer {
+  background-color: #f7f7f7 !important;
+  border-color: #d9d9d9 !important;
+}
+
+:root[data-theme="wechat"] .bg-indigo-600\/30,
+:root[data-theme="wechat"] .bg-indigo-600\/20 {
+  background-color: #dedede !important;
+}
+
+:root[data-theme="wechat"] .app-sidebar input.bg-gray-800,
+:root[data-theme="wechat"] .app-sidebar input.bg-gray-900,
+:root[data-theme="wechat"] .chat-composer textarea.bg-gray-700,
+:root[data-theme="wechat"] .chat-header + div input.bg-gray-700 {
+  background-color: #ededed !important;
+  border-color: transparent !important;
+  color: #1f1f1f !important;
+  border-radius: 6px;
+}
+
+:root[data-theme="wechat"] .chat-composer textarea.bg-gray-700 {
+  background-color: #ffffff !important;
+  border-radius: 10px;
+}
+
+:root[data-theme="wechat"] .chat-composer button.bg-gray-700 {
+  background-color: #ededed !important;
+  color: #4d4d4d !important;
+}
+
+:root[data-theme="wechat"] .app-sidebar button.bg-gray-700,
+:root[data-theme="wechat"] .app-sidebar .bg-gray-700 {
+  background-color: #ededed !important;
+  color: #4d4d4d !important;
+}
+
+:root[data-theme="wechat"] .app-sidebar .hover\:bg-gray-800:hover,
+:root[data-theme="wechat"] .chat-composer button.bg-gray-700:hover {
+  background-color: #ededed !important;
+}
+
+:root[data-theme="wechat"] .app-sidebar .bg-gray-800,
+:root[data-theme="wechat"] .chat-header + div.bg-gray-900\/60 {
+  background-color: #f7f7f7 !important;
+}
+
+:root[data-theme="wechat"] .border-gray-900 {
+  border-color: #f7f7f7 !important;
+}
+
+:root[data-theme="wechat"] .bg-gray-500 {
+  background-color: #aaaaaa !important;
+}
+
+:root[data-theme="wechat"] .bg-indigo-700,
+:root[data-theme="wechat"] .bg-indigo-700\/60 {
+  background-color: #1aad19 !important;
+}
+
+:root[data-theme="wechat"] .message-bubble-own.bg-indigo-700\/60,
+:root[data-theme="wechat"] .message-bubble-own.bg-indigo-600\/50,
+:root[data-theme="wechat"] .message-bubble-own.bg-indigo-600 {
+  background-color: #95ec69 !important;
+}
+
+:root[data-theme="wechat"] .text-indigo-200,
+:root[data-theme="wechat"] .text-indigo-300,
+:root[data-theme="wechat"] .text-indigo-400 {
+  color: #1aad19 !important;
+}
+
+:root[data-theme="wechat"] .hover\:text-white:hover,
+:root[data-theme="wechat"] .hover\:text-gray-300:hover,
+:root[data-theme="wechat"] .hover\:text-gray-200:hover {
+  color: #4d4d4d !important;
+}
+
+:root[data-theme="wechat"] .shadow-2xl,
+:root[data-theme="wechat"] .shadow-xl {
+  box-shadow: 0 18px 44px rgb(0 0 0 / 0.08) !important;
+}
+
+.focus\:ring-indigo-500:focus,
+.focus\:ring-indigo-500:focus-visible {
+  --tw-ring-color: var(--echo-accent) !important;
+}
+
+.focus\:border-indigo-500:focus {
+  border-color: var(--echo-accent) !important;
+}
+
+.bg-green-400 {
+  background-color: var(--echo-success) !important;
+}
+
+.bg-red-500,
+.bg-red-600\/30,
+.hover\:bg-red-600:hover {
+  background-color: var(--echo-danger) !important;
+}
+
+.border-red-500\/50 {
+  border-color: var(--echo-danger) !important;
+}
+
+.bg-yellow-700\/60,
+.hover\:bg-yellow-700:hover {
+  background-color: var(--echo-warning) !important;
+}
+
+.shadow-2xl,
+.shadow-xl {
+  box-shadow: 0 22px 55px var(--echo-shadow) !important;
+}
+
+input,
+textarea,
+select,
+button {
+  letter-spacing: 0;
+}
+
+input,
+textarea,
+select {
+  caret-color: var(--echo-accent);
+}
+
+.theme-swatch {
+  display: inline-grid;
+  grid-template-columns: repeat(3, 1fr);
+  width: 28px;
+  height: 18px;
+  overflow: hidden;
+  border: 1px solid var(--echo-border-soft);
+  border-radius: 6px;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08);
+}
+
+.theme-swatch span {
+  min-width: 0;
+}
+
+.theme-swatch:hover {
+  transform: translateY(-1px);
+  border-color: var(--echo-accent);
+}
+
+.theme-swatch-active {
+  border-color: var(--echo-accent);
+  box-shadow: 0 0 0 2px var(--echo-accent-soft), inset 0 0 0 1px rgb(255 255 255 / 0.14);
+}
