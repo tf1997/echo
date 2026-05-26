@@ -1,8 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { Peer, ChatMessage, AppInfo, StoredPeer, UnreadCount } from "./types";
+import { ask, message } from "@tauri-apps/api/dialog";
+import { listen } from "@tauri-apps/api/event";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
 import {
+  checkForUpdates,
+  downloadUpdate,
   getAppInfo,
   getPeers,
   getConversation,
@@ -43,6 +47,7 @@ function App() {
   const [scanSubnets, setScanSubnetsState] = useState<string[]>([]);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [groups, setGroups] = useState<GroupInfo[]>([]);
+  const checkingUpdateRef = useRef(false);
 
   // ── notification sound ────────────────────────────────────────────────
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -103,6 +108,57 @@ function App() {
     if (ctx.state !== "running") return;
     playChime(ctx);
   }, [playChime]);
+
+  const handleMenuCheckUpdate = useCallback(async () => {
+    if (checkingUpdateRef.current) return;
+    checkingUpdateRef.current = true;
+    try {
+      const result = await checkForUpdates();
+      if (!result.available) {
+        await message(`当前已是最新版本 ${result.current_version}`, {
+          title: "Echo 更新",
+          type: "info",
+        });
+        return;
+      }
+
+      const shouldDownload = await ask(
+        `发现新版本 ${result.latest_version || ""}，是否现在下载？`,
+        {
+          title: "Echo 更新",
+          type: "info",
+          okLabel: "下载",
+          cancelLabel: "稍后",
+        }
+      );
+      if (!shouldDownload) return;
+
+      const downloaded = await downloadUpdate();
+      await message(downloaded.message, {
+        title: "Echo 更新",
+        type: "info",
+      });
+    } catch (err) {
+      await message(String(err), {
+        title: "Echo 更新失败",
+        type: "error",
+      });
+    } finally {
+      checkingUpdateRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen("menu-check-update", () => {
+      handleMenuCheckUpdate();
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [handleMenuCheckUpdate]);
 
   // Detect new incoming CONTACT messages via unread-count changes
   // (same data that drives the sidebar red badges)

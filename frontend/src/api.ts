@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/tauri";
-import type { Peer, ChatMessage, AppInfo, SaveProfilePayload, StoredPeer, UnreadCount } from "./types";
+import type { Peer, ChatMessage, AppInfo, SaveProfilePayload, StoredPeer, UnreadCount, UpdateCheckResult, DownloadUpdateResult } from "./types";
 
 export async function getAppInfo(): Promise<AppInfo> {
   return await invoke("get_app_info");
@@ -194,6 +194,13 @@ export async function checkPeerOnline(ip: string, port: number): Promise<boolean
   return await invoke("check_peer_online", { ip, port });
 }
 
+export async function checkForUpdates(): Promise<UpdateCheckResult> {
+  return await invoke("check_for_updates_command");
+}
+
+export async function downloadUpdate(): Promise<DownloadUpdateResult> {
+  return await invoke("download_update_command");
+}
 
 
 

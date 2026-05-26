@@ -4,6 +4,7 @@ mod contact_sync;
 mod db;
 mod discovery;
 mod state;
+pub mod updater;
 
 use db::Database;
 use log::info;
@@ -11,10 +12,19 @@ use crate::discovery::{Peer, PeerEntry};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::Manager;
+use tauri::{CustomMenuItem, Manager, Menu, Submenu};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use state::AppState;
+
+const MENU_CHECK_UPDATE: &str = "check_update";
+
+fn app_menu() -> Menu {
+    Menu::os_default("Echo").add_submenu(Submenu::new(
+        "帮助",
+        Menu::new().add_item(CustomMenuItem::new(MENU_CHECK_UPDATE, "检查更新")),
+    ))
+}
 
 pub fn run() {
     // ── File logger with size-based truncation ─────────────────────────
@@ -46,6 +56,12 @@ pub fn run() {
         .expect("failed to start logger");
 
     tauri::Builder::default()
+        .menu(app_menu())
+        .on_menu_event(|event| {
+            if event.menu_item_id() == MENU_CHECK_UPDATE {
+                let _ = event.window().emit("menu-check-update", ());
+            }
+        })
         .setup(move |app| {
             let listen_port = std::env::var("ECHO_PORT")
                 .ok()
@@ -98,6 +114,8 @@ pub fn run() {
                 runtime: RwLock::new(runtime_services),
                 relay_tx: Some(relay_tx),
             });
+
+            updater::spawn_background_update_check(app.handle().clone());
 
             // ── UDP relay → contact sync processor ───────────────────
             // Receives PeerEntry batches forwarded from the UDP discovery
@@ -395,6 +413,8 @@ pub fn run() {
             commands::get_group_unread_counts,
             commands::mark_group_read,
             commands::deliver_pending,
+            updater::check_for_updates_command,
+            updater::download_update_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Echo");

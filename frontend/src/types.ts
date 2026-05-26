@@ -52,6 +52,33 @@ export interface UnreadCount {
   count: number;
 }
 
+export interface UpdatePackage {
+  target: "portable" | "installer";
+  platform: string;
+  arch: string;
+  url: string;
+  sha256: string;
+  signature?: string | null;
+  size?: number | null;
+}
+
+export interface UpdateCheckResult {
+  current_version: string;
+  latest_version?: string | null;
+  available: boolean;
+  distribution: string;
+  package?: UpdatePackage | null;
+  notes?: string | null;
+}
+
+export interface DownloadUpdateResult {
+  version: string;
+  target: "portable" | "installer";
+  path: string;
+  ready_to_restart: boolean;
+  message: string;
+}
+
 export interface GroupInfo {
   group_id: string;
   name: string;
