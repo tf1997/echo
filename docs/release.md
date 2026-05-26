@@ -2,6 +2,41 @@
 
 This project uses MinIO as the update host. The app reads one built-in manifest URL and then downloads the matching package for the current distribution, platform, and CPU architecture.
 
+## latest.json
+```json
+{
+  "version": "0.2.0",
+  "channel": "stable",
+  "notes": "fix some bugs",
+  "packages": [
+    {
+      "target": "portable",
+      "platform": "windows",
+      "arch": "x64",
+      "url": "https://minio.example.com/echo/stable/0.2.0/windows-x64-portable.zip",
+      "sha256": "...",
+      "signature": "..."
+    },
+    {
+      "target": "installer",
+      "platform": "windows",
+      "arch": "x64",
+      "url": "https://minio.example.com/echo/stable/0.2.0/windows-x64-setup.exe",
+      "sha256": "...",
+      "signature": "..."
+    },
+    {
+      "target": "installer",
+      "platform": "macos",
+      "arch": "aarch64",
+      "url": "https://minio.example.com/echo/stable/0.2.0/macos-aarch64.dmg",
+      "sha256": "...",
+      "signature": "..."
+    }
+  ]
+}
+```
+
 ## Files Required For A Release
 
 Upload these files to MinIO:

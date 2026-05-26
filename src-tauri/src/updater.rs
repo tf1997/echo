@@ -45,8 +45,11 @@ pub struct UpdateCheckResult {
     pub latest_version: Option<String>,
     pub available: bool,
     pub distribution: String,
+    pub platform: String,
+    pub arch: String,
     pub package: Option<UpdatePackage>,
     pub notes: Option<String>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,8 +67,7 @@ struct PortableVersionMarker {
     executable: String,
 }
 
-const BUILT_IN_UPDATE_MANIFEST_URL: &str =
-    "http://127.0.0.1:9001/echo/updates/stable/latest.json";
+const BUILT_IN_UPDATE_MANIFEST_URL: &str = "http://127.0.0.1:9001/echo/updates/stable/latest.json";
 const PORTABLE_MARKER: &str = "portable.json";
 const CURRENT_MARKER: &str = "current.json";
 
@@ -107,9 +109,20 @@ pub async fn check_for_updates() -> Result<UpdateCheckResult> {
         Version::parse(env!("CARGO_PKG_VERSION")).context("invalid current app version")?;
     let latest_version = Version::parse(&manifest.version).context("invalid manifest version")?;
     let distribution = current_distribution();
+    let platform = current_platform().to_string();
+    let arch = current_arch().to_string();
+    let newer_version_available = latest_version > current_version;
 
-    let package = if latest_version > current_version {
-        select_package(&manifest, &distribution).cloned()
+    let package = if newer_version_available {
+        select_package(&manifest, &distribution, &platform, &arch).cloned()
+    } else {
+        None
+    };
+    let message = if newer_version_available && package.is_none() {
+        Some(format!(
+            "发现新版本 {}，但没有适用于当前 {} / {} / {} 的更新包",
+            latest_version, distribution, platform, arch
+        ))
     } else {
         None
     };
@@ -119,20 +132,30 @@ pub async fn check_for_updates() -> Result<UpdateCheckResult> {
         latest_version: Some(latest_version.to_string()),
         available: package.is_some(),
         distribution,
+        platform,
+        arch,
         package,
         notes: manifest.notes,
+        message,
     })
 }
 
 pub async fn download_update(app: AppHandle) -> Result<DownloadUpdateResult> {
     let check = check_for_updates().await?;
     let Some(package) = check.package else {
+        let target = if check.distribution == "portable" {
+            UpdateTarget::Portable
+        } else {
+            UpdateTarget::Installer
+        };
         return Ok(DownloadUpdateResult {
-            version: check.current_version,
-            target: UpdateTarget::Portable,
+            version: check.latest_version.unwrap_or(check.current_version),
+            target,
             path: String::new(),
             ready_to_restart: false,
-            message: "当前已是最新版本".to_string(),
+            message: check
+                .message
+                .unwrap_or_else(|| "当前已是最新版本".to_string()),
         });
     };
     let version = check
@@ -185,9 +208,9 @@ fn update_manifest_url() -> &'static str {
 fn select_package<'a>(
     manifest: &'a UpdateManifest,
     distribution: &str,
+    platform: &str,
+    arch: &str,
 ) -> Option<&'a UpdatePackage> {
-    let platform = current_platform();
-    let arch = current_arch();
     let target = if distribution == "portable" {
         UpdateTarget::Portable
     } else {

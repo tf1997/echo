@@ -91,8 +91,15 @@ if (Test-Path $ZipPath) {
 }
 Compress-Archive -Path (Join-Path $StageDir "*") -DestinationPath $ZipPath -Force
 
+$ZipHash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$ZipSize = (Get-Item $ZipPath).Length
+
 Write-Host "Portable package created:"
 Write-Host "  $ZipPath"
+Write-Host ""
+Write-Host "Package metadata:"
+Write-Host "  sha256: $ZipHash"
+Write-Host "  size:   $ZipSize"
 Write-Host ""
 Write-Host "Included WebView2 loader:"
 Write-Host "  $LoaderPath"

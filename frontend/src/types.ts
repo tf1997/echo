@@ -67,8 +67,11 @@ export interface UpdateCheckResult {
   latest_version?: string | null;
   available: boolean;
   distribution: string;
+  platform: string;
+  arch: string;
   package?: UpdatePackage | null;
   notes?: string | null;
+  message?: string | null;
 }
 
 export interface DownloadUpdateResult {

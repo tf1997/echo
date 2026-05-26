@@ -115,7 +115,7 @@ function App() {
     try {
       const result = await checkForUpdates();
       if (!result.available) {
-        await message(`当前已是最新版本 ${result.current_version}`, {
+        await message(result.message || `当前已是最新版本 ${result.current_version}`, {
           title: "Echo 更新",
           type: "info",
         });
