@@ -1,0 +1,36 @@
+{
+  "version": "0.2.0",
+  "channel": "stable",
+  "notes": "更新说明",
+  "force": false,
+  "min_supported_version": "0.1.0",
+  "packages": [
+    {
+      "target": "portable",
+      "platform": "windows",
+      "arch": "x64",
+      "url": "https://minio.example.com/echo-updates/stable/0.2.0/Echo-0.2.0-windows-x64-portable.zip",
+      "sha256": "REPLACE_WITH_SHA256",
+      "signature": null,
+      "size": 0
+    },
+    {
+      "target": "portable",
+      "platform": "macos",
+      "arch": "aarch64",
+      "url": "https://minio.example.com/echo-updates/stable/0.2.0/Echo-0.2.0-macos-aarch64-portable.zip",
+      "sha256": "REPLACE_WITH_SHA256",
+      "signature": null,
+      "size": 0
+    },
+    {
+      "target": "installer",
+      "platform": "windows",
+      "arch": "x64",
+      "url": "https://minio.example.com/echo-updates/stable/0.2.0/Echo_0.2.0_x64-setup.exe",
+      "sha256": "REPLACE_WITH_SHA256",
+      "signature": null,
+      "size": 0
+    }
+  ]
+}

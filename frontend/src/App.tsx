@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import type { Peer, ChatMessage, AppInfo, StoredPeer, UnreadCount } from "./types";
+import type { Peer, ChatMessage, AppInfo, StoredPeer, UnreadCount, UpdateCheckResult } from "./types";
 import { ask, message } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { Sidebar } from "./components/Sidebar";
@@ -29,6 +29,15 @@ import {
   markGroupRead,
 } from "./api";
 import type { GroupInfo } from "./api";
+
+function formatUpdatePrompt(result: UpdateCheckResult) {
+  const version = result.latest_version || "";
+  const notes = result.notes?.trim();
+  if (!notes) {
+    return `发现新版本 ${version}，是否现在下载？`;
+  }
+  return `发现新版本 ${version}，是否现在下载？\n\n更新说明：\n${notes}`;
+}
 
 function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
@@ -109,6 +118,22 @@ function App() {
     playChime(ctx);
   }, [playChime]);
 
+  const promptAndDownloadUpdate = useCallback(async (result: UpdateCheckResult) => {
+    const shouldDownload = await ask(formatUpdatePrompt(result), {
+      title: "Echo 更新",
+      type: "info",
+      okLabel: "下载",
+      cancelLabel: "稍后",
+    });
+    if (!shouldDownload) return;
+
+    const downloaded = await downloadUpdate();
+    await message(downloaded.message, {
+      title: "Echo 更新",
+      type: "info",
+    });
+  }, []);
+
   const handleMenuCheckUpdate = useCallback(async () => {
     if (checkingUpdateRef.current) return;
     checkingUpdateRef.current = true;
@@ -122,22 +147,7 @@ function App() {
         return;
       }
 
-      const shouldDownload = await ask(
-        `发现新版本 ${result.latest_version || ""}，是否现在下载？`,
-        {
-          title: "Echo 更新",
-          type: "info",
-          okLabel: "下载",
-          cancelLabel: "稍后",
-        }
-      );
-      if (!shouldDownload) return;
-
-      const downloaded = await downloadUpdate();
-      await message(downloaded.message, {
-        title: "Echo 更新",
-        type: "info",
-      });
+      await promptAndDownloadUpdate(result);
     } catch (err) {
       await message(String(err), {
         title: "Echo 更新失败",
@@ -146,19 +156,41 @@ function App() {
     } finally {
       checkingUpdateRef.current = false;
     }
-  }, []);
+  }, [promptAndDownloadUpdate]);
+
+  const handleBackgroundUpdateAvailable = useCallback(async (result: UpdateCheckResult) => {
+    if (!result.available || checkingUpdateRef.current) return;
+    checkingUpdateRef.current = true;
+    try {
+      await promptAndDownloadUpdate(result);
+    } catch (err) {
+      await message(String(err), {
+        title: "Echo 更新失败",
+        type: "error",
+      });
+    } finally {
+      checkingUpdateRef.current = false;
+    }
+  }, [promptAndDownloadUpdate]);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    let unlistenMenu: (() => void) | undefined;
+    let unlistenUpdate: (() => void) | undefined;
     listen("menu-check-update", () => {
       handleMenuCheckUpdate();
     }).then((fn) => {
-      unlisten = fn;
+      unlistenMenu = fn;
+    });
+    listen<UpdateCheckResult>("update-available", (event) => {
+      handleBackgroundUpdateAvailable(event.payload);
+    }).then((fn) => {
+      unlistenUpdate = fn;
     });
     return () => {
-      unlisten?.();
+      unlistenMenu?.();
+      unlistenUpdate?.();
     };
-  }, [handleMenuCheckUpdate]);
+  }, [handleMenuCheckUpdate, handleBackgroundUpdateAvailable]);
 
   // Detect new incoming CONTACT messages via unread-count changes
   // (same data that drives the sidebar red badges)

@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "channel": "stable",
+  "notes": "更新说明",
+  "packages": [
+    {
+      "target": "portable",
+      "platform": "macos",
+      "arch": "aarch64",
+      "url": "http://127.0.0.1:9001/echo/stable/0.2.0/macos-aarch64-portable.zip",
+      "sha256": "...",
+      "signature": null,
+      "size": 12345678
+    }
+  ]
+}

@@ -43,7 +43,7 @@
     },
     "bundle": {
       "active": false,
-      "identifier": "com.tf1997.echo",
+      "identifier": "com.echo.p2p",
       "windows": {
         "webviewInstallMode": {
           "type": "embedBootstrapper",

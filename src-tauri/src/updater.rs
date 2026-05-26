@@ -390,12 +390,25 @@ fn portable_root() -> Result<PathBuf> {
 
 fn portable_root_from_exe(exe: &Path) -> Option<PathBuf> {
     let exe_dir = exe.parent()?;
+    if let Some(root) = versioned_portable_root_from_dir(exe_dir) {
+        return Some(root);
+    }
     if exe_dir.join(PORTABLE_MARKER).exists() || exe_dir.join("versions").exists() {
         return Some(exe_dir.to_path_buf());
     }
-    let versions_dir = exe_dir.parent()?;
-    if versions_dir.file_name().and_then(|v| v.to_str()) == Some("versions") {
-        return versions_dir.parent().map(|root| root.to_path_buf());
+    None
+}
+
+fn versioned_portable_root_from_dir(dir: &Path) -> Option<PathBuf> {
+    for ancestor in dir.ancestors() {
+        let version_name = ancestor.file_name()?.to_str()?;
+        if Version::parse(version_name).is_err() {
+            continue;
+        }
+        let versions_dir = ancestor.parent()?;
+        if versions_dir.file_name().and_then(|v| v.to_str()) == Some("versions") {
+            return versions_dir.parent().map(|root| root.to_path_buf());
+        }
     }
     None
 }
