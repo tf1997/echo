@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import type { ChatMessage, Peer } from "../types";
 import type { GroupInfo } from "../api";
 import { MessageBubble, DateDivider, formatDateLabel } from "./MessageBubble";
-import { saveTempFile, listEmojiFiles, addEmojiFile, readFileBase64, sendMessage, sendMessageTyped, sendGroupMessage, sendGroupMessageTyped, renameGroup, leaveGroup, dissolveGroup, inviteToGroup } from "../api";
+import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, readFileBase64, sendMessage, sendMessageTyped, sendGroupMessage, sendGroupMessageTyped, renameGroup, leaveGroup, dissolveGroup, inviteToGroup } from "../api";
 import type { ForwardCardData } from "./MessageBubble";
 import { open } from "@tauri-apps/api/dialog";
 
@@ -166,6 +166,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
   const [showEmoji, setShowEmoji] = useState(false);
   const [emojiTab, setEmojiTab] = useState<"default" | "custom">("default");
   const [customEmojis, setCustomEmojis] = useState<string[]>([]);
+  const [deletingEmoji, setDeletingEmoji] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [showSearch, setShowSearch] = useState(false);
   const [searchIndex, setSearchIndex] = useState(0);
@@ -218,6 +219,30 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     }
   }, []);
 
+  const handleAddStickerFromMessage = useCallback(async (message: ChatMessage) => {
+    if (message.msg_type !== "sticker" || !message.file_path) return;
+    try {
+      const saved = await addEmojiFile(message.file_path);
+      setCustomEmojis((prev) => prev.includes(saved) ? prev : [...prev, saved]);
+      setEmojiTab("custom");
+    } catch (e) {
+      console.error("Failed to add sticker from message:", e);
+    }
+  }, []);
+
+  const handleDeleteEmoji = useCallback(async (path: string) => {
+    if (deletingEmoji) return;
+    setDeletingEmoji(path);
+    try {
+      await deleteEmojiFile(path);
+      setCustomEmojis((prev) => prev.filter((item) => item !== path));
+    } catch (e) {
+      console.error("Failed to delete emoji:", e);
+    } finally {
+      setDeletingEmoji(null);
+    }
+  }, [deletingEmoji]);
+
   // Listen for file send progress
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -258,6 +283,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const emojiPopoverRef = useRef<HTMLDivElement>(null);
   const nearBottomRef = useRef(true);
 
   const pendingScrollRef = useRef(false);
@@ -309,6 +335,17 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       });
     }));
   }, [messages, myId]);
+
+  useEffect(() => {
+    if (!showEmoji) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!emojiPopoverRef.current?.contains(event.target as Node)) {
+        setShowEmoji(false);
+      }
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [showEmoji]);
 
   const retryText = useCallback(async (pending: PendingMessage) => {
     setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
@@ -761,6 +798,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
                     selected={selectedIds.has(item.id)}
                     onToggleSelect={handleToggleSelect}
                     onStartForward={handleStartForward}
+                    onAddSticker={handleAddStickerFromMessage}
                   />
                 </div>
               );
@@ -799,7 +837,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
 
       <div className="chat-composer px-4 py-3 border-t border-gray-700 bg-gray-900/50">
         <div className="flex items-end gap-2">
-          <div className="relative flex-shrink-0">
+          <div ref={emojiPopoverRef} className="relative flex-shrink-0">
             <button onClick={() => setShowEmoji(!showEmoji)} className="w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center" title="表情">
               <span className="text-lg">😀</span>
             </button>
@@ -826,14 +864,23 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
                         {customEmojis.map((path) => {
                           const name = path.replace(/\\/g, "/").split("/").pop() || "emoji";
                           return (
-                            <button
-                              key={path}
-                              onClick={() => sendSticker(path)}
-                              className="aspect-square rounded-lg hover:bg-gray-700 overflow-hidden border border-gray-700 bg-gray-900/60"
-                              title={name}
-                            >
-                              <EmojiThumb path={path} />
-                            </button>
+                            <div key={path} className="relative group aspect-square">
+                              <button
+                                onClick={() => sendSticker(path)}
+                                className="w-full h-full rounded-lg hover:bg-gray-700 overflow-hidden border border-gray-700 bg-gray-900/60"
+                                title={name}
+                              >
+                                <EmojiThumb path={path} />
+                              </button>
+                              <button
+                                disabled={deletingEmoji === path}
+                                onClick={(e) => { e.stopPropagation(); handleDeleteEmoji(path); }}
+                                className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-red-600 text-white text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 hover:bg-red-500 disabled:opacity-60 shadow"
+                                title="删除表情"
+                              >
+                                ×
+                              </button>
+                            </div>
                           );
                         })}
                         <button

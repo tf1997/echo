@@ -69,6 +69,10 @@ export async function addEmojiFile(sourcePath: string): Promise<string> {
   return await invoke("add_emoji_file", { sourcePath });
 }
 
+export async function deleteEmojiFile(filePath: string): Promise<void> {
+  await invoke("delete_emoji_file", { filePath });
+}
+
 export async function listRecentContacts(): Promise<StoredPeer[]> {
   return await invoke("list_recent_contacts");
 }
@@ -201,6 +205,5 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
 export async function downloadUpdate(): Promise<DownloadUpdateResult> {
   return await invoke("download_update_command");
 }
-
 
 

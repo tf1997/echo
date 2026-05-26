@@ -397,6 +397,7 @@ pub fn run() {
             commands::set_scan_subnets,
             commands::list_emoji_files,
             commands::add_emoji_file,
+            commands::delete_emoji_file,
             commands::list_recent_contacts,
             commands::remove_recent_contact,
             commands::create_group,

@@ -985,6 +985,21 @@ pub fn add_emoji_file(source_path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+pub fn delete_emoji_file(file_path: String) -> Result<(), String> {
+    let dir = emoji_dir();
+    let dir = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?;
+    let path = std::fs::canonicalize(&file_path).map_err(|e| e.to_string())?;
+    if !path.starts_with(&dir) {
+        return Err("invalid emoji path".to_string());
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+        return Err("invalid emoji file type".to_string());
+    }
+    std::fs::remove_file(path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn list_recent_contacts(state: State<'_, AppState>) -> Result<Vec<StoredPeer>, String> {
     log::info!("list_recent_contacts COMMAND called");
     let result = state.db.list_recent_contacts().await.map_err(|e| e.to_string())?;

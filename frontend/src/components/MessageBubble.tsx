@@ -20,6 +20,7 @@ interface MessageBubbleProps {
   selected?: boolean;
   onToggleSelect?: (message: ChatMessage) => void;
   onStartForward?: (message: ChatMessage) => void;
+  onAddSticker?: (message: ChatMessage) => Promise<void> | void;
 }
 
 export function DateDivider({ date }: { date: string }) {
@@ -160,12 +161,14 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
   );
 }
 
-export function MessageBubble({ message, isOwn, showSender = false, highlighted = false, selectMode = false, selected = false, onToggleSelect, onStartForward }: MessageBubbleProps) {
+export function MessageBubble({ message, isOwn, showSender = false, highlighted = false, selectMode = false, selected = false, onToggleSelect, onStartForward, onAddSticker }: MessageBubbleProps) {
   const isSticker = message.msg_type === "sticker";
   const isFile = message.msg_type === "file";
   const showPreview = isFile && isImageFile(message.file_name) && message.file_path;
   const [showMenu, setShowMenu] = useState(false);
+  const [addingSticker, setAddingSticker] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const canAddSticker = isSticker && !isOwn && !!message.file_path && !!onAddSticker;
 
   useEffect(() => {
     if (!showMenu) return;
@@ -194,6 +197,26 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
           >
             转发
           </button>
+          {canAddSticker && (
+            <button
+              disabled={addingSticker}
+              className="block w-full px-3 py-1 text-left text-xs text-gray-200 hover:bg-gray-700 rounded-lg whitespace-nowrap disabled:opacity-50"
+              onClick={async (e) => {
+                e.stopPropagation();
+                setAddingSticker(true);
+                try {
+                  await onAddSticker(message);
+                  setShowMenu(false);
+                } catch (error) {
+                  console.error("Failed to add sticker:", error);
+                } finally {
+                  setAddingSticker(false);
+                }
+              }}
+            >
+              {addingSticker ? "添加中..." : "添加到表情"}
+            </button>
+          )}
         </div>
       )}
 
