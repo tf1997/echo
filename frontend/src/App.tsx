@@ -243,7 +243,7 @@ function App() {
         port: item.port,
         online: item.is_online || graceKey > now,
       };
-      if (peer.online) {
+      if (item.is_online) {
         onlineGraceUntilRef.current.set(peer.id, now + onlineGraceMs);
       }
       const endpointKey = `${peer.ip}:${peer.port}`;
@@ -385,9 +385,15 @@ function App() {
         markRead(peer.id),
       ]);
       setMessages(conv);
-      checkPeerOnline(peer.ip, peer.port).then((online) => {
+      checkPeerOnline(peer.id, peer.ip, peer.port).then((online) => {
+        if (!online) {
+          onlineGraceUntilRef.current.delete(peer.id);
+        }
         setPeers((prev) =>
           prev.map((p) => (p.id === peer.id ? { ...p, online } : p))
+        );
+        setSelectedPeer((current) =>
+          current?.id === peer.id ? { ...current, online } : current
         );
       });
     } catch (err) {

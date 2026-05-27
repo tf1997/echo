@@ -441,15 +441,15 @@ impl LanDiscovery {
                             if let Ok(ip) = entry.ip.parse::<IpAddr>() {
                                 peers_map.insert(
                                     entry.id.clone(),
-                                    Peer {
-                                        id: entry.id.clone(),
-                                        username: entry.username.clone(),
-                                        department: entry.department.clone(),
+                                    Peer::with_online(
+                                        entry.id.clone(),
+                                        entry.username.clone(),
+                                        entry.department.clone(),
                                         ip,
-                                        port: entry.port,
-                                        online: true,
-                                        last_seen: now,
-                                    },
+                                        entry.port,
+                                        false,
+                                        0,
+                                    ),
                                 );
                                 relayed.push(entry.clone());
                                 info!(

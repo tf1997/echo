@@ -194,8 +194,8 @@ export async function searchMessages(query: string): Promise<SearchResult[]> {
   return await invoke("search_messages", { query });
 }
 
-export async function checkPeerOnline(ip: string, port: number): Promise<boolean> {
-  return await invoke("check_peer_online", { ip, port });
+export async function checkPeerOnline(peerId: string, ip: string, port: number): Promise<boolean> {
+  return await invoke("check_peer_online", { peerId, ip, port });
 }
 
 export async function checkForUpdates(): Promise<UpdateCheckResult> {
@@ -205,5 +205,4 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
 export async function downloadUpdate(): Promise<DownloadUpdateResult> {
   return await invoke("download_update_command");
 }
-
 

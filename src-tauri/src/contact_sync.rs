@@ -135,12 +135,14 @@ fn merge_into_memory(
             if !map.contains_key(&entry.peer_id) {
                 map.insert(
                     entry.peer_id.clone(),
-                    Peer::new(
+                    Peer::with_online(
                         entry.peer_id.clone(),
                         entry.username.clone(),
                         entry.department.clone(),
                         ip,
                         entry.port,
+                        false,
+                        entry.version,
                     ),
                 );
             }

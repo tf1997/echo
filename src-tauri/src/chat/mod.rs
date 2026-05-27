@@ -313,9 +313,9 @@ impl ChatServer {
                             for entry in &msg.known_peers {
                                 if entry.id != my_id && !map.contains_key(&entry.id) {
                                     if let Ok(entry_ip) = entry.ip.parse::<std::net::IpAddr>() {
-                                        let relay = Peer::new(
+                                        let relay = Peer::with_online(
                                             entry.id.clone(), entry.username.clone(),
-                                            entry.department.clone(), entry_ip, entry.port,
+                                            entry.department.clone(), entry_ip, entry.port, false, 0,
                                         );
                                         map.insert(entry.id.clone(), relay.clone());
                                         info!("Chat relay: discovered {} via {}", entry.username, msg.sender_name);

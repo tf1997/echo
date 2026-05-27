@@ -673,6 +673,8 @@ pub async fn discover_by_ip(
 
 #[tauri::command]
 pub async fn check_peer_online(
+    state: State<'_, AppState>,
+    peer_id: String,
     ip: String,
     port: u16,
 ) -> Result<bool, String> {
@@ -684,6 +686,34 @@ pub async fn check_peer_online(
     .await
     .map(|r| r.is_ok())
     .unwrap_or(false);
+
+    let stored = state
+        .db
+        .get_stored_peer(&peer_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let username = stored
+        .as_ref()
+        .map(|peer| peer.username.clone())
+        .unwrap_or_default();
+    let department = stored
+        .as_ref()
+        .map(|peer| peer.department.clone())
+        .unwrap_or_default();
+
+    if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
+        if online {
+            runtime.discovery.write().await.touch_peer(&peer_id);
+        } else {
+            runtime.discovery.write().await.set_online(&peer_id, false);
+        }
+    }
+
+    let _ = state
+        .db
+        .upsert_peer(&peer_id, &username, &department, &ip, port, online)
+        .await;
+
     Ok(online)
 }
 
