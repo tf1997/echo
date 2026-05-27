@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import type { ChatMessage, Peer } from "../types";
 import type { GroupInfo } from "../api";
-import { MessageBubble, DateDivider, formatDateLabel } from "./MessageBubble";
+import { MessageBubble, DateDivider, formatDateLabel, makeSearchHitId } from "./MessageBubble";
 import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, readFileBase64, sendMessage, sendMessageTyped, sendGroupMessage, sendGroupMessageTyped, renameGroup, leaveGroup, dissolveGroup, inviteToGroup } from "../api";
 import type { ForwardCardData } from "./MessageBubble";
 import { open } from "@tauri-apps/api/dialog";
@@ -37,6 +37,37 @@ interface ChatWindowProps {
 }
 
 let pendingId = Date.now();
+
+interface TextSearchHit {
+  id: string;
+  messageId: number;
+  occurrenceIndex: number;
+}
+
+function getTextSearchHits(messages: ChatMessage[], query: string): TextSearchHit[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [];
+
+  const hits: TextSearchHit[] = [];
+  for (const message of messages) {
+    if (message.msg_type !== "text") continue;
+    const haystack = message.content.toLowerCase();
+    let cursor = 0;
+    let occurrenceIndex = 0;
+    let matchIndex = haystack.indexOf(needle, cursor);
+    while (matchIndex !== -1) {
+      hits.push({
+        id: makeSearchHitId(message.id, occurrenceIndex),
+        messageId: message.id,
+        occurrenceIndex,
+      });
+      occurrenceIndex += 1;
+      cursor = matchIndex + needle.length;
+      matchIndex = haystack.indexOf(needle, cursor);
+    }
+  }
+  return hits;
+}
 
 async function readFileAndSave(file: File): Promise<string> {
   const buffer = await file.arrayBuffer();
@@ -624,6 +655,24 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     return getTime(a) - getTime(b);
   });
 
+  const searchHits = getTextSearchHits(messages, searchQuery);
+  const totalSearchHits = searchHits.length;
+  const clampedSearchIndex = totalSearchHits > 0 ? Math.min(searchIndex, totalSearchHits - 1) : 0;
+  const currentSearchHit = searchHits[clampedSearchIndex];
+  const searchMatchIds = new Set(searchHits.map((hit) => hit.messageId));
+  const scrollToSearchHit = (idx: number) => {
+    const hit = searchHits[idx];
+    if (!hit) return;
+    requestAnimationFrame(() => {
+      const hitEl = messagesContainerRef.current?.querySelector<HTMLElement>(`[data-search-hit-id="${hit.id}"]`);
+      if (hitEl) {
+        hitEl.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+        return;
+      }
+      messageRefs.current.get(hit.messageId)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  };
+
   return (
     <div className="flex-1 flex h-full min-w-0">
     <div
@@ -677,15 +726,6 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
         )}
       </div>
       {showSearch && (() => {
-        const textMessages = messages.filter((m) => m.msg_type === "text" && searchQuery && m.content.toLowerCase().includes(searchQuery.toLowerCase()));
-        const total = textMessages.length;
-        const clampedIndex = total > 0 ? Math.min(searchIndex, total - 1) : 0;
-        const scrollToMatch = (idx: number) => {
-          const msg = textMessages[idx];
-          if (!msg) return;
-          const el = messageRefs.current.get(msg.id);
-          el?.scrollIntoView({ behavior: "smooth", block: "center" });
-        };
         return (
           <div className="flex items-center gap-2 px-4 py-2 bg-gray-900/60 border-b border-gray-700">
             <input
@@ -695,10 +735,10 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   e.preventDefault();
-                  if (total === 0) return;
-                  const next = (clampedIndex + 1) % total;
+                  if (totalSearchHits === 0) return;
+                  const next = (clampedSearchIndex + 1) % totalSearchHits;
                   setSearchIndex(next);
-                  scrollToMatch(next);
+                  scrollToSearchHit(next);
                 }
                 if (e.key === "Escape") { setShowSearch(false); setSearchQuery(""); }
               }}
@@ -706,12 +746,12 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
               className="flex-1 bg-gray-700 text-white text-sm rounded-lg px-3 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-400"
             />
             {searchQuery && (
-              <span className="text-xs text-gray-400 flex-shrink-0">{total > 0 ? `${clampedIndex + 1}/${total}` : "无结果"}</span>
+              <span className="text-xs text-gray-400 flex-shrink-0">{totalSearchHits > 0 ? `${clampedSearchIndex + 1}/${totalSearchHits}` : "无结果"}</span>
             )}
-            <button disabled={total === 0} onClick={() => { const prev = (clampedIndex - 1 + total) % total; setSearchIndex(prev); scrollToMatch(prev); }} className="text-gray-400 hover:text-white disabled:opacity-30">
+            <button disabled={totalSearchHits === 0} onClick={() => { const prev = (clampedSearchIndex - 1 + totalSearchHits) % totalSearchHits; setSearchIndex(prev); scrollToSearchHit(prev); }} className="text-gray-400 hover:text-white disabled:opacity-30">
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" /></svg>
             </button>
-            <button disabled={total === 0} onClick={() => { const next = (clampedIndex + 1) % total; setSearchIndex(next); scrollToMatch(next); }} className="text-gray-400 hover:text-white disabled:opacity-30">
+            <button disabled={totalSearchHits === 0} onClick={() => { const next = (clampedSearchIndex + 1) % totalSearchHits; setSearchIndex(next); scrollToSearchHit(next); }} className="text-gray-400 hover:text-white disabled:opacity-30">
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
             </button>
           </div>
@@ -725,13 +765,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
             <p className="text-xs mt-1">向 {peer.username} 发送第一条消息吧</p>
           </div>
         ) : (() => {
-          const searchMatches = searchQuery
-            ? new Set(messages.filter((m) => m.msg_type === "text" && m.content.toLowerCase().includes(searchQuery.toLowerCase())).map((m) => m.id))
-            : new Set<number>();
-          const textMatches = searchQuery
-            ? messages.filter((m) => m.msg_type === "text" && m.content.toLowerCase().includes(searchQuery.toLowerCase()))
-            : [];
-          const highlightedId = textMatches[Math.min(searchIndex, textMatches.length - 1)]?.id;
+          const highlightedId = currentSearchHit?.messageId;
           let lastDateLabel = "";
           return allItems.map((item) => {
             const elements: React.ReactNode[] = [];
@@ -745,7 +779,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
             if ("status" in item) {
               const isPendingSticker = item.msg_type === "sticker" && !!item.file_path;
               elements.push(
-                <div key={`pending-${item.id}`} className="flex justify-end mb-3 px-4">
+                <div key={`pending-${item.id}`} className="message-row flex justify-end mb-3 px-4">
                   <div className="max-w-[70%] flex flex-col items-end">
                     <div className={`${isPendingSticker ? "overflow-hidden rounded-xl" : "rounded-2xl px-4 py-2.5 rounded-br-md"} ${
                       item.status === "failed"
@@ -793,7 +827,9 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
                     message={item}
                     isOwn={item.sender_id === myId}
                     showSender={isGroup}
-                    highlighted={searchMatches.has(item.id) && item.id === highlightedId}
+                    highlighted={searchMatchIds.has(item.id) && item.id === highlightedId}
+                    searchQuery={searchMatchIds.has(item.id) ? searchQuery : ""}
+                    activeSearchHitId={item.id === highlightedId ? currentSearchHit?.id : undefined}
                     selectMode={selectMode}
                     selected={selectedIds.has(item.id)}
                     onToggleSelect={handleToggleSelect}
@@ -864,8 +900,9 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
                         {customEmojis.map((path) => {
                           const name = path.replace(/\\/g, "/").split("/").pop() || "emoji";
                           return (
-                            <div key={path} className="relative group aspect-square">
+                            <div key={path} className="custom-emoji-tile group aspect-square">
                               <button
+                                type="button"
                                 onClick={() => sendSticker(path)}
                                 className="w-full h-full rounded-lg hover:bg-gray-700 overflow-hidden border border-gray-700 bg-gray-900/60"
                                 title={name}
@@ -873,12 +910,16 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
                                 <EmojiThumb path={path} />
                               </button>
                               <button
+                                type="button"
                                 disabled={deletingEmoji === path}
                                 onClick={(e) => { e.stopPropagation(); handleDeleteEmoji(path); }}
-                                className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-red-600 text-white text-xs leading-none flex items-center justify-center opacity-0 group-hover:opacity-100 hover:bg-red-500 disabled:opacity-60 shadow"
+                                className="custom-emoji-delete"
                                 title="删除表情"
+                                aria-label={`删除表情 ${name}`}
                               >
-                                ×
+                                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 6l12 12M18 6L6 18" />
+                                </svg>
                               </button>
                             </div>
                           );

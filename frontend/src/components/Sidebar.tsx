@@ -312,13 +312,13 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
 
       {/* Manual IP search */}
       <div className="px-4 pb-2">
-        <div className="flex gap-1">
+        <div className="grid grid-cols-[minmax(0,1fr)_4.25rem_auto] gap-2">
           <input
             type="text"
             value={manualIp}
             onChange={(e) => setManualIp(e.target.value)}
             placeholder="IP 地址"
-            className="flex-1 bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
+            className="min-w-0 bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
             onKeyDown={(e) => { if (e.key === "Enter") handleDiscoverIp(); }}
           />
           <input
@@ -326,13 +326,13 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
             value={manualPort}
             onChange={(e) => setManualPort(e.target.value)}
             placeholder="9527"
-            className="w-14 bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
+            className="min-w-0 bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
             onKeyDown={(e) => { if (e.key === "Enter") handleDiscoverIp(); }}
           />
           <button
             onClick={handleDiscoverIp}
             disabled={searchingIp}
-            className="px-2 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 whitespace-nowrap"
+            className="px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 whitespace-nowrap"
           >
             {searchingIp ? "..." : "查找"}
           </button>
@@ -537,8 +537,8 @@ function PeerItem({ peer, isSelected, unread, onClick }: { peer: Peer; isSelecte
   return (
     <button
       onClick={onClick}
-      className={`w-full flex items-center gap-3 px-4 py-3 transition-colors ${
-        isSelected ? "bg-indigo-600/30 border-l-2 border-indigo-400" : "hover:bg-gray-800 border-l-2 border-transparent"
+      className={`sidebar-list-item w-full flex items-center gap-3 px-4 py-3 transition-colors ${
+        isSelected ? "sidebar-list-item-active bg-indigo-600/30 border-l-2 border-indigo-400" : "hover:bg-gray-800 border-l-2 border-transparent"
       }`}
     >
       <div className="relative">
@@ -567,7 +567,7 @@ function GroupItem({ group, isSelected, onSelect }: { group: GroupInfo; isSelect
   const sender = group.last_message_sender;
   const time = group.last_message_at ? new Date(group.last_message_at).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
   return (
-    <div className={`flex items-stretch ${isSelected ? "bg-indigo-600/20 border-l-2 border-indigo-400" : "border-l-2 border-transparent hover:bg-gray-800"}`}>
+    <div className={`sidebar-list-item flex items-stretch ${isSelected ? "sidebar-list-item-active bg-indigo-600/20 border-l-2 border-indigo-400" : "border-l-2 border-transparent hover:bg-gray-800"}`}>
       <button onClick={onSelect} className="flex-1 min-w-0 text-left px-4 py-3 flex items-center gap-3">
         <div className="relative flex-shrink-0">
           <div className="w-9 h-9 rounded-full bg-indigo-700 flex items-center justify-center text-base">👥</div>

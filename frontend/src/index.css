@@ -561,6 +561,159 @@ body {
   box-shadow: 0 22px 55px var(--echo-shadow) !important;
 }
 
+.message-row {
+  width: min(100%, 1080px);
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.message-search-hit {
+  padding: 0 2px;
+  border-radius: 4px;
+  background: rgb(250 204 21 / 0.34);
+  background: color-mix(in srgb, var(--echo-warning) 34%, transparent);
+  color: inherit;
+  box-shadow: inset 0 -1px 0 rgb(250 204 21 / 0.58);
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.message-bubble-own .message-search-hit {
+  background: rgb(255 255 255 / 0.28);
+  color: inherit;
+  box-shadow: inset 0 -1px 0 rgb(255 255 255 / 0.58);
+}
+
+.message-search-hit-current {
+  background: rgb(250 204 21 / 0.62);
+  background: color-mix(in srgb, var(--echo-warning) 62%, white 8%);
+  color: #1f2937;
+  box-shadow: 0 0 0 1px rgb(202 138 4 / 0.42), inset 0 -1px 0 rgb(120 53 15 / 0.28);
+}
+
+.message-bubble-own .message-search-hit-current {
+  background: rgb(255 255 255 / 0.46);
+  color: inherit;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.7), inset 0 -1px 0 rgb(255 255 255 / 0.76);
+}
+
+:root[data-theme="wechat"] .message-bubble-other .message-search-hit,
+:root[data-theme="daylight"] .message-bubble-other .message-search-hit {
+  background: rgb(255 215 64 / 0.48);
+  box-shadow: inset 0 -1px 0 rgb(180 128 18 / 0.32);
+}
+
+:root[data-theme="wechat"] .message-bubble-other .message-search-hit-current,
+:root[data-theme="daylight"] .message-bubble-other .message-search-hit-current {
+  background: rgb(255 215 64 / 0.72);
+  box-shadow: 0 0 0 1px rgb(180 128 18 / 0.34), inset 0 -1px 0 rgb(180 128 18 / 0.36);
+}
+
+.date-divider {
+  margin-top: 14px;
+  margin-bottom: 14px;
+}
+
+.date-divider span {
+  padding: 2px 9px;
+  border: 1px solid var(--echo-border);
+  border-radius: 999px;
+  background: var(--echo-bg-soft);
+}
+
+.sidebar-list-item {
+  border-left-width: 3px;
+}
+
+.sidebar-list-item-active {
+  background: linear-gradient(90deg, var(--echo-accent-soft) 0%, rgb(255 255 255 / 0) 82%) !important;
+  border-left-color: var(--echo-accent) !important;
+}
+
+.sidebar-list-item-active > .relative > .rounded-full,
+.sidebar-list-item-active button > .relative > .rounded-full {
+  box-shadow: 0 0 0 2px var(--echo-accent-soft);
+}
+
+.custom-emoji-tile {
+  position: relative;
+}
+
+.custom-emoji-delete {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  display: flex;
+  width: 22px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgb(255 255 255 / 0.2);
+  border-radius: 999px;
+  background: rgb(15 23 42 / 0.66);
+  color: #ffffff;
+  opacity: 0;
+  box-shadow: 0 6px 16px rgb(0 0 0 / 0.2);
+  transform: scale(0.86);
+  transition: opacity 140ms ease, transform 140ms ease, background-color 140ms ease, border-color 140ms ease;
+  backdrop-filter: blur(8px);
+}
+
+.custom-emoji-tile:hover .custom-emoji-delete,
+.custom-emoji-tile:focus-within .custom-emoji-delete,
+.custom-emoji-delete:focus-visible {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.custom-emoji-delete:hover {
+  border-color: rgb(255 255 255 / 0.28);
+  background: var(--echo-danger);
+}
+
+.custom-emoji-delete:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+:root[data-theme="wechat"] .custom-emoji-delete,
+:root[data-theme="daylight"] .custom-emoji-delete {
+  border-color: rgb(15 23 42 / 0.08);
+  background: rgb(255 255 255 / 0.88);
+  color: var(--echo-danger);
+  box-shadow: 0 6px 18px rgb(31 31 31 / 0.12);
+}
+
+:root[data-theme="wechat"] .custom-emoji-delete:hover,
+:root[data-theme="daylight"] .custom-emoji-delete:hover {
+  border-color: var(--echo-danger);
+  background: var(--echo-danger);
+  color: #ffffff;
+}
+
+.context-menu {
+  min-width: 112px;
+  overflow: hidden;
+  border-color: var(--echo-border-soft) !important;
+  background: var(--echo-panel-strong) !important;
+  box-shadow: 0 16px 38px var(--echo-shadow) !important;
+}
+
+.context-menu button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 0;
+  color: var(--echo-text-soft) !important;
+  text-align: left;
+}
+
+.context-menu button:hover {
+  background-color: var(--echo-control-hover) !important;
+  color: var(--echo-text) !important;
+}
+
 input,
 textarea,
 select,

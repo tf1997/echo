@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
+import type { ReactNode } from "react";
 import type { ChatMessage } from "../types";
 import { readFileBase64, openFile, openFolder } from "../api";
 import { WebviewWindow } from "@tauri-apps/api/window";
@@ -16,6 +17,8 @@ interface MessageBubbleProps {
   isOwn: boolean;
   showSender?: boolean;
   highlighted?: boolean;
+  searchQuery?: string;
+  activeSearchHitId?: string;
   selectMode?: boolean;
   selected?: boolean;
   onToggleSelect?: (message: ChatMessage) => void;
@@ -25,7 +28,7 @@ interface MessageBubbleProps {
 
 export function DateDivider({ date }: { date: string }) {
   return (
-    <div className="flex items-center gap-3 px-4 my-2">
+    <div className="message-row date-divider flex items-center gap-3 px-4 my-2">
       <div className="flex-1 h-px bg-gray-700" />
       <span className="text-[11px] text-gray-500 select-none">{date}</span>
       <div className="flex-1 h-px bg-gray-700" />
@@ -66,12 +69,83 @@ function isImageFile(name: string | null): boolean {
   return ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tiff"].includes(ext);
 }
 
+function getCopyableBubbleText(message: ChatMessage): string {
+  return message.msg_type === "text" ? message.content : "";
+}
+
+export function makeSearchHitId(messageId: number, occurrenceIndex: number): string {
+  return `search-hit-${messageId}-${occurrenceIndex}`;
+}
+
+function renderTextWithSearchHighlights(text: string, query: string, messageId: number, activeSearchHitId?: string): ReactNode {
+  const needle = query.trim();
+  if (!needle) return text;
+
+  const lowerText = text.toLowerCase();
+  const lowerNeedle = needle.toLowerCase();
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  let matchIndex = lowerText.indexOf(lowerNeedle, cursor);
+  let occurrenceIndex = 0;
+
+  while (matchIndex !== -1) {
+    if (matchIndex > cursor) {
+      parts.push(text.slice(cursor, matchIndex));
+    }
+    const endIndex = matchIndex + needle.length;
+    const hitId = makeSearchHitId(messageId, occurrenceIndex);
+    parts.push(
+      <mark
+        key={hitId}
+        className={`message-search-hit ${hitId === activeSearchHitId ? "message-search-hit-current" : ""}`}
+        data-search-hit-id={hitId}
+      >
+        {text.slice(matchIndex, endIndex)}
+      </mark>
+    );
+    occurrenceIndex += 1;
+    cursor = endIndex;
+    matchIndex = lowerText.indexOf(lowerNeedle, cursor);
+  }
+
+  if (cursor < text.length) {
+    parts.push(text.slice(cursor));
+  }
+
+  return parts.length > 0 ? parts : text;
+}
+
 function handleOpenFile(filePath: string | null) {
   if (filePath) openFile(filePath).catch(console.error);
 }
 
 function handleOpenFolder(filePath: string | null) {
   if (filePath) openFolder(filePath).catch(console.error);
+}
+
+async function copyTextToClipboard(text: string) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch {
+    // Fall back to a temporary textarea below.
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    document.execCommand("copy");
+  } finally {
+    document.body.removeChild(textarea);
+  }
 }
 
 function ImagePreview({ filePath, fileSize }: { filePath: string; fileSize: number | null }) {
@@ -161,13 +235,16 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
   );
 }
 
-export function MessageBubble({ message, isOwn, showSender = false, highlighted = false, selectMode = false, selected = false, onToggleSelect, onStartForward, onAddSticker }: MessageBubbleProps) {
+export function MessageBubble({ message, isOwn, showSender = false, highlighted = false, searchQuery = "", activeSearchHitId, selectMode = false, selected = false, onToggleSelect, onStartForward, onAddSticker }: MessageBubbleProps) {
   const isSticker = message.msg_type === "sticker";
   const isFile = message.msg_type === "file";
   const showPreview = isFile && isImageFile(message.file_name) && message.file_path;
   const [showMenu, setShowMenu] = useState(false);
+  const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null);
   const [addingSticker, setAddingSticker] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const copyableText = getCopyableBubbleText(message);
+  const canCopyText = copyableText.length > 0;
   const canAddSticker = isSticker && !isOwn && !!message.file_path && !!onAddSticker;
 
   useEffect(() => {
@@ -175,22 +252,63 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
     const handler = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) setShowMenu(false);
     };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setShowMenu(false);
+    };
     document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handler);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
   }, [showMenu]);
+
+  useLayoutEffect(() => {
+    if (!showMenu || !menuPosition || !menuRef.current) return;
+    const padding = 8;
+    const rect = menuRef.current.getBoundingClientRect();
+    const nextX = Math.min(Math.max(padding, menuPosition.x), window.innerWidth - rect.width - padding);
+    const nextY = Math.min(Math.max(padding, menuPosition.y), window.innerHeight - rect.height - padding);
+    if (nextX !== menuPosition.x || nextY !== menuPosition.y) {
+      setMenuPosition({ x: nextX, y: nextY });
+    }
+  }, [showMenu, menuPosition]);
 
   return (
     <div
-      className={`flex ${isOwn ? "justify-end" : "justify-start"} mb-3 px-4 group relative ${highlighted ? "bg-indigo-900/30 rounded-lg" : ""} ${selected ? "bg-indigo-900/20 rounded-lg" : ""} ${selectMode ? "cursor-pointer" : ""}`}
+      className={`message-row flex ${isOwn ? "justify-end" : "justify-start"} mb-3 px-4 group relative ${highlighted ? "bg-indigo-900/30 rounded-lg" : ""} ${selected ? "bg-indigo-900/20 rounded-lg" : ""} ${selectMode ? "cursor-pointer" : ""}`}
       onClick={() => { if (selectMode) onToggleSelect?.(message); }}
-      onContextMenu={(e) => { if (!selectMode) { e.preventDefault(); setShowMenu(true); } }}
+      onContextMenu={(e) => {
+        if (!selectMode) {
+          e.preventDefault();
+          setMenuPosition({ x: e.clientX, y: e.clientY });
+          setShowMenu(true);
+        }
+      }}
     >
-      {/* Floating menu above the bubble, not overlapping it */}
-      {showMenu && (
+      {showMenu && menuPosition && (
         <div
           ref={menuRef}
-          className={`absolute bottom-full ${isOwn ? "right-4" : "left-4"} mb-1 z-50 bg-gray-900 border border-gray-600 rounded-lg shadow-xl py-1`}
+          className="context-menu fixed z-50 bg-gray-900 border border-gray-600 rounded-lg shadow-xl py-1"
+          style={{ left: menuPosition.x, top: menuPosition.y }}
         >
+          {canCopyText && (
+            <button
+              className="px-3 py-1 text-xs text-gray-200 hover:bg-gray-700 rounded-lg whitespace-nowrap"
+              onClick={async (e) => {
+                e.stopPropagation();
+                try {
+                  await copyTextToClipboard(copyableText);
+                } catch (error) {
+                  console.error("Failed to copy message:", error);
+                } finally {
+                  setShowMenu(false);
+                }
+              }}
+            >
+              复制文字
+            </button>
+          )}
           <button
             className="px-3 py-1 text-xs text-gray-200 hover:bg-gray-700 rounded-lg whitespace-nowrap"
             onClick={(e) => { e.stopPropagation(); onStartForward?.(message); setShowMenu(false); }}
@@ -271,7 +389,7 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
               </button>
             </div>
           ) : (
-            <p className="text-sm whitespace-pre-wrap break-words">{message.content}</p>
+            <p className="text-sm whitespace-pre-wrap break-words">{renderTextWithSearchHighlights(message.content, searchQuery, message.id, activeSearchHitId)}</p>
           )}
         </div>
         <span className={`text-[10px] text-gray-500 mt-1 ${isOwn ? "mr-1" : "ml-1"}`}>
