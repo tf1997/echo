@@ -59,3 +59,6 @@ rand = "0.8"
 
 # Socket options (SO_REUSEADDR, SO_REUSEPORT)
 socket2 = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_System_EventLog"] }

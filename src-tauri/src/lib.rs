@@ -5,12 +5,14 @@ mod db;
 mod discovery;
 mod state;
 mod tray;
+mod windows_event_log;
 pub mod updater;
 
 use db::Database;
 use log::info;
 use crate::discovery::{Peer, PeerEntry};
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{CustomMenuItem, Manager, Menu, Submenu};
@@ -27,34 +29,104 @@ fn app_menu() -> Menu {
     ))
 }
 
-pub fn run() {
-    // ── File logger with size-based truncation ─────────────────────────
-    let log_dir = std::env::var("ECHO_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".echo"))
-                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        });
-    std::fs::create_dir_all(&log_dir).ok();
+fn startup_log_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("ECHO_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
 
-    flexi_logger::Logger::try_with_str("info")
-        .expect("failed to parse log level")
+    #[cfg(windows)]
+    {
+        if let Ok(dir) = std::env::var("LOCALAPPDATA").or_else(|_| std::env::var("APPDATA")) {
+            return PathBuf::from(dir).join("Echo");
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".echo");
+    }
+
+    std::env::temp_dir().join("echo")
+}
+
+fn append_crash_log(log_dir: &Path, message: &str) {
+    let timestamp = chrono::Local::now().to_rfc3339();
+    let entry = format!("[{}] {}\n", timestamp, message);
+
+    let _ = std::fs::create_dir_all(log_dir);
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("crash.log"))
+        .and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(entry.as_bytes())
+        });
+
+    windows_event_log::write_error(&entry);
+}
+
+fn install_panic_logger(log_dir: PathBuf) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let payload = panic_info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|value| (*value).to_string())
+            .or_else(|| {
+                panic_info
+                    .payload()
+                    .downcast_ref::<String>()
+                    .cloned()
+            })
+            .unwrap_or_else(|| "unknown panic payload".to_string());
+        let location = panic_info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+
+        append_crash_log(&log_dir, &format!("panic at {}: {}", location, payload));
+        default_hook(panic_info);
+    }));
+}
+
+fn init_file_logger(log_dir: &Path) {
+    if let Err(error) = std::fs::create_dir_all(log_dir) {
+        append_crash_log(log_dir, &format!("failed to create log dir: {}", error));
+    }
+
+    let logger = match flexi_logger::Logger::try_with_str("info") {
+        Ok(logger) => logger,
+        Err(error) => {
+            append_crash_log(log_dir, &format!("failed to parse log level: {}", error));
+            return;
+        }
+    };
+
+    if let Err(error) = logger
         .log_to_file(
             flexi_logger::FileSpec::default()
-                .directory(&log_dir)
+                .directory(log_dir)
                 .basename("echo"),
         )
         .rotate(
-            flexi_logger::Criterion::Size(5 * 1024 * 1024), // 5 MB
+            flexi_logger::Criterion::Size(5 * 1024 * 1024),
             flexi_logger::Naming::Numbers,
-            flexi_logger::Cleanup::KeepLogFiles(0), // don't keep old — clear & restart
+            flexi_logger::Cleanup::KeepLogFiles(0),
         )
         .duplicate_to_stderr(flexi_logger::Duplicate::All)
         .format_for_files(flexi_logger::detailed_format)
         .format_for_stderr(flexi_logger::colored_default_format)
         .start()
-        .expect("failed to start logger");
+    {
+        append_crash_log(log_dir, &format!("failed to start logger: {}", error));
+    }
+}
+
+pub fn run() {
+    // ── File logger with size-based truncation ─────────────────────────
+    let log_dir = startup_log_dir();
+    install_panic_logger(log_dir.clone());
+    init_file_logger(&log_dir);
 
     tauri::Builder::default()
         .menu(app_menu())
@@ -78,7 +150,7 @@ pub fn run() {
                 .unwrap_or_else(|_| {
                     app.path_resolver()
                         .app_data_dir()
-                        .expect("Failed to get app data dir")
+                        .unwrap_or_else(|| startup_log_dir())
                 });
             std::fs::create_dir_all(&app_data_dir).ok();
 
