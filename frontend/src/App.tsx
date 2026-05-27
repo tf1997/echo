@@ -16,6 +16,7 @@ import {
   sendFile,
   sendSticker,
   markRead,
+  setTrayUnreadAttention,
   checkPeerOnline,
   getDepartments,
   saveProfile,
@@ -68,6 +69,7 @@ function App() {
   const unreadInitRef = useRef(true);
   const groupUnreadInitRef = useRef(true);
   const onlineGraceUntilRef = useRef(new Map<string, number>());
+  const unreadAttentionActiveRef = useRef<boolean | null>(null);
 
   // Silent WAV (1 sample) — used only to unlock autoplay policy on first click
   const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
@@ -226,6 +228,16 @@ function App() {
       prevGroupUnreadRef.current.set(g.group_id, cur);
     }
   }, [groups, playNotificationSound]);
+
+  useEffect(() => {
+    if (!appInfo?.initialized) return;
+    const contactUnread = unreadCounts.reduce((sum, uc) => sum + uc.count, 0);
+    const groupUnread = groups.reduce((sum, group) => sum + (group.unread_count || 0), 0);
+    const active = contactUnread + groupUnread > 0;
+    if (unreadAttentionActiveRef.current === active) return;
+    unreadAttentionActiveRef.current = active;
+    setTrayUnreadAttention(active).catch(console.error);
+  }, [appInfo?.initialized, unreadCounts, groups]);
 
   const mergePeers = useCallback((onlinePeers: Peer[], stored: StoredPeer[]): Peer[] => {
     const map = new Map<string, Peer>();

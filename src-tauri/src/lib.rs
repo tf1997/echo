@@ -4,6 +4,7 @@ mod contact_sync;
 mod db;
 mod discovery;
 mod state;
+mod tray;
 pub mod updater;
 
 use db::Database;
@@ -57,10 +58,14 @@ pub fn run() {
 
     tauri::Builder::default()
         .menu(app_menu())
+        .system_tray(tray::system_tray(MENU_CHECK_UPDATE))
         .on_menu_event(|event| {
             if event.menu_item_id() == MENU_CHECK_UPDATE {
                 let _ = event.window().emit("menu-check-update", ());
             }
+        })
+        .on_system_tray_event(|app, event| {
+            tray::handle_tray_event(app, event, MENU_CHECK_UPDATE);
         })
         .setup(move |app| {
             let listen_port = std::env::var("ECHO_PORT")
@@ -386,6 +391,7 @@ pub fn run() {
             commands::get_conversation,
             commands::mark_read,
             commands::get_unread_counts,
+            commands::set_tray_unread_attention,
             commands::save_temp_file,
             commands::read_file_base64,
             commands::open_file,

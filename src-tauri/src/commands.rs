@@ -1,6 +1,6 @@
 use log::{error, info};
 use serde::{Deserialize, Serialize};
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
 use std::sync::Arc;
 
 use crate::chat::{send_file_in_background_with_kind, WireMessage};
@@ -746,6 +746,11 @@ pub async fn get_unread_counts(state: State<'_, AppState>) -> Result<Vec<UnreadC
         .get_unread_counts(&runtime.my_id)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_tray_unread_attention(app: AppHandle, active: bool) -> Result<(), String> {
+    crate::tray::set_unread_attention(&app, active).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

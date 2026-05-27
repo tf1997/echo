@@ -8,7 +8,7 @@ tauri-build = { version = "1", features = [] }
 
 [dependencies]
 # Tauri
-tauri = { version = "1.8.3", features = ["dialog-all", "shell-open", "window-all", "window-data-url", "protocol-asset"] }
+tauri = { version = "1.8.3", features = ["dialog-all", "shell-open", "system-tray", "window-all", "window-data-url", "protocol-asset"] }
 
 # mDNS service discovery
 mdns-sd = "0.13"

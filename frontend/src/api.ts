@@ -49,6 +49,10 @@ export async function getUnreadCounts(): Promise<UnreadCount[]> {
   return await invoke("get_unread_counts");
 }
 
+export async function setTrayUnreadAttention(active: boolean): Promise<void> {
+  await invoke("set_tray_unread_attention", { active });
+}
+
 export async function getScanSubnets(): Promise<string[]> {
   return await invoke("get_scan_subnets");
 }
@@ -205,4 +209,3 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
 export async function downloadUpdate(): Promise<DownloadUpdateResult> {
   return await invoke("download_update_command");
 }
-
