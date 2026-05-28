@@ -2,7 +2,8 @@ param(
   [switch]$Build,
   [string]$Arch = "x64",
   [string]$Version = "",
-  [string]$OutputRoot = ""
+  [string]$OutputRoot = "",
+  [string]$WebView2RuntimePath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,6 +50,35 @@ function Find-WebView2Loader {
   return ($all | Select-Object -First 1).FullName
 }
 
+function Resolve-WebView2Runtime {
+  param([string]$RuntimePath)
+
+  if (-not $RuntimePath -and $env:WEBVIEW2_FIXED_RUNTIME_PATH) {
+    $RuntimePath = $env:WEBVIEW2_FIXED_RUNTIME_PATH
+  }
+  if (-not $RuntimePath) {
+    return $null
+  }
+  if (-not (Test-Path $RuntimePath -PathType Container)) {
+    throw "WebView2 fixed runtime path does not exist: $RuntimePath"
+  }
+
+  $resolved = (Resolve-Path $RuntimePath).Path
+  if (Test-Path (Join-Path $resolved "msedgewebview2.exe")) {
+    return $resolved
+  }
+
+  $child = Get-ChildItem -Path $resolved -Directory -ErrorAction SilentlyContinue |
+    Where-Object { Test-Path (Join-Path $_.FullName "msedgewebview2.exe") } |
+    Select-Object -First 1
+
+  if ($child) {
+    return $child.FullName
+  }
+
+  throw "WebView2 fixed runtime path must contain msedgewebview2.exe: $RuntimePath"
+}
+
 if ($Build) {
   Push-Location $FrontendDir
   npm run build
@@ -69,6 +99,7 @@ if (-not (Test-Path $ExePath)) {
 }
 
 $LoaderPath = Find-WebView2Loader
+$RuntimePath = Resolve-WebView2Runtime $WebView2RuntimePath
 $PackageName = "Echo-$Version-windows-$Arch-portable"
 $StageDir = Join-Path $OutputRoot $PackageName
 $ZipPath = Join-Path $OutputRoot "$PackageName.zip"
@@ -80,6 +111,11 @@ New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
 
 Copy-Item $ExePath (Join-Path $StageDir "echo.exe") -Force
 Copy-Item $LoaderPath (Join-Path $StageDir "WebView2Loader.dll") -Force
+if ($RuntimePath) {
+  $RuntimeStageDir = Join-Path $StageDir "WebView2Runtime"
+  New-Item -ItemType Directory -Force -Path $RuntimeStageDir | Out-Null
+  Copy-Item (Join-Path $RuntimePath "*") $RuntimeStageDir -Recurse -Force
+}
 
 @{
   version = $Version
@@ -103,3 +139,8 @@ Write-Host "  size:   $ZipSize"
 Write-Host ""
 Write-Host "Included WebView2 loader:"
 Write-Host "  $LoaderPath"
+if ($RuntimePath) {
+  Write-Host ""
+  Write-Host "Included WebView2 fixed runtime:"
+  Write-Host "  $RuntimePath"
+}

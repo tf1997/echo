@@ -102,6 +102,14 @@ portable.json
 
 Keep `WebView2Loader.dll` next to `echo.exe`. Do not move it into a subfolder.
 
+If the target Windows machines may not have Microsoft Edge WebView2 Runtime installed, build the portable package with a fixed runtime:
+
+```powershell
+.\scripts\package-windows-portable.ps1 -Build -Arch x64 -WebView2RuntimePath "C:\path\to\Microsoft.WebView2.FixedVersionRuntime"
+```
+
+This adds a `WebView2Runtime` directory next to `echo.exe`; Echo will use it automatically at startup.
+
 ## macOS Portable
 
 Build on macOS:
@@ -150,7 +158,7 @@ cd ..\src-tauri
 cargo tauri build
 ```
 
-The Windows config currently uses `embedBootstrapper`, so the installer contains the WebView2 bootstrapper. If the target machines have no internet, switch to `offlineInstaller` or `fixedRuntime`.
+The Windows config currently uses `embedBootstrapper`, so the installer contains the WebView2 bootstrapper but still needs network access to install the runtime. If the target machines have no internet or cannot reach Microsoft download endpoints, switch to `offlineInstaller` or `fixedRuntime`.
 
 ## Checksums
 

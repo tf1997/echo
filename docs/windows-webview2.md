@@ -24,3 +24,22 @@ This DLL is only the WebView2 loader. It helps the app locate the WebView2 Runti
 - `embedBootstrapper`: includes the small bootstrapper, still needs network.
 - `offlineInstaller`: includes the runtime installer, works offline, much larger.
 - `fixedRuntime`: ships a fixed WebView2 Runtime folder with the app, largest but most self-contained.
+
+If `WebView2Loader.dll` is present but startup still fails with `CreateWebview(WebView2Error(... 0x80070002 ...))`, the target machine usually does not have the Evergreen WebView2 Runtime installed. The loader is not the runtime.
+
+For portable packages that must work on those machines, bundle the Microsoft Edge WebView2 Fixed Version Runtime:
+
+```powershell
+.\scripts\package-windows-portable.ps1 -Build -Arch x64 -WebView2RuntimePath "C:\path\to\Microsoft.WebView2.FixedVersionRuntime"
+```
+
+The generated zip then includes:
+
+```text
+echo.exe
+WebView2Loader.dll
+WebView2Runtime\msedgewebview2.exe
+portable.json
+```
+
+On startup, Echo automatically uses the `WebView2Runtime` directory next to `echo.exe` before creating the WebView.

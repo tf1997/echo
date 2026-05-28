@@ -9,12 +9,15 @@ mod windows_event_log;
 pub mod updater;
 
 use db::Database;
-use log::info;
 use crate::discovery::{Peer, PeerEntry};
+use log::info;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tauri::api::dialog::{
+    blocking::MessageDialogBuilder, MessageDialogButtons, MessageDialogKind,
+};
 use tauri::{CustomMenuItem, Manager, Menu, Submenu};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -122,13 +125,91 @@ fn init_file_logger(log_dir: &Path) {
     }
 }
 
+#[cfg(windows)]
+fn configure_windows_webview2_runtime() {
+    const FIXED_RUNTIME_DIR: &str = "WebView2Runtime";
+    const FIXED_RUNTIME_PREFIX: &str = "Microsoft.WebView2.FixedVersionRuntime";
+    const WEBVIEW2_EXE: &str = "msedgewebview2.exe";
+
+    if std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER").is_some() {
+        return;
+    }
+
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(exe_dir) = current_exe.parent() else {
+        return;
+    };
+
+    let direct = exe_dir.join(FIXED_RUNTIME_DIR);
+    if direct.join(WEBVIEW2_EXE).is_file() {
+        std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", &direct);
+        info!("Using bundled WebView2 fixed runtime: {}", direct.display());
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(exe_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(FIXED_RUNTIME_PREFIX) && path.join(WEBVIEW2_EXE).is_file() {
+            std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", &path);
+            info!("Using bundled WebView2 fixed runtime: {}", path.display());
+            return;
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn configure_windows_webview2_runtime() {}
+
+fn is_webview2_startup_error(details: &str) -> bool {
+    let details = details.to_ascii_lowercase();
+    details.contains("webview2") || details.contains("createwebview")
+}
+
+fn startup_error_message(details: &str) -> String {
+    if is_webview2_startup_error(details) {
+        return format!(
+            "Echo 启动失败：Windows WebView2 Runtime 不可用。\n\n\
+WebView2Loader.dll 只是加载器；目标机器还需要安装 Microsoft Edge WebView2 Runtime，\
+或使用包含 WebView2Runtime 固定运行时目录的 Echo 便携包/离线安装包。\n\n\
+技术信息：{}",
+            details
+        );
+    }
+
+    format!("Echo 启动失败。\n\n技术信息：{}", details)
+}
+
+fn show_startup_error(message: &str) {
+    let _ = MessageDialogBuilder::new("Echo 启动失败", message)
+        .kind(MessageDialogKind::Error)
+        .buttons(MessageDialogButtons::OkWithLabel("确定".to_string()))
+        .show();
+}
+
+fn handle_startup_error(log_dir: &Path, error: tauri::Error) {
+    let details = error.to_string();
+    let message = startup_error_message(&details);
+    append_crash_log(log_dir, &message);
+    show_startup_error(&message);
+    std::process::exit(1);
+}
+
 pub fn run() {
     // ── File logger with size-based truncation ─────────────────────────
     let log_dir = startup_log_dir();
     install_panic_logger(log_dir.clone());
     init_file_logger(&log_dir);
+    configure_windows_webview2_runtime();
 
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .menu(app_menu())
         .system_tray(tray::system_tray(MENU_CHECK_UPDATE))
         .on_menu_event(|event| {
@@ -495,6 +576,9 @@ pub fn run() {
             updater::check_for_updates_command,
             updater::download_update_command,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Echo");
+        .run(tauri::generate_context!());
+
+    if let Err(error) = result {
+        handle_startup_error(&log_dir, error);
+    }
 }
