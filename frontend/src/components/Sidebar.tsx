@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import type { Peer, UnreadCount, StoredPeer } from "../types";
 import { searchMessages, discoverByIp, listRecentContacts, removeRecentContact, createGroup } from "../api";
 import { THEMES } from "../theme";
@@ -43,6 +43,8 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   const [newGroupName, setNewGroupName] = useState("");
   const [newGroupMembers, setNewGroupMembers] = useState<string[]>([]);
   const [expandedDepts, setExpandedDepts] = useState<Set<string>>(new Set());
+  const [groupNameError, setGroupNameError] = useState("");
+  const themeMenuRef = useRef<HTMLDivElement>(null);
 
   const toggleDept = useCallback((dept: string) => {
     setExpandedDepts((prev) => {
@@ -55,20 +57,46 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
 
   useEffect(() => { listRecentContacts().then(setRecentContacts).catch(() => {}); }, [peers, tab]);
 
+  // Close theme menu when clicking outside
+  useEffect(() => {
+    if (!showThemeMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (themeMenuRef.current && !themeMenuRef.current.contains(e.target as Node)) {
+        setShowThemeMenu(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showThemeMenu]);
+
   const handleRemoveRecent = useCallback(async (peerId: string) => {
     await removeRecentContact(peerId).catch(() => {});
     setRecentContacts((prev) => prev.filter((r) => r.peer_id !== peerId));
   }, []);
 
   const handleCreateGroup = useCallback(async () => {
-    if (!newGroupName.trim()) return;
+    const trimmedName = newGroupName.trim();
+    if (!trimmedName) {
+      setGroupNameError("群组名称不能为空");
+      return;
+    }
+    if (trimmedName.length > 50) {
+      setGroupNameError("群组名称不能超过50个字符");
+      return;
+    }
+    if (newGroupMembers.length === 0) {
+      setGroupNameError("请至少选择一个成员");
+      return;
+    }
     try {
-      await createGroup(newGroupName.trim(), newGroupMembers);
+      await createGroup(trimmedName, newGroupMembers);
       setShowCreateGroup(false);
       setNewGroupName("");
       setNewGroupMembers([]);
+      setGroupNameError("");
     } catch (e) {
       console.error("Failed to create group:", e);
+      setGroupNameError("创建群组失败，请重试");
     }
   }, [newGroupName, newGroupMembers]);
 
@@ -469,23 +497,82 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
       {/* Create group dialog */}
       {showCreateGroup && (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="bg-gray-800 border border-gray-600 rounded-xl p-4 w-80 shadow-2xl">
-            <p className="text-sm font-semibold mb-3">创建群组</p>
-            <input value={newGroupName} onChange={(e) => setNewGroupName(e.target.value)} placeholder="群组名称" className="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm text-gray-200 outline-none mb-3" />
-            <p className="text-xs text-gray-400 mb-2">选择成员：</p>
-            <div className="max-h-32 overflow-y-auto mb-3">
-              {peers.map((p) => (
-                <label key={p.id} className="flex items-center gap-2 py-1 cursor-pointer">
-                  <input type="checkbox" checked={newGroupMembers.includes(p.id)} onChange={() => {
-                    setNewGroupMembers((prev) => prev.includes(p.id) ? prev.filter((id) => id !== p.id) : [...prev, p.id]);
-                  }} />
-                  <span className="text-xs text-gray-300">{p.username}{p.department ? ` (${p.department})` : ""}</span>
-                </label>
-              ))}
+          <div className="bg-gray-800 border border-gray-600 rounded-xl p-5 w-96 shadow-2xl">
+            <h3 className="text-base font-semibold mb-4">创建群组</h3>
+
+            <div className="mb-4">
+              <label className="block text-xs text-gray-400 mb-1.5">
+                群组名称 <span className="text-red-400">*</span>
+              </label>
+              <input
+                value={newGroupName}
+                onChange={(e) => {
+                  setNewGroupName(e.target.value);
+                  if (groupNameError) setGroupNameError("");
+                }}
+                placeholder="请输入群组名称"
+                maxLength={50}
+                className={`w-full bg-gray-900 border ${groupNameError ? "border-red-500" : "border-gray-600"} rounded px-3 py-2 text-sm text-gray-200 outline-none focus:border-indigo-500 transition-colors`}
+                autoFocus
+              />
+              {groupNameError && (
+                <p className="text-xs text-red-400 mt-1">{groupNameError}</p>
+              )}
+              <p className="text-xs text-gray-500 mt-1">{newGroupName.length}/50</p>
             </div>
+
+            <div className="mb-4">
+              <label className="block text-xs text-gray-400 mb-1.5">
+                选择成员 <span className="text-red-400">*</span>
+                <span className="text-gray-500 ml-1">({newGroupMembers.length} 人)</span>
+              </label>
+              <div className="max-h-40 overflow-y-auto bg-gray-900 border border-gray-600 rounded p-2">
+                {peers.length === 0 ? (
+                  <p className="text-xs text-gray-500 text-center py-4">暂无可选成员</p>
+                ) : (
+                  peers.map((p) => (
+                    <label key={p.id} className="flex items-center gap-2 py-1.5 px-2 hover:bg-gray-800 rounded cursor-pointer transition-colors">
+                      <input
+                        type="checkbox"
+                        checked={newGroupMembers.includes(p.id)}
+                        onChange={() => {
+                          setNewGroupMembers((prev) => prev.includes(p.id) ? prev.filter((id) => id !== p.id) : [...prev, p.id]);
+                          if (groupNameError) setGroupNameError("");
+                        }}
+                        className="w-4 h-4 accent-indigo-600"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <span className="text-xs text-gray-300">{p.username}</span>
+                        {p.department && <span className="text-xs text-gray-500 ml-1">({p.department})</span>}
+                      </div>
+                      <span className={`text-[10px] ${p.online ? "text-green-400" : "text-gray-500"}`}>
+                        {p.online ? "在线" : "离线"}
+                      </span>
+                    </label>
+                  ))
+                )}
+              </div>
+            </div>
+
             <div className="flex gap-2">
-              <button onClick={handleCreateGroup} className="flex-1 py-2 text-xs rounded bg-indigo-600 hover:bg-indigo-500">创建</button>
-              <button onClick={() => setShowCreateGroup(false)} className="flex-1 py-2 text-xs rounded bg-gray-700 hover:bg-gray-600">取消</button>
+              <button
+                onClick={handleCreateGroup}
+                disabled={!newGroupName.trim() || newGroupMembers.length === 0}
+                className="flex-1 py-2.5 text-sm font-medium rounded bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed transition-colors"
+              >
+                创建群组
+              </button>
+              <button
+                onClick={() => {
+                  setShowCreateGroup(false);
+                  setNewGroupName("");
+                  setNewGroupMembers([]);
+                  setGroupNameError("");
+                }}
+                className="flex-1 py-2.5 text-sm font-medium rounded bg-gray-700 hover:bg-gray-600 transition-colors"
+              >
+                取消
+              </button>
             </div>
           </div>
         </div>
@@ -493,41 +580,43 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
 
       <div className="relative p-3 border-t border-gray-700 text-xs text-gray-500 text-center">
         Echo P2P Chat · 局域网通信
-        <button
-          type="button"
-          onClick={() => setShowThemeMenu((value) => !value)}
-          className="absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 rounded bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center"
-          title="切换皮肤"
-          aria-label="切换皮肤"
-        >
-          <span className="flex items-center gap-0.5">
-            {currentTheme.preview.map((color) => (
-              <span key={color} className="w-1.5 h-3 rounded-sm" style={{ background: color }} />
-            ))}
-          </span>
-        </button>
-        {showThemeMenu && (
-          <div className="absolute bottom-full right-2 mb-2 z-50 w-44 rounded-lg bg-gray-800 border border-gray-600 p-2 shadow-2xl text-left">
-            {THEMES.map((theme) => (
-              <button
-                key={theme.id}
-                type="button"
-                onClick={() => {
-                  onThemeChange(theme.id);
-                  setShowThemeMenu(false);
-                }}
-                className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs hover:bg-gray-700 ${themeId === theme.id ? "text-indigo-400" : "text-gray-300"}`}
-              >
-                <span className={`theme-swatch ${themeId === theme.id ? "theme-swatch-active" : ""}`}>
-                  <span style={{ background: theme.preview[0] }} />
-                  <span style={{ background: theme.preview[1] }} />
-                  <span style={{ background: theme.preview[2] }} />
-                </span>
-                <span>{theme.name}</span>
-              </button>
-            ))}
-          </div>
-        )}
+        <div ref={themeMenuRef} className="absolute right-2 top-1/2 -translate-y-1/2">
+          <button
+            type="button"
+            onClick={() => setShowThemeMenu((value) => !value)}
+            className="w-7 h-7 rounded bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center"
+            title="切换皮肤"
+            aria-label="切换皮肤"
+          >
+            <span className="flex items-center gap-0.5">
+              {currentTheme.preview.map((color) => (
+                <span key={color} className="w-1.5 h-3 rounded-sm" style={{ background: color }} />
+              ))}
+            </span>
+          </button>
+          {showThemeMenu && (
+            <div className="absolute bottom-full right-0 mb-2 z-50 w-44 rounded-lg bg-gray-800 border border-gray-600 p-2 shadow-2xl text-left">
+              {THEMES.map((theme) => (
+                <button
+                  key={theme.id}
+                  type="button"
+                  onClick={() => {
+                    onThemeChange(theme.id);
+                    setShowThemeMenu(false);
+                  }}
+                  className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs hover:bg-gray-700 ${themeId === theme.id ? "text-indigo-400" : "text-gray-300"}`}
+                >
+                  <span className={`theme-swatch ${themeId === theme.id ? "theme-swatch-active" : ""}`}>
+                    <span style={{ background: theme.preview[0] }} />
+                    <span style={{ background: theme.preview[1] }} />
+                    <span style={{ background: theme.preview[2] }} />
+                  </span>
+                  <span>{theme.name}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
