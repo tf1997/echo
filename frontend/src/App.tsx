@@ -15,7 +15,7 @@ import {
   sendFile,
   sendSticker,
   markRead,
-  setTrayUnreadAttention,
+  updateTrayUnread,
   checkPeerOnline,
   getDepartments,
   saveProfile,
@@ -30,7 +30,7 @@ import {
   listGroups,
   markGroupRead,
 } from "./api";
-import type { GroupInfo } from "./api";
+import type { GroupInfo, TrayUnreadItem } from "./api";
 
 function formatUpdatePrompt(result: UpdateCheckResult) {
   const version = result.latest_version || "";
@@ -65,10 +65,11 @@ function App() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const prevUnreadTotalRef = useRef(0);
   const prevGroupUnreadRef = useRef(new Map<string, number>());
+  const prevContactUnreadRef = useRef(new Map<string, number>());
+  const trayLastTsRef = useRef(new Map<string, number>());
   const unreadInitRef = useRef(true);
   const groupUnreadInitRef = useRef(true);
   const onlineGraceUntilRef = useRef(new Map<string, number>());
-  const unreadAttentionActiveRef = useRef<boolean | null>(null);
 
   // Silent WAV (1 sample) — used only to unlock autoplay policy on first click
   const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
@@ -199,13 +200,62 @@ function App() {
 
   useEffect(() => {
     if (!appInfo?.initialized) return;
-    const contactUnread = unreadCounts.reduce((sum, uc) => sum + uc.count, 0);
-    const groupUnread = groups.reduce((sum, group) => sum + (group.unread_count || 0), 0);
-    const active = contactUnread + groupUnread > 0;
-    if (unreadAttentionActiveRef.current === active) return;
-    unreadAttentionActiveRef.current = active;
-    setTrayUnreadAttention(active).catch(console.error);
-  }, [appInfo?.initialized, unreadCounts, groups]);
+    const now = Date.now();
+    const lastTs = trayLastTsRef.current;
+
+    const items: TrayUnreadItem[] = [];
+    const seen = new Set<string>();
+
+    for (const uc of unreadCounts) {
+      const key = `contact:${uc.peer_id}`;
+      seen.add(key);
+      const prev = prevContactUnreadRef.current.get(uc.peer_id) ?? 0;
+      if (uc.count > prev || !lastTs.has(key)) {
+        lastTs.set(key, now);
+      }
+      prevContactUnreadRef.current.set(uc.peer_id, uc.count);
+      if (uc.count > 0) {
+        const peer = peers.find((p) => p.id === uc.peer_id);
+        items.push({
+          kind: "contact",
+          id: uc.peer_id,
+          name: peer?.username || uc.peer_id,
+          count: uc.count,
+          last_ts: lastTs.get(key) ?? now,
+        });
+      }
+    }
+    for (const peerId of Array.from(prevContactUnreadRef.current.keys())) {
+      if (!unreadCounts.some((uc) => uc.peer_id === peerId)) {
+        prevContactUnreadRef.current.delete(peerId);
+      }
+    }
+
+    for (const g of groups) {
+      const count = g.unread_count || 0;
+      const key = `group:${g.group_id}`;
+      seen.add(key);
+      if (count > 0) {
+        const prev = prevGroupUnreadRef.current.get(g.group_id) || 0;
+        if (count > prev || !lastTs.has(key)) {
+          lastTs.set(key, now);
+        }
+        items.push({
+          kind: "group",
+          id: g.group_id,
+          name: g.name,
+          count,
+          last_ts: lastTs.get(key) ?? now,
+        });
+      }
+    }
+
+    for (const key of Array.from(lastTs.keys())) {
+      if (!seen.has(key)) lastTs.delete(key);
+    }
+
+    updateTrayUnread(items).catch(console.error);
+  }, [appInfo?.initialized, unreadCounts, groups, peers]);
 
   const mergePeers = useCallback((onlinePeers: Peer[], stored: StoredPeer[]): Peer[] => {
     const map = new Map<string, Peer>();
@@ -394,6 +444,31 @@ function App() {
     } catch (err) {
       console.error("Failed to load group messages:", err);
     }
+  }, []);
+
+  const peersRef = useRef(peers);
+  const groupsRef = useRef(groups);
+  const selectPeerRef = useRef(handleSelectPeer);
+  const selectGroupRef = useRef(handleSelectGroup);
+  useEffect(() => { peersRef.current = peers; }, [peers]);
+  useEffect(() => { groupsRef.current = groups; }, [groups]);
+  useEffect(() => { selectPeerRef.current = handleSelectPeer; }, [handleSelectPeer]);
+  useEffect(() => { selectGroupRef.current = handleSelectGroup; }, [handleSelectGroup]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<TrayUnreadItem>("tray-open-conversation", (event) => {
+      const { kind, id } = event.payload;
+      if (kind === "group") {
+        if (groupsRef.current.some((g) => g.group_id === id)) {
+          selectGroupRef.current(id);
+        }
+      } else {
+        const peer = peersRef.current.find((p) => p.id === id);
+        if (peer) selectPeerRef.current(peer);
+      }
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
   }, []);
 
   const handleSendMessage = useCallback(async (content: string) => {

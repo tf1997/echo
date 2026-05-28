@@ -49,8 +49,16 @@ export async function getUnreadCounts(): Promise<UnreadCount[]> {
   return await invoke("get_unread_counts");
 }
 
-export async function setTrayUnreadAttention(active: boolean): Promise<void> {
-  await invoke("set_tray_unread_attention", { active });
+export interface TrayUnreadItem {
+  kind: "contact" | "group";
+  id: string;
+  name: string;
+  count: number;
+  last_ts: number;
+}
+
+export async function updateTrayUnread(items: TrayUnreadItem[]): Promise<void> {
+  await invoke("update_tray_unread", { items });
 }
 
 export async function getScanSubnets(): Promise<string[]> {

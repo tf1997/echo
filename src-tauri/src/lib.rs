@@ -220,6 +220,14 @@ pub fn run() {
         .on_system_tray_event(|app, event| {
             tray::handle_tray_event(app, event, MENU_CHECK_UPDATE);
         })
+        .on_window_event(|event| {
+            if event.window().label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::Focused(focused) = event.event() {
+                tray::note_window_focused(&event.window().app_handle(), *focused);
+            }
+        })
         .setup(move |app| {
             let listen_port = std::env::var("ECHO_PORT")
                 .ok()
@@ -544,7 +552,7 @@ pub fn run() {
             commands::get_conversation,
             commands::mark_read,
             commands::get_unread_counts,
-            commands::set_tray_unread_attention,
+            commands::update_tray_unread,
             commands::save_temp_file,
             commands::read_file_base64,
             commands::open_file,

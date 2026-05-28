@@ -749,8 +749,11 @@ pub async fn get_unread_counts(state: State<'_, AppState>) -> Result<Vec<UnreadC
 }
 
 #[tauri::command]
-pub fn set_tray_unread_attention(app: AppHandle, active: bool) -> Result<(), String> {
-    crate::tray::set_unread_attention(&app, active).map_err(|e| e.to_string())
+pub fn update_tray_unread(
+    app: AppHandle,
+    items: Vec<crate::tray::TrayUnreadItem>,
+) -> Result<(), String> {
+    crate::tray::update_unread(&app, items).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
