@@ -195,24 +195,37 @@ fn tray_icon(unread: bool) -> Icon {
     let size = TRAY_SIZE as usize;
     let mut rgba = vec![0u8; size * size * 4];
 
-    const PURPLE: [u8; 4] = [124, 58, 237, 255]; // #7C3AED — 与 app 图标紫一致
-    const WHITE: [u8; 4] = [255, 255, 255, 255];
-    const RED: [u8; 4] = [239, 68, 68, 255];
+    const TOP: [u8; 4] = [155, 124, 255, 255];
+    const MID: [u8; 4] = [108, 59, 255, 255];
+    const BOTTOM: [u8; 4] = [9, 182, 242, 255];
+    const MARK: [u8; 4] = [255, 255, 255, 246];
+    const MARK_SHADOW: [u8; 4] = [25, 10, 80, 78];
+    const RED: [u8; 4] = [255, 59, 48, 255];
 
-    // 紫色圆角方背景
-    fill_rrect(&mut rgba, TRAY_SIZE, 2.0, 2.0, 30.0, 30.0, 6.5, PURPLE);
+    fill_rrect_gradient(
+        &mut rgba, TRAY_SIZE, 2.0, 2.0, 30.0, 30.0, 7.2, TOP, MID, BOTTOM,
+    );
+    fill_circle(&mut rgba, TRAY_SIZE, 8.2, 2.2, 13.8, [255, 255, 255, 48]);
+    fill_circle(&mut rgba, TRAY_SIZE, 24.0, 25.0, 11.8, [126, 235, 255, 62]);
+    stroke_rrect(
+        &mut rgba,
+        TRAY_SIZE,
+        2.4,
+        2.4,
+        29.6,
+        29.6,
+        6.9,
+        1.1,
+        [255, 255, 255, 70],
+    );
 
-    // 白色字母 E:
-    //   竖杠 + 顶 / 中 / 底三横，中间一横略短，更接近字体感
-    fill_rect(&mut rgba, TRAY_SIZE, 11, 8, 14, 25, WHITE); // vertical bar
-    fill_rect(&mut rgba, TRAY_SIZE, 11, 8, 22, 11, WHITE); // top
-    fill_rect(&mut rgba, TRAY_SIZE, 11, 14, 20, 17, WHITE); // middle (shorter)
-    fill_rect(&mut rgba, TRAY_SIZE, 11, 22, 22, 25, WHITE); // bottom
+    draw_tray_mark(&mut rgba, 0.0, 0.8, MARK_SHADOW);
+    draw_tray_mark(&mut rgba, 0.0, 0.0, MARK);
 
     if unread {
-        // 红色未读角标 + 白色描边，叠在右上角
-        fill_circle(&mut rgba, TRAY_SIZE, 24.0, 8.0, 6.2, WHITE);
-        fill_circle(&mut rgba, TRAY_SIZE, 24.0, 8.0, 4.8, RED);
+        fill_circle(&mut rgba, TRAY_SIZE, 24.2, 7.8, 6.3, MARK);
+        fill_circle(&mut rgba, TRAY_SIZE, 24.2, 7.8, 4.8, RED);
+        fill_circle(&mut rgba, TRAY_SIZE, 22.6, 6.0, 1.35, [255, 255, 255, 122]);
     }
 
     Icon::Rgba {
@@ -220,6 +233,135 @@ fn tray_icon(unread: bool) -> Icon {
         width: TRAY_SIZE,
         height: TRAY_SIZE,
     }
+}
+
+fn draw_tray_mark(rgba: &mut [u8], dx: f32, dy: f32, color: [u8; 4]) {
+    fill_rrect(
+        rgba,
+        TRAY_SIZE,
+        9.2 + dx,
+        7.5 + dy,
+        13.2 + dx,
+        24.9 + dy,
+        2.0,
+        color,
+    );
+    fill_rrect(
+        rgba,
+        TRAY_SIZE,
+        9.2 + dx,
+        7.5 + dy,
+        23.2 + dx,
+        11.6 + dy,
+        2.05,
+        color,
+    );
+    fill_rrect(
+        rgba,
+        TRAY_SIZE,
+        9.2 + dx,
+        14.1 + dy,
+        20.4 + dx,
+        18.2 + dy,
+        2.05,
+        color,
+    );
+    fill_rrect(
+        rgba,
+        TRAY_SIZE,
+        9.2 + dx,
+        20.8 + dy,
+        23.2 + dx,
+        24.9 + dy,
+        2.05,
+        color,
+    );
+}
+
+fn fill_rrect_gradient(
+    rgba: &mut [u8],
+    width: u32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    r: f32,
+    top: [u8; 4],
+    mid: [u8; 4],
+    bottom: [u8; 4],
+) {
+    let w = width as usize;
+    let cx = (x0 + x1) * 0.5;
+    let cy = (y0 + y1) * 0.5;
+    let bx = (x1 - x0) * 0.5;
+    let by = (y1 - y0) * 0.5;
+    for y in 0..w {
+        for x in 0..w {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let qx = (px - cx).abs() - bx + r;
+            let qy = (py - cy).abs() - by + r;
+            let outside = qx.max(0.0).hypot(qy.max(0.0));
+            let inside = qx.max(qy).min(0.0);
+            let sdf = outside + inside - r;
+            let coverage = (0.5 - sdf).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                let tx = ((px - x0) / (x1 - x0)).clamp(0.0, 1.0);
+                let ty = ((py - y0) / (y1 - y0)).clamp(0.0, 1.0);
+                let t = (tx * 0.28 + ty * 0.72).clamp(0.0, 1.0);
+                let color = if t < 0.52 {
+                    lerp_color(top, mid, t / 0.52)
+                } else {
+                    lerp_color(mid, bottom, (t - 0.52) / 0.48)
+                };
+                blend_pixel(rgba, (y * w + x) * 4, color, coverage);
+            }
+        }
+    }
+}
+
+fn stroke_rrect(
+    rgba: &mut [u8],
+    width: u32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    r: f32,
+    thickness: f32,
+    color: [u8; 4],
+) {
+    let w = width as usize;
+    let cx = (x0 + x1) * 0.5;
+    let cy = (y0 + y1) * 0.5;
+    let bx = (x1 - x0) * 0.5;
+    let by = (y1 - y0) * 0.5;
+    let half = thickness * 0.5;
+    for y in 0..w {
+        for x in 0..w {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let qx = (px - cx).abs() - bx + r;
+            let qy = (py - cy).abs() - by + r;
+            let outside = qx.max(0.0).hypot(qy.max(0.0));
+            let inside = qx.max(qy).min(0.0);
+            let sdf = outside + inside - r;
+            let coverage = (0.5 - (sdf.abs() - half)).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                blend_pixel(rgba, (y * w + x) * 4, color, coverage);
+            }
+        }
+    }
+}
+
+fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
+    let t = t.clamp(0.0, 1.0);
+    [
+        (a[0] as f32 + (b[0] as f32 - a[0] as f32) * t).round() as u8,
+        (a[1] as f32 + (b[1] as f32 - a[1] as f32) * t).round() as u8,
+        (a[2] as f32 + (b[2] as f32 - a[2] as f32) * t).round() as u8,
+        (a[3] as f32 + (b[3] as f32 - a[3] as f32) * t).round() as u8,
+    ]
 }
 
 fn fill_rrect(
@@ -267,20 +409,6 @@ fn fill_circle(rgba: &mut [u8], width: u32, cx: f32, cy: f32, r: f32, color: [u8
             if coverage > 0.0 {
                 blend_pixel(rgba, (y * w + x) * 4, color, coverage);
             }
-        }
-    }
-}
-
-fn fill_rect(rgba: &mut [u8], width: u32, x0: i32, y0: i32, x1: i32, y1: i32, color: [u8; 4]) {
-    let w = width as i32;
-    let lo_x = x0.max(0);
-    let hi_x = x1.min(w);
-    let lo_y = y0.max(0);
-    let hi_y = y1.min(w);
-    for y in lo_y..hi_y {
-        for x in lo_x..hi_x {
-            let idx = ((y * w + x) * 4) as usize;
-            blend_pixel(rgba, idx, color, 1.0);
         }
     }
 }
