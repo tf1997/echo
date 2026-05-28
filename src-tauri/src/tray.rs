@@ -6,6 +6,8 @@ use tauri::{
     SystemTrayMenuItem, UserAttentionType,
 };
 
+use crate::updater;
+
 const TRAY_SHOW: &str = "tray_show";
 const TRAY_QUIT: &str = "tray_quit";
 const TRAY_SIZE: u32 = 32;
@@ -35,7 +37,7 @@ pub fn handle_tray_event(app: &AppHandle, event: SystemTrayEvent, check_update_i
             show_main_window(app);
         }
         SystemTrayEvent::MenuItemClick { id, .. } if id == check_update_id => {
-            let _ = app.emit_all("menu-check-update", ());
+            updater::spawn_manual_update_check(app.clone());
         }
         SystemTrayEvent::MenuItemClick { id, .. } if id == TRAY_QUIT => {
             app.exit(0);

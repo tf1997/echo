@@ -7,7 +7,6 @@ import { ChatWindow } from "./components/ChatWindow";
 import { applyTheme, getInitialTheme } from "./theme";
 import type { ThemeId } from "./theme";
 import {
-  checkForUpdates,
   downloadUpdate,
   getAppInfo,
   getPeers,
@@ -140,30 +139,6 @@ function App() {
     });
   }, []);
 
-  const handleMenuCheckUpdate = useCallback(async () => {
-    if (checkingUpdateRef.current) return;
-    checkingUpdateRef.current = true;
-    try {
-      const result = await checkForUpdates();
-      if (!result.available) {
-        await message(result.message || `当前已是最新版本 ${result.current_version}`, {
-          title: "Echo 更新",
-          type: "info",
-        });
-        return;
-      }
-
-      await promptAndDownloadUpdate(result);
-    } catch (err) {
-      await message(String(err), {
-        title: "Echo 更新失败",
-        type: "error",
-      });
-    } finally {
-      checkingUpdateRef.current = false;
-    }
-  }, [promptAndDownloadUpdate]);
-
   const handleBackgroundUpdateAvailable = useCallback(async (result: UpdateCheckResult) => {
     if (!result.available || checkingUpdateRef.current) return;
     checkingUpdateRef.current = true;
@@ -180,23 +155,16 @@ function App() {
   }, [promptAndDownloadUpdate]);
 
   useEffect(() => {
-    let unlistenMenu: (() => void) | undefined;
     let unlistenUpdate: (() => void) | undefined;
-    listen("menu-check-update", () => {
-      handleMenuCheckUpdate();
-    }).then((fn) => {
-      unlistenMenu = fn;
-    });
     listen<UpdateCheckResult>("update-available", (event) => {
       handleBackgroundUpdateAvailable(event.payload);
     }).then((fn) => {
       unlistenUpdate = fn;
     });
     return () => {
-      unlistenMenu?.();
       unlistenUpdate?.();
     };
-  }, [handleMenuCheckUpdate, handleBackgroundUpdateAvailable]);
+  }, [handleBackgroundUpdateAvailable]);
 
   // Detect new incoming CONTACT messages via unread-count changes
   // (same data that drives the sidebar red badges)

@@ -29,6 +29,10 @@
         "assetScope": ["**"]
       }
     },
+    "systemTray": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": false
+    },
     "windows": [
       {
         "title": "Echo - P2P Chat",

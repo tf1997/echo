@@ -133,7 +133,7 @@ pub fn run() {
         .system_tray(tray::system_tray(MENU_CHECK_UPDATE))
         .on_menu_event(|event| {
             if event.menu_item_id() == MENU_CHECK_UPDATE {
-                let _ = event.window().emit("menu-check-update", ());
+                updater::spawn_manual_update_check(event.window().app_handle().clone());
             }
         })
         .on_system_tray_event(|app, event| {
