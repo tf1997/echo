@@ -173,7 +173,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
         <div className="flex items-center gap-3">
           <button
             onClick={() => setShowProfile(!showProfile)}
-            className="relative flex-shrink-0 w-10 h-10 rounded-full bg-indigo-500 hover:bg-indigo-400 transition-colors flex items-center justify-center text-lg font-bold cursor-pointer"
+            className="own-profile-avatar relative flex-shrink-0 w-10 h-10 rounded-full bg-indigo-500 hover:bg-indigo-400 transition-colors flex items-center justify-center text-lg font-bold cursor-pointer"
             title="查看个人信息"
           >
             {myName.charAt(0).toUpperCase()}
@@ -197,7 +197,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
         {showProfile && (
           <div className="absolute top-full left-2 right-2 mt-1 z-50 bg-gray-800 border border-gray-600 rounded-xl p-4 shadow-2xl">
             <div className="flex items-center gap-3 mb-3">
-              <div className="w-12 h-12 rounded-full bg-indigo-500 flex items-center justify-center text-xl font-bold">
+              <div className="own-profile-avatar w-12 h-12 rounded-full bg-indigo-500 flex items-center justify-center text-xl font-bold">
                 {myName.charAt(0).toUpperCase()}
               </div>
               <div>
