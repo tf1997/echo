@@ -220,11 +220,10 @@ function App() {
       }
       prevContactUnreadRef.current.set(uc.peer_id, uc.count);
       if (uc.count > 0) {
-        const peer = peers.find((p) => p.id === uc.peer_id);
         items.push({
           kind: "contact",
           id: uc.peer_id,
-          name: peer?.username || uc.peer_id,
+          name: uc.username,
           count: uc.count,
           last_ts: lastTs.get(key) ?? now,
         });

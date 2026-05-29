@@ -50,6 +50,7 @@ export interface SaveProfilePayload {
 export interface UnreadCount {
   peer_id: string;
   count: number;
+  username: string;
 }
 
 export interface UpdatePackage {

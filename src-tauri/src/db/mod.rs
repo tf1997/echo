@@ -77,6 +77,7 @@ pub struct StoredPeer {
 pub struct UnreadCount {
     pub peer_id: String,
     pub count: u32,
+    pub username: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1196,10 +1197,11 @@ impl Database {
 
     pub async fn get_unread_counts(&self, my_id: &str) -> Result<Vec<UnreadCount>> {
         let rows = sqlx::query(
-            "SELECT sender_id, COUNT(*) as cnt
-             FROM messages
-             WHERE receiver_id = ? AND is_read = 0
-             GROUP BY sender_id",
+            "SELECT m.sender_id, COUNT(*) as cnt, COALESCE(p.username, m.sender_id) as username
+             FROM messages m
+             LEFT JOIN peers p ON m.sender_id = p.peer_id
+             WHERE m.receiver_id = ? AND m.is_read = 0
+             GROUP BY m.sender_id",
         )
         .bind(my_id)
         .fetch_all(&self.pool)
@@ -1211,6 +1213,7 @@ impl Database {
             .map(|row| UnreadCount {
                 peer_id: row.get("sender_id"),
                 count: row.get::<i64, _>("cnt") as u32,
+                username: row.get("username"),
             })
             .collect())
     }
