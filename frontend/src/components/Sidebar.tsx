@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import type { Peer, UnreadCount, StoredPeer } from "../types";
 import { searchMessages, discoverByIp, listRecentContacts, removeRecentContact, createGroup } from "../api";
 import { THEMES } from "../theme";
@@ -38,6 +38,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   const [subnetInput, setSubnetInput] = useState(scanSubnets.join(", "));
   const [savingSubnets, setSavingSubnets] = useState(false);
   const [tab, setTab] = useState<"recent" | "contacts" | "groups">("recent");
+  const [contactQuery, setContactQuery] = useState("");
   const [recentContacts, setRecentContacts] = useState<StoredPeer[]>([]);
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
@@ -123,9 +124,26 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
     }
   }, []);
 
+  const contactFilter = contactQuery.trim().toLowerCase();
+  const visiblePeers = useMemo(() => {
+    if (!contactFilter) return peers;
+
+    return peers.filter((peer) => {
+      const fields = [
+        peer.username,
+        peer.department,
+        peer.ip,
+        `${peer.ip}:${peer.port}`,
+        peer.online ? "在线" : "离线",
+      ];
+
+      return fields.some((field) => field.toLowerCase().includes(contactFilter));
+    });
+  }, [contactFilter, peers]);
+
   // Group peers by department for "contacts" tab
   const deptGroups = new Map<string, Peer[]>();
-  for (const p of peers) {
+  for (const p of visiblePeers) {
     const dept = p.department || "未分组";
     if (!deptGroups.has(dept)) deptGroups.set(dept, []);
     deptGroups.get(dept)!.push(p);
@@ -460,14 +478,39 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
               </>
             ) : (
               <>
+                <div className="sticky top-0 z-10 border-b border-gray-700 bg-gray-900 px-4 py-2">
+                  <div className="relative">
+                    <svg className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                    </svg>
+                    <input
+                      type="text"
+                      value={contactQuery}
+                      onChange={(e) => setContactQuery(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Escape") setContactQuery(""); }}
+                      placeholder="搜索联系人..."
+                      className="w-full bg-gray-800 text-xs text-gray-200 rounded-lg pl-8 pr-8 py-2 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
+                    />
+                    {contactQuery ? (
+                      <button
+                        type="button"
+                        onClick={() => setContactQuery("")}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 w-5 h-5 rounded-full text-gray-500 hover:text-gray-300 hover:bg-gray-700 flex items-center justify-center"
+                        aria-label="清空联系人搜索"
+                      >
+                        ×
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
                 {sortedDepts.map(dept => {
-                  const expanded = expandedDepts.has(dept);
+                  const expanded = contactFilter ? true : expandedDepts.has(dept);
                   const deptPeers = deptGroups.get(dept) || [];
                   const onlineCount = deptPeers.filter(p => p.online).length;
                   return (
                     <div key={dept}>
                       <button
-                        onClick={() => toggleDept(dept)}
+                        onClick={() => { if (!contactFilter) toggleDept(dept); }}
                         className="w-full flex items-center gap-2 px-4 py-2 text-xs text-gray-400 font-medium hover:bg-gray-800 transition-colors"
                       >
                         <svg
@@ -488,6 +531,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                   );
                 })}
                 {peers.length === 0 && <p className="px-4 py-8 text-xs text-gray-500 text-center">暂无联系人</p>}
+                {peers.length > 0 && visiblePeers.length === 0 && <p className="px-4 py-8 text-xs text-gray-500 text-center">无匹配联系人</p>}
               </>
             )}
           </div>
@@ -558,7 +602,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
               <button
                 onClick={handleCreateGroup}
                 disabled={!newGroupName.trim() || newGroupMembers.length === 0}
-                className="flex-1 py-2.5 text-sm font-medium rounded bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 disabled:cursor-not-allowed transition-colors"
+                className="create-group-submit flex-1 py-2.5 text-sm font-medium rounded border border-transparent bg-indigo-600 hover:bg-indigo-500 disabled:cursor-not-allowed transition-colors"
               >
                 创建群组
               </button>

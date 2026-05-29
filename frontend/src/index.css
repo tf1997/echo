@@ -315,6 +315,13 @@ body {
   background-color: var(--echo-other-bubble) !important;
 }
 
+.create-group-submit:disabled,
+.create-group-submit:disabled:hover {
+  background-color: var(--echo-accent-soft) !important;
+  border-color: color-mix(in srgb, var(--echo-accent) 30%, transparent) !important;
+  color: color-mix(in srgb, var(--echo-accent-muted) 72%, var(--echo-muted) 28%) !important;
+}
+
 :root[data-theme="daylight"] .app-sidebar {
   background: linear-gradient(180deg, #fbfdfe 0%, #f3f8fa 100%) !important;
   border-color: #d7e5eb !important;

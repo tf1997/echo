@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import type { Peer, ChatMessage, AppInfo, StoredPeer, UnreadCount, UpdateCheckResult } from "./types";
 import { ask, message } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -53,6 +53,7 @@ function App() {
   const [username, setUsername] = useState("");
   const [department, setDepartment] = useState("");
   const [departmentOptions, setDepartmentOptions] = useState<string[]>([]);
+  const [departmentPickerOpen, setDepartmentPickerOpen] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
   const [profileError, setProfileError] = useState("");
   const [editingProfile, setEditingProfile] = useState(false);
@@ -61,6 +62,7 @@ function App() {
   const [groups, setGroups] = useState<GroupInfo[]>([]);
   const [themeId, setThemeId] = useState<ThemeId>(() => getInitialTheme());
   const checkingUpdateRef = useRef(false);
+  const departmentPickerRef = useRef<HTMLDivElement | null>(null);
 
   // ── notification sound ────────────────────────────────────────────────
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -543,6 +545,34 @@ function App() {
     } catch { /* keep existing */ }
   }, []);
 
+  const filteredDepartmentOptions = useMemo(() => {
+    const query = department.trim().toLowerCase();
+    const seen = new Set<string>();
+
+    return departmentOptions.filter((dep) => {
+      const normalized = dep.trim();
+      if (!normalized) return false;
+
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+
+      return query ? key.includes(query) : true;
+    });
+  }, [department, departmentOptions]);
+
+  useEffect(() => {
+    if (!departmentPickerOpen) return;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (departmentPickerRef.current?.contains(event.target as Node)) return;
+      setDepartmentPickerOpen(false);
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [departmentPickerOpen]);
+
   const handleThemeChange = useCallback((nextThemeId: ThemeId) => {
     setThemeId(nextThemeId);
     applyTheme(nextThemeId);
@@ -571,12 +601,50 @@ function App() {
           </div>
           <div className="space-y-2">
             <label className="text-sm text-gray-300">部门</label>
-            <input list="department-options" value={department} onChange={(e) => setDepartment(e.target.value)} onFocus={refreshDepartments} placeholder="例如：研发部" className="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-indigo-500" />
-            <datalist id="department-options">
-              {departmentOptions.map((dep) => (
-                <option key={dep} value={dep} />
-              ))}
-            </datalist>
+            <div ref={departmentPickerRef} className="relative">
+              <input
+                value={department}
+                onChange={(e) => {
+                  setDepartment(e.target.value);
+                  setDepartmentPickerOpen(true);
+                }}
+                onFocus={() => {
+                  setDepartmentPickerOpen(true);
+                  void refreshDepartments();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setDepartmentPickerOpen(false);
+                }}
+                placeholder="例如：研发部"
+                className="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-indigo-500"
+                autoComplete="off"
+              />
+              {departmentPickerOpen && departmentOptions.length > 0 ? (
+                <div className="absolute left-0 right-0 top-full z-50 mt-1 overflow-hidden rounded-lg border border-gray-600 bg-gray-800 shadow-xl">
+                  <div className="max-h-60 overflow-y-auto py-1">
+                    {filteredDepartmentOptions.length > 0 ? (
+                      filteredDepartmentOptions.map((dep) => (
+                        <button
+                          key={dep}
+                          type="button"
+                          title={dep}
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => {
+                            setDepartment(dep);
+                            setDepartmentPickerOpen(false);
+                          }}
+                          className="block w-full px-3 py-2 text-left text-sm text-gray-100 outline-none hover:bg-gray-700 focus:bg-gray-700"
+                        >
+                          <span className="block truncate">{dep}</span>
+                        </button>
+                      ))
+                    ) : (
+                      <div className="px-3 py-2 text-sm text-gray-400">没有匹配的部门</div>
+                    )}
+                  </div>
+                </div>
+              ) : null}
+            </div>
           </div>
           {profileError ? <p className="text-sm text-red-400">{profileError}</p> : null}
           <div className="flex gap-2">
