@@ -217,3 +217,7 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
 export async function downloadUpdate(): Promise<DownloadUpdateResult> {
   return await invoke("download_update_command");
 }
+
+export async function restartAfterUpdate(): Promise<void> {
+  await invoke("restart_after_update_command");
+}

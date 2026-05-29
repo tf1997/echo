@@ -6,9 +6,11 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use tauri::api::dialog::{
     blocking::MessageDialogBuilder, MessageDialogButtons, MessageDialogKind,
 };
@@ -98,12 +100,7 @@ pub fn relaunch_latest_portable_if_needed() {
         return;
     }
 
-    let mut command = Command::new(latest_exe);
-    command.env("ECHO_SKIP_PORTABLE_RELAUNCH", "1");
-    if let Ok(data_dir) = std::env::var("ECHO_DATA_DIR") {
-        command.env("ECHO_DATA_DIR", data_dir);
-    }
-    if command.spawn().is_ok() {
+    if spawn_portable_executable(&latest_exe).is_ok() {
         std::process::exit(0);
     }
 }
@@ -245,13 +242,34 @@ async fn run_manual_update_check(app: AppHandle) -> Result<()> {
     }
 
     let downloaded = download_update(app.clone()).await?;
-    show_update_dialog(
+    let confirmed = show_update_dialog(
         &app,
         "Echo 更新",
         &downloaded.message,
         MessageDialogKind::Info,
         MessageDialogButtons::OkWithLabel("确定".to_string()),
     );
+    if confirmed && downloaded.ready_to_restart {
+        restart_after_update(&app)?;
+    }
+    Ok(())
+}
+
+pub fn restart_after_update(app: &AppHandle) -> Result<()> {
+    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    let root = portable_root_from_exe(&current_exe)
+        .ok_or_else(|| anyhow!("当前版本不是便携式分发，无法自动重启到新版"))?;
+    let current_version =
+        Version::parse(env!("CARGO_PKG_VERSION")).context("invalid current app version")?;
+    let (latest_version, latest_exe) =
+        find_latest_portable_executable(&root).ok_or_else(|| anyhow!("未找到可重启的新版本"))?;
+
+    if latest_version <= current_version {
+        return Err(anyhow!("未找到高于当前版本的新版本"));
+    }
+
+    spawn_portable_executable(&latest_exe).context("failed to launch updated app")?;
+    app.exit(0);
     Ok(())
 }
 
@@ -358,7 +376,7 @@ async fn download_portable(
         target: UpdateTarget::Portable,
         path: version_dir.to_string_lossy().to_string(),
         ready_to_restart: true,
-        message: "新版已下载，重启后生效".to_string(),
+        message: "新版已下载，点击确定后重启应用".to_string(),
     })
 }
 
@@ -538,6 +556,21 @@ fn find_latest_portable_executable(root: &Path) -> Option<(Version, PathBuf)> {
     best
 }
 
+fn spawn_portable_executable(executable: &Path) -> std::io::Result<Child> {
+    let mut command = Command::new(executable);
+    command.args(std::env::args_os().skip(1));
+    command.env("ECHO_SKIP_PORTABLE_RELAUNCH", "1");
+    if let Ok(data_dir) = std::env::var("ECHO_DATA_DIR") {
+        command.env("ECHO_DATA_DIR", data_dir);
+    }
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command.spawn()
+}
+
 fn read_marker_executable(dir: &Path) -> Option<PathBuf> {
     let marker = fs::read_to_string(dir.join(CURRENT_MARKER)).ok()?;
     let marker: PortableVersionMarker = serde_json::from_str(&marker).ok()?;
@@ -629,4 +662,9 @@ pub async fn check_for_updates_command() -> Result<UpdateCheckResult, String> {
 #[tauri::command]
 pub async fn download_update_command(app: AppHandle) -> Result<DownloadUpdateResult, String> {
     download_update(app).await.map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn restart_after_update_command(app: AppHandle) -> Result<(), String> {
+    restart_after_update(&app).map_err(|err| err.to_string())
 }

@@ -583,6 +583,7 @@ pub fn run() {
             commands::deliver_pending,
             updater::check_for_updates_command,
             updater::download_update_command,
+            updater::restart_after_update_command,
         ])
         .run(tauri::generate_context!());
 

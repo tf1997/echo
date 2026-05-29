@@ -29,6 +29,7 @@ import {
   sendGroupSticker,
   listGroups,
   markGroupRead,
+  restartAfterUpdate,
 } from "./api";
 import type { GroupInfo, TrayUnreadItem } from "./api";
 
@@ -137,7 +138,11 @@ function App() {
     await message(downloaded.message, {
       title: "Echo 更新",
       type: "info",
+      okLabel: "确定",
     });
+    if (downloaded.ready_to_restart) {
+      await restartAfterUpdate();
+    }
   }, []);
 
   const handleBackgroundUpdateAvailable = useCallback(async (result: UpdateCheckResult) => {
