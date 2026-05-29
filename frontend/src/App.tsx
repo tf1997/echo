@@ -475,35 +475,35 @@ function App() {
     return () => { unlisten?.(); };
   }, []);
 
-  const handleSendMessage = useCallback(async (content: string) => {
+  const handleSendMessage = useCallback(async (content: string, clientMsgId?: string) => {
     if (!selectedPeer) throw new Error("未选择联系人");
-    const sent = await sendMessage(selectedPeer.id, content);
+    const sent = await sendMessage(selectedPeer.id, content, clientMsgId);
     setMessages((prev) => [...prev, sent]);
     return sent;
   }, [selectedPeer]);
 
-  const handleSendGroupMsg = useCallback(async (groupId: string, content: string) => {
-    const msg = await sendGroupMessage(groupId, content);
+  const handleSendGroupMsg = useCallback(async (groupId: string, content: string, clientMsgId?: string) => {
+    const msg = await sendGroupMessage(groupId, content, clientMsgId);
     setMessages((prev) => [...prev, msg]);
     return msg;
   }, []);
 
-  const handleSendFile = useCallback(async (filePath: string) => {
+  const handleSendFile = useCallback(async (filePath: string, clientMsgId?: string) => {
     if (selectedGroupId) {
-      return await sendGroupFile(selectedGroupId, filePath);
+      return await sendGroupFile(selectedGroupId, filePath, clientMsgId);
     }
     if (!selectedPeer) throw new Error("未选择联系人");
-    sendFile(selectedPeer.id, filePath).catch(console.error);
+    sendFile(selectedPeer.id, filePath, clientMsgId).catch(console.error);
   }, [selectedPeer, selectedGroupId]);
 
-  const handleSendSticker = useCallback(async (filePath: string) => {
+  const handleSendSticker = useCallback(async (filePath: string, clientMsgId?: string) => {
     if (selectedGroupId) {
-      const sent = await sendGroupSticker(selectedGroupId, filePath);
+      const sent = await sendGroupSticker(selectedGroupId, filePath, clientMsgId);
       setMessages((prev) => [...prev, sent]);
       return sent;
     }
     if (!selectedPeer) throw new Error("未选择联系人");
-    return await sendSticker(selectedPeer.id, filePath);
+    return await sendSticker(selectedPeer.id, filePath, clientMsgId);
   }, [selectedPeer, selectedGroupId]);
 
   const handleSaveProfile = useCallback(async () => {

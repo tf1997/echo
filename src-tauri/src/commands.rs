@@ -183,8 +183,9 @@ pub async fn send_message(
     state: State<'_, AppState>,
     peer_id: String,
     content: String,
+    client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_message_typed(state, peer_id, content, "text".to_string()).await
+    send_message_typed(state, peer_id, content, "text".to_string(), client_msg_id).await
 }
 
 #[tauri::command]
@@ -193,6 +194,7 @@ pub async fn send_message_typed(
     peer_id: String,
     content: String,
     msg_type: String,
+    client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
     let runtime_opt = { state.runtime.read().await.clone() };
     let Some(runtime) = runtime_opt.as_ref() else {
@@ -221,7 +223,7 @@ pub async fn send_message_typed(
     drop(discovery);
 
     let chat = runtime.chat.lock().await;
-    chat.send_message_typed(&peer, &content, &msg_type)
+    chat.send_message_typed(&peer, &content, &msg_type, client_msg_id.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
@@ -232,8 +234,9 @@ pub async fn send_file(
     state: State<'_, AppState>,
     peer_id: String,
     file_path: String,
+    client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_file_with_kind(app_handle, state, peer_id, file_path, "file").await
+    send_file_with_kind(app_handle, state, peer_id, file_path, "file", client_msg_id).await
 }
 
 #[tauri::command]
@@ -242,8 +245,9 @@ pub async fn send_sticker(
     state: State<'_, AppState>,
     peer_id: String,
     file_path: String,
+    client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_file_with_kind(app_handle, state, peer_id, file_path, "sticker").await
+    send_file_with_kind(app_handle, state, peer_id, file_path, "sticker", client_msg_id).await
 }
 
 async fn send_file_with_kind(
@@ -252,6 +256,7 @@ async fn send_file_with_kind(
     peer_id: String,
     file_path: String,
     file_kind: &str,
+    client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
     info!("send_file: start ({})", file_kind);
     let t0 = std::time::Instant::now();
@@ -340,6 +345,7 @@ async fn send_file_with_kind(
         file_size: None,
         timestamp: Utc::now().to_rfc3339(),
         is_read: true,
+        client_msg_id,
     })
 }
 
@@ -1120,14 +1126,14 @@ pub async fn list_groups(state: State<'_, AppState>) -> Result<Vec<crate::db::Gr
 
 #[tauri::command]
 pub async fn send_group_message(
-    state: State<'_, AppState>, group_id: String, content: String,
+    state: State<'_, AppState>, group_id: String, content: String, client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_group_message_typed(state, group_id, content, "text".to_string()).await
+    send_group_message_typed(state, group_id, content, "text".to_string(), client_msg_id).await
 }
 
 #[tauri::command]
 pub async fn send_group_message_typed(
-    state: State<'_, AppState>, group_id: String, content: String, msg_type: String,
+    state: State<'_, AppState>, group_id: String, content: String, msg_type: String, client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
     let (my_id, my_name, my_department, listen_port, members) = {
         let runtime_opt = { state.runtime.read().await.clone() };
@@ -1139,7 +1145,7 @@ pub async fn send_group_message_typed(
         (r.my_id.clone(), my_name, my_dept, r.listen_port, members)
     };
 
-    let msg = state.db.save_group_message(&group_id, &my_id, &my_name, &content, &msg_type, None, None, None, true).await.map_err(|e| e.to_string())?;
+    let msg = state.db.save_group_message(&group_id, &my_id, &my_name, &content, &msg_type, None, None, None, true, client_msg_id.as_deref()).await.map_err(|e| e.to_string())?;
 
     let online_peers = {
         let runtime_opt = { state.runtime.read().await.clone() };
@@ -1292,8 +1298,9 @@ pub async fn send_group_file(
     state: State<'_, AppState>,
     group_id: String,
     file_path: String,
+    client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_group_file_with_kind(app_handle, state, group_id, file_path, "file").await
+    send_group_file_with_kind(app_handle, state, group_id, file_path, "file", client_msg_id).await
 }
 
 #[tauri::command]
@@ -1302,8 +1309,9 @@ pub async fn send_group_sticker(
     state: State<'_, AppState>,
     group_id: String,
     file_path: String,
+    client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_group_file_with_kind(app_handle, state, group_id, file_path, "sticker").await
+    send_group_file_with_kind(app_handle, state, group_id, file_path, "sticker", client_msg_id).await
 }
 
 async fn send_group_file_with_kind(
@@ -1312,6 +1320,7 @@ async fn send_group_file_with_kind(
     group_id: String,
     file_path: String,
     file_kind: &str,
+    client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
     use chrono::Utc;
     let (my_id, my_name, my_department, listen_port, db, members) = {
@@ -1339,7 +1348,7 @@ async fn send_group_file_with_kind(
     let saved = db.save_group_message(
         &group_id, &my_id, &my_name,
         &content, msg_kind,
-        Some(&file_path), Some(&file_name), Some(file_size), true,
+        Some(&file_path), Some(&file_name), Some(file_size), true, client_msg_id.as_deref(),
     ).await.map_err(|e| e.to_string())?;
 
     // Get online peer snapshot once
@@ -1445,6 +1454,7 @@ async fn send_group_file_with_kind(
         file_size: Some(file_size),
         timestamp: Utc::now().to_rfc3339(),
         is_read: true,
+        client_msg_id: saved.client_msg_id,
     })
 }
 

@@ -8,6 +8,7 @@ import { open } from "@tauri-apps/api/dialog";
 
 export interface PendingMessage {
   id: number;
+  clientMsgId: string; // 必填，用于精确匹配数据库消息
   content: string;
   msg_type: string;
   file_name?: string;
@@ -20,6 +21,11 @@ export interface PendingMessage {
   createdAt?: number;
 }
 
+// 生成唯一的客户端消息 ID
+function generateClientMsgId(): string {
+  return `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
 interface ChatWindowProps {
   peer: Peer | null;
   messages: ChatMessage[];
@@ -30,9 +36,9 @@ interface ChatWindowProps {
   groupInfo?: GroupInfo | null;
   peers?: Peer[];
   groups?: GroupInfo[];
-  onSendMessage: (content: string) => Promise<ChatMessage>;
-  onSendFile: (filePath: string) => Promise<void | ChatMessage>;
-  onSendSticker: (filePath: string) => Promise<ChatMessage>;
+  onSendMessage: (content: string, clientMsgId?: string) => Promise<ChatMessage>;
+  onSendFile: (filePath: string, clientMsgId?: string) => Promise<void | ChatMessage>;
+  onSendSticker: (filePath: string, clientMsgId?: string) => Promise<ChatMessage>;
   onGroupUpdated?: () => void;
 }
 
@@ -229,6 +235,20 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     setForwardModal({ messages: selected, mode });
   }, [messages, selectedIds]);
 
+  // 核心去重逻辑：通过 client_msg_id 自动清理已保存的 pending 消息
+  useEffect(() => {
+    setPendingMessages((prev) => prev.filter((p) => {
+      if (p.status === "failed") return true; // 保留失败的消息
+
+      // 检查是否已经在数据库消息中（通过 client_msg_id 精确匹配）
+      const exists = messages.some((m) =>
+        m.client_msg_id && m.client_msg_id === p.clientMsgId
+      );
+
+      return !exists; // 如果已存在，移除 pending
+    }));
+  }, [messages]);
+
   // Load custom emojis
   useEffect(() => {
     listEmojiFiles().then(setCustomEmojis).catch(() => {});
@@ -380,12 +400,14 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
 
   const retryText = useCallback(async (pending: PendingMessage) => {
     setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
+    const newClientMsgId = generateClientMsgId();
     try {
-      await onSendMessage(pending.content);
+      await onSendMessage(pending.content, newClientMsgId);
     } catch {
       setPendingMessages((prev) => [...prev, {
         ...pending,
         id: ++pendingId,
+        clientMsgId: newClientMsgId,
         status: "failed",
         error: "重试失败",
       }]);
@@ -395,12 +417,14 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
   const retryFile = useCallback(async (pending: PendingMessage) => {
     if (!pending.file_path) return;
     setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
+    const newClientMsgId = generateClientMsgId();
     try {
-      await onSendFile(pending.file_path);
+      await onSendFile(pending.file_path, newClientMsgId);
     } catch {
       setPendingMessages((prev) => [...prev, {
         ...pending,
         id: ++pendingId,
+        clientMsgId: newClientMsgId,
         status: "failed",
         error: "重试失败",
       }]);
@@ -412,9 +436,11 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     const name = pending.file_name || pending.file_path.replace(/\\/g, "/").split("/").pop() || "sticker";
     setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
     const tempId = ++pendingId;
+    const newClientMsgId = generateClientMsgId();
     setPendingMessages((prev) => [...prev, {
       ...pending,
       id: tempId,
+      clientMsgId: newClientMsgId,
       file_name: name,
       createdAt: Date.now(),
       status: "sending",
@@ -427,7 +453,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       return;
     }
     try {
-      await onSendSticker(pending.file_path);
+      await onSendSticker(pending.file_path, newClientMsgId);
     } catch (e) {
       setPendingMessages((prev) => prev.map((p) =>
         p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
@@ -441,8 +467,11 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     nearBottomRef.current = true;
     const name = filePath.replace(/\\/g, "/").split("/").pop() || "sticker";
     const tempId = ++pendingId;
+    const clientMsgId = generateClientMsgId();
+
     setPendingMessages((prev) => [...prev, {
       id: tempId,
+      clientMsgId,
       content: "[表情]",
       msg_type: "sticker",
       file_name: name,
@@ -457,7 +486,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       return;
     }
     try {
-      await onSendSticker(filePath);
+      await onSendSticker(filePath, clientMsgId);
     } catch (e) {
       setPendingMessages((prev) => prev.map((p) =>
         p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
@@ -475,12 +504,20 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     }
 
     const tempId = ++pendingId;
-    const temp: PendingMessage = { id: tempId, content: trimmed, msg_type: "text", status: "sending" };
+    const clientMsgId = generateClientMsgId();
+
+    const temp: PendingMessage = {
+      id: tempId,
+      clientMsgId,
+      content: trimmed,
+      msg_type: "text",
+      status: "sending"
+    };
     setPendingMessages((prev) => [...prev, temp]);
 
     try {
-      await onSendMessage(trimmed);
-      setPendingMessages((prev) => prev.filter((p) => p.id !== tempId));
+      await onSendMessage(trimmed, clientMsgId);
+      // 不需要手动清理，useEffect 会自动处理
     } catch (e) {
       setPendingMessages((prev) => prev.map((p) =>
         p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
@@ -507,8 +544,11 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     nearBottomRef.current = true;
 
     const tempId = ++pendingId;
+    const clientMsgId = generateClientMsgId();
+
     const temp: PendingMessage = {
       id: tempId,
+      clientMsgId,
       content: `📎 ${file.name}`,
       msg_type: "file",
       file_name: file.name,
@@ -522,7 +562,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       if (filePath) {
         // attach the real path so retries can use it and so pending matches final message
         setPendingMessages((prev) => prev.map((p) => p.id === tempId ? { ...p, file_path: filePath } : p));
-        onSendFile(filePath).catch((e) => {
+        onSendFile(filePath, clientMsgId).catch((e) => {
           setPendingMessages((prev) => prev.map((p) =>
             p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
           ));
@@ -538,7 +578,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       // Update pending entry to use the saved temp filename (it has a timestamp prefix)
       const savedName = savedPath.replace(/\\/g, "/").split("/").pop() || file.name;
       setPendingMessages((prev) => prev.map((p) => p.id === tempId ? { ...p, file_name: savedName, file_path: savedPath, file_size: file.size } : p));
-      onSendFile(savedPath).catch((e) => {
+      onSendFile(savedPath, clientMsgId).catch((e) => {
         setPendingMessages((prev) => prev.map((p) =>
           p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
         ));
@@ -586,10 +626,11 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
           const name = filePath.replace(/\\/g, "/").split("/").pop() || "file";
           nearBottomRef.current = true;
           const tempId = ++pendingId;
+          const clientMsgId = generateClientMsgId();
           setPendingMessages((prev) => [...prev, {
-            id: tempId, content: `📎 ${name}`, msg_type: "file", file_name: name, status: "sending",
+            id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, status: "sending",
           }]);
-          onSendFile(filePath).catch((e) => {
+          onSendFile(filePath, clientMsgId).catch((e) => {
             setPendingMessages((prev) => prev.map((p) =>
               p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
             ));
@@ -613,10 +654,11 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       const name = filePath.replace(/\\/g, "/").split("/").pop() || "file";
       nearBottomRef.current = true;
       const tempId = ++pendingId;
+      const clientMsgId = generateClientMsgId();
       setPendingMessages((prev) => [...prev, {
-        id: tempId, content: `📎 ${name}`, msg_type: "file", file_name: name, status: "sending",
+        id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, status: "sending",
       }]);
-      onSendFile(filePath).catch((e) => {
+      onSendFile(filePath, clientMsgId).catch((e) => {
         setPendingMessages((prev) => prev.map((p) =>
           p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
         ));

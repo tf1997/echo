@@ -533,13 +533,13 @@ body {
 }
 
 :root[data-theme="wechat"] .own-profile-avatar {
-  background: linear-gradient(180deg, #13bf6d 0%, #0b9c58 100%) !important;
+  background: linear-gradient(180deg, #07C160 0%, #06AD56 100%) !important;
   color: #ffffff !important;
-  box-shadow: 0 7px 18px rgb(11 156 88 / 0.16), inset 0 0 0 1px rgb(255 255 255 / 0.18);
+  box-shadow: 0 7px 18px rgb(6 173 86 / 0.16), inset 0 0 0 1px rgb(255 255 255 / 0.18);
 }
 
 :root[data-theme="wechat"] .own-profile-avatar:hover {
-  background: linear-gradient(180deg, #17c977 0%, #0aa15b 100%) !important;
+  background: linear-gradient(180deg, #08CD66 0%, #07B65C 100%) !important;
 }
 
 :root[data-theme="wechat"] .border-indigo-400,

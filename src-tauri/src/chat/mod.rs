@@ -375,7 +375,7 @@ impl ChatServer {
                                 if let Err(e) = db.save_group_message(
                                     gid, sender_id, sender_name, &display_content, msg_kind,
                                     Some(&saved_path), Some(file_name_display),
-                                    msg.file_size.map(|s| s as i64), false,
+                                    msg.file_size.map(|s| s as i64), false, None,
                                 ).await {
                                     error!("Failed to save incoming group file message: {}", e);
                                 }
@@ -391,6 +391,7 @@ impl ChatServer {
                                         Some(&saved_path),
                                         Some(file_name_display),
                                         msg.file_size.map(|s| s as i64),
+                                        None, // client_msg_id - incoming messages don't have it
                                     )
                                     .await
                                 {
@@ -423,7 +424,7 @@ impl ChatServer {
 
                             if let Some(ref gid) = msg.group_id {
                                 // Group message — save with group_id; is_read=false so unread counts work
-                                let _ = db.save_group_message(gid, &msg.sender_id, &msg.sender_name, &msg.content, &msg.msg_type, None, None, None, false).await;
+                                let _ = db.save_group_message(gid, &msg.sender_id, &msg.sender_name, &msg.content, &msg.msg_type, None, None, None, false, None).await;
                                 // Auto-join if needed (only when group truly missing — typical when we missed group_created)
                                 let my_groups = db.list_groups(&my_id).await.unwrap_or_default();
                                 if !my_groups.iter().any(|g| g.group_id == *gid) {
@@ -432,7 +433,7 @@ impl ChatServer {
                                 }
                             } else {
                                 // Private message
-                                let _ = db.save_message(&msg.sender_id, &msg.sender_name, &my_id, &msg.content, &msg.msg_type, msg.file_name.as_deref(), None, msg.file_size.map(|s| s as i64)).await;
+                                let _ = db.save_message(&msg.sender_id, &msg.sender_name, &my_id, &msg.content, &msg.msg_type, msg.file_name.as_deref(), None, msg.file_size.map(|s| s as i64), None).await;
                             }
 
                             let _ = incoming_tx.send(IncomingMessage {
@@ -458,10 +459,10 @@ impl ChatServer {
 
     /// Send a text message to a peer.
     pub async fn send_message(&self, peer: &Peer, content: &str) -> Result<crate::db::ChatMessage> {
-        self.send_message_typed(peer, content, "text").await
+        self.send_message_typed(peer, content, "text", None).await
     }
 
-    pub async fn send_message_typed(&self, peer: &Peer, content: &str, msg_type: &str) -> Result<crate::db::ChatMessage> {
+    pub async fn send_message_typed(&self, peer: &Peer, content: &str, msg_type: &str, client_msg_id: Option<&str>) -> Result<crate::db::ChatMessage> {
         let msg = WireMessage {
             sender_id: self.my_id.clone(),
             sender_name: self.my_name.clone(),
@@ -481,7 +482,7 @@ impl ChatServer {
         self.send_wire_message(peer, &msg).await?;
         let _ = self.db.add_recent_contact(&peer.id).await;
         let saved = self.db
-            .save_message(&self.my_id, &self.my_name, &peer.id, content, msg_type, None, None, None)
+            .save_message(&self.my_id, &self.my_name, &peer.id, content, msg_type, None, None, None, client_msg_id)
             .await?;
         Ok(saved)
     }
@@ -576,6 +577,7 @@ impl ChatServer {
                 Some(file_path),
                 Some(&file_name),
                 Some(file_size as i64),
+                None, // client_msg_id not used in this legacy path
             )
             .await?;
 
@@ -841,6 +843,7 @@ async fn send_file_in_background_inner(
         let saved = db.save_message(&my_id, &my_name, &peer.id,
             &content, msg_kind,
             Some(file_path), Some(file_name), Some(file_size as i64),
+            None, // client_msg_id - background file send doesn't use it (placeholder already returned)
         ).await?;
 
         // Update peer last_seen
@@ -874,6 +877,7 @@ async fn send_file_in_background_inner(
             file_size: Some(file_size as i64),
             timestamp: chrono::Utc::now().to_rfc3339(),
             is_read: true,
+            client_msg_id: None,
         })
     }
 }

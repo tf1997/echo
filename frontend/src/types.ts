@@ -31,6 +31,7 @@ export interface ChatMessage {
   file_size: number | null;
   timestamp: string;
   is_read: boolean;
+  client_msg_id?: string | null;
 }
 
 export interface AppInfo {

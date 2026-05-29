@@ -93,6 +93,8 @@ pub struct ChatMessage {
     pub file_size: Option<i64>,
     pub timestamp: String,
     pub is_read: bool,
+    #[serde(default)]
+    pub client_msg_id: Option<String>,
 }
 
 pub struct Database {
@@ -250,6 +252,22 @@ impl Database {
                 return Err(error).context("Failed to add group_id to messages");
             }
         }
+
+        // Add client_msg_id to messages if not exists
+        if let Err(error) = sqlx::query("ALTER TABLE messages ADD COLUMN client_msg_id TEXT")
+            .execute(&self.pool).await
+        {
+            let msg = error.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(error).context("Failed to add client_msg_id to messages");
+            }
+        }
+
+        // Create index on client_msg_id for fast lookups
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_client_msg_id ON messages(client_msg_id)")
+            .execute(&self.pool)
+            .await
+            .context("Failed to create client_msg_id index")?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS pending_group_messages (
@@ -748,21 +766,21 @@ impl Database {
     pub async fn save_group_message(
         &self, group_id: &str, sender_id: &str, sender_name: &str,
         content: &str, msg_type: &str, file_path: Option<&str>, file_name: Option<&str>, file_size: Option<i64>,
-        is_read: bool,
+        is_read: bool, client_msg_id: Option<&str>,
     ) -> Result<ChatMessage> {
         let timestamp = Utc::now().to_rfc3339();
         let id = sqlx::query(
-            "INSERT INTO messages (sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, group_id)
-             VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO messages (sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, group_id, client_msg_id)
+             VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).bind(sender_id).bind(sender_name).bind(content).bind(msg_type)
          .bind(file_path).bind(file_name).bind(file_size).bind(&timestamp)
-         .bind(if is_read { 1 } else { 0 }).bind(group_id)
+         .bind(if is_read { 1 } else { 0 }).bind(group_id).bind(client_msg_id)
          .execute(&self.pool).await.context("Failed to save group message")?.last_insert_rowid();
         Ok(ChatMessage {
             id, sender_id: sender_id.to_string(), sender_name: sender_name.to_string(),
             receiver_id: String::new(), content: content.to_string(), msg_type: msg_type.to_string(),
             file_path: file_path.map(|s| s.to_string()), file_name: file_name.map(|s| s.to_string()),
-            file_size, timestamp, is_read,
+            file_size, timestamp, is_read, client_msg_id: client_msg_id.map(|s| s.to_string()),
         })
     }
 
@@ -787,7 +805,7 @@ impl Database {
 
     pub async fn get_group_messages(&self, group_id: &str) -> Result<Vec<ChatMessage>> {
         let rows = sqlx::query(
-            "SELECT id, sender_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read
+            "SELECT id, sender_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
              FROM messages WHERE group_id = ? ORDER BY id ASC"
         ).bind(group_id).fetch_all(&self.pool).await.context("Failed to get group messages")?;
         Ok(rows.iter().map(|r| ChatMessage {
@@ -795,7 +813,7 @@ impl Database {
             receiver_id: String::new(), content: r.get("content"), msg_type: r.get("msg_type"),
             file_path: r.get("file_path"), file_name: r.get("file_name"),
             file_size: r.get("file_size"), timestamp: r.get("timestamp"),
-            is_read: r.get::<bool, _>("is_read"),
+            is_read: r.get::<bool, _>("is_read"), client_msg_id: r.try_get("client_msg_id").ok(),
         }).collect())
     }
 
@@ -1078,12 +1096,13 @@ impl Database {
         file_path: Option<&str>,
         file_name: Option<&str>,
         file_size: Option<i64>,
+        client_msg_id: Option<&str>,
     ) -> Result<ChatMessage> {
         let timestamp = Utc::now().to_rfc3339();
 
         let result = sqlx::query(
-            "INSERT INTO messages (sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)"
+            "INSERT INTO messages (sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)"
         )
         .bind(sender_id)
         .bind(sender_name)
@@ -1094,6 +1113,7 @@ impl Database {
         .bind(file_name)
         .bind(file_size)
         .bind(&timestamp)
+        .bind(client_msg_id)
         .execute(&self.pool)
         .await
         .context("Failed to save message")?;
@@ -1110,13 +1130,14 @@ impl Database {
             file_size,
             timestamp,
             is_read: false,
+            client_msg_id: client_msg_id.map(|s| s.to_string()),
         })
     }
 
     pub async fn get_conversation(&self, peer_id: &str, my_id: &str) -> Result<Vec<ChatMessage>> {
         log::info!("get_conversation: peer_id={}, my_id={}", peer_id, my_id);
         let rows = sqlx::query(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
              FROM messages
              WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
              ORDER BY id ASC"
@@ -1143,6 +1164,7 @@ impl Database {
                 file_size: row.get("file_size"),
                 timestamp: row.get("timestamp"),
                 is_read: row.get::<bool, _>("is_read"),
+                client_msg_id: row.try_get("client_msg_id").ok(),
             })
             .collect();
 
@@ -1152,7 +1174,7 @@ impl Database {
     pub async fn search_messages(&self, my_id: &str, query: &str) -> Result<Vec<ChatMessage>> {
         let pattern = format!("%{}%", query);
         let rows = sqlx::query(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
              FROM messages
              WHERE (sender_id = ? OR receiver_id = ?)
                AND (content LIKE ? OR file_name LIKE ?)
@@ -1181,6 +1203,7 @@ impl Database {
                 file_size: row.get("file_size"),
                 timestamp: row.get("timestamp"),
                 is_read: row.get::<bool, _>("is_read"),
+                client_msg_id: row.try_get("client_msg_id").ok(),
             })
             .collect())
     }
