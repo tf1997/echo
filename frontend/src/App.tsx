@@ -42,6 +42,10 @@ function formatUpdatePrompt(result: UpdateCheckResult) {
   return `发现新版本 ${version}，是否现在下载？\n\n更新说明：\n${notes}`;
 }
 
+function isEndpointLike(value: string) {
+  return /^.+:\d+$/.test(value.trim());
+}
+
 function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
@@ -213,27 +217,55 @@ function App() {
     const items: TrayUnreadItem[] = [];
     const seen = new Set<string>();
 
+    const peerById = new Map(peers.map((peer) => [peer.id, peer]));
+    const peerByEndpoint = new Map(peers.map((peer) => [`${peer.ip}:${peer.port}`, peer]));
+    const contactBuckets = new Map<string, Omit<TrayUnreadItem, "last_ts">>();
+
     for (const uc of unreadCounts) {
-      const key = `contact:${uc.peer_id}`;
-      seen.add(key);
-      const prev = prevContactUnreadRef.current.get(uc.peer_id) ?? 0;
-      if (uc.count > prev || !lastTs.has(key)) {
-        lastTs.set(key, now);
-      }
-      prevContactUnreadRef.current.set(uc.peer_id, uc.count);
-      if (uc.count > 0) {
-        items.push({
-          kind: "contact",
-          id: uc.peer_id,
-          name: uc.username,
-          count: uc.count,
-          last_ts: lastTs.get(key) ?? now,
+      if (uc.count <= 0) continue;
+
+      const peer = peerById.get(uc.peer_id) ?? peerByEndpoint.get(uc.peer_id);
+      const name = (peer?.username || uc.username || uc.peer_id).trim();
+      const displayName = name || uc.peer_id;
+      const key = isEndpointLike(displayName)
+        ? `contact:${peer?.id ?? uc.peer_id}`
+        : `contact:name:${displayName.toLowerCase()}`;
+      const existing = contactBuckets.get(key);
+      const next = {
+        kind: "contact" as const,
+        id: peer?.id ?? uc.peer_id,
+        name: displayName,
+        count: uc.count,
+      };
+
+      if (!existing) {
+        contactBuckets.set(key, next);
+      } else {
+        const keepNextName = isEndpointLike(existing.name) && !isEndpointLike(next.name);
+        contactBuckets.set(key, {
+          ...existing,
+          id: keepNextName ? next.id : existing.id,
+          name: keepNextName ? next.name : existing.name,
+          count: Math.max(existing.count, next.count),
         });
       }
     }
-    for (const peerId of Array.from(prevContactUnreadRef.current.keys())) {
-      if (!unreadCounts.some((uc) => uc.peer_id === peerId)) {
-        prevContactUnreadRef.current.delete(peerId);
+
+    for (const [key, item] of contactBuckets) {
+      seen.add(key);
+      const prev = prevContactUnreadRef.current.get(key) ?? 0;
+      if (item.count > prev || !lastTs.has(key)) {
+        lastTs.set(key, now);
+      }
+      prevContactUnreadRef.current.set(key, item.count);
+      items.push({
+        ...item,
+        last_ts: lastTs.get(key) ?? now,
+      });
+    }
+    for (const key of Array.from(prevContactUnreadRef.current.keys())) {
+      if (!contactBuckets.has(key)) {
+        prevContactUnreadRef.current.delete(key);
       }
     }
 

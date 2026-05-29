@@ -1209,9 +1209,25 @@ impl Database {
     }
 
     pub async fn mark_read(&self, sender_id: &str, receiver_id: &str) -> Result<()> {
-        sqlx::query("UPDATE messages SET is_read = 1 WHERE sender_id = ? AND receiver_id = ?")
-            .bind(sender_id)
+        sqlx::query(
+            "UPDATE messages
+             SET is_read = 1
+             WHERE receiver_id = ?
+               AND (
+                    sender_id = ?
+                    OR (
+                        sender_name <> ''
+                        AND sender_name = (
+                            SELECT username FROM peers
+                            WHERE peer_id = ? AND username <> ''
+                            LIMIT 1
+                        )
+                    )
+               )",
+        )
             .bind(receiver_id)
+            .bind(sender_id)
+            .bind(sender_id)
             .execute(&self.pool)
             .await
             .context("Failed to mark messages as read")?;
@@ -1220,7 +1236,8 @@ impl Database {
 
     pub async fn get_unread_counts(&self, my_id: &str) -> Result<Vec<UnreadCount>> {
         let rows = sqlx::query(
-            "SELECT m.sender_id, COUNT(*) as cnt, COALESCE(p.username, m.sender_id) as username
+            "SELECT m.sender_id, COUNT(*) as cnt,
+                    COALESCE(NULLIF(p.username, ''), NULLIF(MAX(m.sender_name), ''), m.sender_id) as username
              FROM messages m
              LEFT JOIN peers p ON m.sender_id = p.peer_id
              WHERE m.receiver_id = ? AND m.is_read = 0
