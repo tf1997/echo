@@ -7,6 +7,8 @@ import { convertFileSrc } from "@tauri-apps/api/tauri";
 import { makeSearchHitId } from "./messageUtils";
 
 const MAX_PREVIEW_BYTES = 20 * 1024 * 1024;
+const COLLAPSED_TEXT_CHARS = 520;
+const COLLAPSED_TEXT_LINES = 8;
 
 export interface ForwardCardData {
   title: string;
@@ -66,6 +68,65 @@ function isImageFile(name: string | null): boolean {
 
 function getCopyableBubbleText(message: ChatMessage): string {
   return message.msg_type === "text" ? message.content : "";
+}
+
+function getFileExtension(name: string | null): string {
+  if (!name) return "FILE";
+  const ext = name.split(".").pop()?.trim();
+  return ext ? ext.slice(0, 4).toUpperCase() : "FILE";
+}
+
+function isLongText(text: string): boolean {
+  return text.length > COLLAPSED_TEXT_CHARS || text.split(/\r?\n/).length > COLLAPSED_TEXT_LINES;
+}
+
+function getCollapsedText(text: string): string {
+  const lines = text.split(/\r?\n/);
+  const byLine = lines.length > COLLAPSED_TEXT_LINES
+    ? lines.slice(0, COLLAPSED_TEXT_LINES).join("\n")
+    : text;
+  const byLength = byLine.length > COLLAPSED_TEXT_CHARS
+    ? byLine.slice(0, COLLAPSED_TEXT_CHARS)
+    : byLine;
+  return byLength.trimEnd() + "...";
+}
+
+function looksLikeCodeText(text: string): boolean {
+  if (text.includes("```")) return true;
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length < 2) return false;
+  const codeLikeLines = lines.filter((line) => {
+    const trimmed = line.trim();
+    return (
+      /^\s{2,}\S/.test(line) ||
+      /[{};]$/.test(trimmed) ||
+      /^(const|let|var|function|class|import|export|pub|fn|struct|enum|impl)\b/.test(trimmed) ||
+      trimmed.includes("=>")
+    );
+  });
+  return codeLikeLines.length >= Math.min(3, lines.length);
+}
+
+function renderTextWithLinks(text: string): ReactNode {
+  const pattern = /(https?:\/\/[^\s<]+|www\.[^\s<]+)/gi;
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  let index = 0;
+  let match = pattern.exec(text);
+
+  while (match) {
+    if (match.index > cursor) parts.push(text.slice(cursor, match.index));
+    parts.push(
+      <span key={`url-${index++}`} className="message-url">
+        {match[0]}
+      </span>
+    );
+    cursor = match.index + match[0].length;
+    match = pattern.exec(text);
+  }
+
+  if (cursor < text.length) parts.push(text.slice(cursor));
+  return parts.length > 0 ? parts : text;
 }
 
 function renderTextWithSearchHighlights(text: string, query: string, messageId: number, activeSearchHitId?: string): ReactNode {
@@ -183,13 +244,20 @@ function ImagePreview({ filePath, fileSize }: { filePath: string; fileSize: numb
 
   if (failed || (fileSize !== null && fileSize > MAX_PREVIEW_BYTES)) return null;
   return (
-    <img
-      src={src}
-      alt=""
-      className="w-full max-h-[320px] object-contain cursor-pointer rounded hover:opacity-90 transition-opacity"
+    <button
+      type="button"
+      title="点击预览图片"
+      className="message-image-preview"
       onClick={openPreview}
-      onError={() => setFailedPath(filePath)}
-    />
+    >
+      <img
+        src={src}
+        alt=""
+        className="w-full max-h-[320px] object-contain rounded"
+        onError={() => setFailedPath(filePath)}
+      />
+      <span className="message-image-preview-badge">预览</span>
+    </button>
   );
 }
 
@@ -309,10 +377,19 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
   const [showMenu, setShowMenu] = useState(false);
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null);
   const [addingSticker, setAddingSticker] = useState(false);
+  const [textExpanded, setTextExpanded] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const copyableText = getCopyableBubbleText(message);
   const canCopyText = copyableText.length > 0;
   const canAddSticker = isSticker && !isOwn && !!message.file_path && !!onAddSticker;
+  const attachmentName = message.file_name || (isSticker ? "图片" : "文件");
+  const canCopyFileName = (isFile || isSticker) && !!message.file_name;
+  const canOpenAttachment = (isFile || isSticker) && !!message.file_path;
+  const isTextMessage = message.msg_type === "text";
+  const hasSearchQuery = !!searchQuery.trim();
+  const shouldCollapseText = isTextMessage && !hasSearchQuery && isLongText(message.content);
+  const visibleText = shouldCollapseText && !textExpanded ? getCollapsedText(message.content) : message.content;
+  const messageTextClass = `message-text ${looksLikeCodeText(message.content) ? "message-text-code" : ""}`;
 
   useEffect(() => {
     if (!showMenu) return;
@@ -376,6 +453,47 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
               复制文字
             </button>
           )}
+          {canCopyFileName && (
+            <button
+              className="block w-full px-3 py-1 text-left text-xs text-gray-200 hover:bg-gray-700 rounded-lg whitespace-nowrap"
+              onClick={async (e) => {
+                e.stopPropagation();
+                try {
+                  await copyTextToClipboard(message.file_name || "");
+                } catch (error) {
+                  console.error("Failed to copy filename:", error);
+                } finally {
+                  setShowMenu(false);
+                }
+              }}
+            >
+              复制文件名
+            </button>
+          )}
+          {canOpenAttachment && (
+            <button
+              className="block w-full px-3 py-1 text-left text-xs text-gray-200 hover:bg-gray-700 rounded-lg whitespace-nowrap"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleOpenFile(message.file_path);
+                setShowMenu(false);
+              }}
+            >
+              打开文件
+            </button>
+          )}
+          {canOpenAttachment && (
+            <button
+              className="block w-full px-3 py-1 text-left text-xs text-gray-200 hover:bg-gray-700 rounded-lg whitespace-nowrap"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleOpenFolder(message.file_path);
+                setShowMenu(false);
+              }}
+            >
+              在文件夹中显示
+            </button>
+          )}
           <button
             className="px-3 py-1 text-xs text-gray-200 hover:bg-gray-700 rounded-lg whitespace-nowrap"
             onClick={(e) => { e.stopPropagation(); onStartForward?.(message); setShowMenu(false); }}
@@ -413,11 +531,11 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
         </div>
       )}
 
-      <div className={`max-w-[70%] ${isOwn ? "items-end" : "items-start"} flex flex-col`}>
+      <div className={`message-stack ${isOwn ? "items-end" : "items-start"} flex flex-col`}>
         {!isOwn && showSender && (
-          <span className="text-xs text-indigo-300 mb-1 ml-1">{message.sender_name}</span>
+          <span className="message-sender-label" title={message.sender_name}>{message.sender_name}</span>
         )}
-        <div className={`${isSticker ? "bg-transparent" : `rounded-2xl overflow-hidden ${isOwn ? "message-bubble-own bg-indigo-600 text-white rounded-br-md" : "message-bubble-other bg-gray-700 text-gray-100 rounded-bl-md"}`} ${!isSticker && !showPreview && message.msg_type !== "forward_card" ? "px-4 py-2.5" : ""}`}>
+        <div className={`${isSticker ? "bg-transparent" : `message-bubble-shell rounded-2xl overflow-hidden ${isOwn ? "message-bubble-own bg-indigo-600 text-white rounded-br-md" : "message-bubble-other bg-gray-700 text-gray-100 rounded-bl-md"}`} ${!isSticker && !showPreview && message.msg_type !== "forward_card" ? "px-4 py-2.5" : ""}`}>
           {message.msg_type === "forward_card" ? (() => {
             try {
               const card: ForwardCardData = JSON.parse(message.content);
@@ -433,8 +551,8 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
             <div className="max-w-[260px]">
               <ImagePreview filePath={message.file_path!} fileSize={message.file_size} />
               <div className="flex items-center gap-1 px-3 py-2">
-                <div className="flex-1 min-w-0 cursor-pointer hover:opacity-80" onClick={() => handleOpenFile(message.file_path)}>
-                  <p className="text-xs font-medium truncate">{message.file_name}</p>
+                <div className="flex-1 min-w-0 cursor-pointer hover:opacity-80" onClick={() => handleOpenFile(message.file_path)} title={attachmentName}>
+                  <p className="text-xs font-medium truncate">{attachmentName}</p>
                   {message.file_size ? <p className="text-[10px] opacity-70">{formatFileSize(message.file_size)}</p> : null}
                 </div>
                 <button onClick={(e) => { e.stopPropagation(); handleOpenFolder(message.file_path); }} className="flex-shrink-0 w-6 h-6 rounded flex items-center justify-center hover:bg-white/10" title="在文件夹中显示">
@@ -443,25 +561,42 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
               </div>
             </div>
           ) : isFile ? (
-            <div className="flex items-center gap-2">
-              <div className="flex items-center gap-2 flex-1 min-w-0 cursor-pointer hover:opacity-80" onClick={() => handleOpenFile(message.file_path)} title="点击打开文件">
-                <svg className="w-5 h-5 flex-shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+            <div className="message-file-card flex items-center gap-2">
+              <button type="button" className="flex items-center gap-2 flex-1 min-w-0 text-left hover:opacity-85" onClick={() => handleOpenFile(message.file_path)} title={`打开 ${attachmentName}`}>
+                <span className="message-file-icon">{getFileExtension(message.file_name)}</span>
                 <div className="min-w-0">
-                  <p className="text-sm font-medium truncate">{message.file_name || "文件"}</p>
+                  <p className="message-file-name truncate" title={attachmentName}>{attachmentName}</p>
                   {message.file_size ? <p className="text-xs opacity-70">{formatFileSize(message.file_size)}</p> : null}
                 </div>
-              </div>
+              </button>
               <button onClick={(e) => { e.stopPropagation(); handleOpenFolder(message.file_path); }} className="flex-shrink-0 w-6 h-6 rounded flex items-center justify-center hover:bg-white/10" title="在文件夹中显示">
                 <svg className="w-3.5 h-3.5 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
               </button>
             </div>
           ) : (
-            <p className="text-sm whitespace-pre-wrap break-words">{renderTextWithSearchHighlights(message.content, searchQuery, message.id, activeSearchHitId)}</p>
+            <>
+              <p className={messageTextClass}>
+                {hasSearchQuery
+                  ? renderTextWithSearchHighlights(visibleText, searchQuery, message.id, activeSearchHitId)
+                  : renderTextWithLinks(visibleText)}
+              </p>
+              {shouldCollapseText ? (
+                <button
+                  type="button"
+                  className="message-inline-action"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setTextExpanded((value) => !value);
+                  }}
+                >
+                  {textExpanded ? "收起" : "展开全文"}
+                </button>
+              ) : null}
+            </>
           )}
         </div>
-        <span className={`text-[10px] text-gray-500 mt-1 ${isOwn ? "mr-1" : "ml-1"}`}>
+        <span className={`message-meta ${isOwn ? "mr-1" : "ml-1"}`}>
           {formatTime(message.timestamp)}
-          {isOwn && <span className="ml-1">{message.is_read ? "✓✓" : "✓"}</span>}
         </span>
       </div>
     </div>

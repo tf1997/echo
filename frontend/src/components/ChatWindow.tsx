@@ -107,6 +107,17 @@ function formatSpeed(bytesPerSec: number | undefined): string {
   return `${bytesPerSec} B/s`;
 }
 
+function getPendingStatusText(message: PendingMessage): string {
+  if (message.status === "failed") {
+    return message.error ? `发送失败：${message.error}` : "发送失败";
+  }
+  if (message.msg_type === "file" && message.progress !== undefined) {
+    const speed = formatSpeed(message.speed);
+    return speed ? `${message.progress}% ${speed}` : `${message.progress}%`;
+  }
+  return "发送中...";
+}
+
 type ForwardMode = "individual" | "merged";
 
 function isAttachmentMessage(message: ChatMessage): boolean {
@@ -1032,10 +1043,11 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
             }
             if ("status" in item) {
               const isPendingSticker = item.msg_type === "sticker" && !!item.file_path;
+              const pendingStatusText = getPendingStatusText(item);
               elements.push(
                 <div key={`pending-${item.id}`} className="message-row flex justify-end mb-3 px-4">
-                  <div className="max-w-[70%] flex flex-col items-end">
-                    <div className={`${isPendingSticker ? "overflow-hidden rounded-xl" : "rounded-2xl px-4 py-2.5 rounded-br-md"} ${
+                  <div className="message-stack flex flex-col items-end">
+                    <div className={`${isPendingSticker ? "overflow-hidden rounded-xl" : "message-bubble-shell rounded-2xl px-4 py-2.5 rounded-br-md"} ${
                       item.status === "failed"
                         ? isPendingSticker ? "ring-1 ring-red-500/70" : "bg-red-600/30 border border-red-500/50"
                         : isPendingSticker ? "" : "message-bubble-own bg-indigo-600/50"
@@ -1049,10 +1061,10 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
                           <svg className="w-5 h-5 flex-shrink-0 opacity-80" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                           </svg>
-                          <p className="text-sm truncate">{item.file_name || "文件"}</p>
+                          <p className="message-file-name truncate" title={item.file_name || "文件"}>{item.file_name || "文件"}</p>
                         </div>
                       ) : (
-                        <p className="text-sm whitespace-pre-wrap break-words">{item.content}</p>
+                        <p className="message-text">{item.content}</p>
                       )}
                     </div>
                     {item.msg_type === "file" && item.status === "sending" && item.progress !== undefined && (
@@ -1061,8 +1073,8 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
                       </div>
                     )}
                     <div className="flex items-center gap-2 mt-1">
-                      <span className="text-[10px] text-gray-500">
-                        {item.status === "failed" ? "发送失败" : item.msg_type === "file" && item.progress !== undefined ? `${item.progress}% ${formatSpeed(item.speed)}` : "发送中..."}
+                      <span className="message-meta max-w-[22rem] truncate" title={item.error || pendingStatusText}>
+                        {pendingStatusText}
                       </span>
                       {item.status === "failed" && (
                         <button
