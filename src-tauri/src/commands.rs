@@ -234,9 +234,10 @@ pub async fn send_file(
     state: State<'_, AppState>,
     peer_id: String,
     file_path: String,
+    file_name: Option<String>,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_file_with_kind(app_handle, state, peer_id, file_path, "file", client_msg_id).await
+    send_file_with_kind(app_handle, state, peer_id, file_path, file_name, "file", client_msg_id).await
 }
 
 #[tauri::command]
@@ -245,9 +246,10 @@ pub async fn send_sticker(
     state: State<'_, AppState>,
     peer_id: String,
     file_path: String,
+    file_name: Option<String>,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_file_with_kind(app_handle, state, peer_id, file_path, "sticker", client_msg_id).await
+    send_file_with_kind(app_handle, state, peer_id, file_path, file_name, "sticker", client_msg_id).await
 }
 
 async fn send_file_with_kind(
@@ -255,6 +257,7 @@ async fn send_file_with_kind(
     state: State<'_, AppState>,
     peer_id: String,
     file_path: String,
+    file_name_override: Option<String>,
     file_kind: &str,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
@@ -293,11 +296,18 @@ async fn send_file_with_kind(
     };
     let _ = runtime;
 
-    let file_name = std::path::Path::new(&file_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let file_name = file_name_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            std::path::Path::new(&file_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        });
 
     // Clone for placeholder (before moving into background task)
     let placeholder_my_id = my_id.clone();
@@ -1421,9 +1431,10 @@ pub async fn send_group_file(
     state: State<'_, AppState>,
     group_id: String,
     file_path: String,
+    file_name: Option<String>,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_group_file_with_kind(app_handle, state, group_id, file_path, "file", client_msg_id).await
+    send_group_file_with_kind(app_handle, state, group_id, file_path, file_name, "file", client_msg_id).await
 }
 
 #[tauri::command]
@@ -1432,9 +1443,10 @@ pub async fn send_group_sticker(
     state: State<'_, AppState>,
     group_id: String,
     file_path: String,
+    file_name: Option<String>,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_group_file_with_kind(app_handle, state, group_id, file_path, "sticker", client_msg_id).await
+    send_group_file_with_kind(app_handle, state, group_id, file_path, file_name, "sticker", client_msg_id).await
 }
 
 async fn send_group_file_with_kind(
@@ -1442,6 +1454,7 @@ async fn send_group_file_with_kind(
     state: State<'_, AppState>,
     group_id: String,
     file_path: String,
+    file_name_override: Option<String>,
     file_kind: &str,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
@@ -1455,8 +1468,18 @@ async fn send_group_file_with_kind(
         (r.my_id.clone(), my_name, my_department, r.listen_port, state.db.clone(), members)
     };
 
-    let file_name = std::path::Path::new(&file_path)
-        .file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+    let file_name = file_name_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            std::path::Path::new(&file_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        });
     let file_size = tokio::fs::metadata(&file_path).await
         .map(|m| m.len() as i64).map_err(|e| e.to_string())?;
     let pending_cache: Arc<tokio::sync::Mutex<Option<String>>> = Arc::new(tokio::sync::Mutex::new(None));

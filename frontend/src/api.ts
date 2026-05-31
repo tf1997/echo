@@ -29,12 +29,12 @@ export async function sendMessageTyped(peerId: string, content: string, msgType:
   return await invoke("send_message_typed", { peerId, content, msgType, clientMsgId });
 }
 
-export async function sendFile(peerId: string, filePath: string, clientMsgId?: string): Promise<ChatMessage> {
-  return await invoke("send_file", { peerId, filePath, clientMsgId });
+export async function sendFile(peerId: string, filePath: string, clientMsgId?: string, fileName?: string | null): Promise<ChatMessage> {
+  return await invoke("send_file", { peerId, filePath, clientMsgId, fileName });
 }
 
-export async function sendSticker(peerId: string, filePath: string, clientMsgId?: string): Promise<ChatMessage> {
-  return await invoke("send_sticker", { peerId, filePath, clientMsgId });
+export async function sendSticker(peerId: string, filePath: string, clientMsgId?: string, fileName?: string | null): Promise<ChatMessage> {
+  return await invoke("send_sticker", { peerId, filePath, clientMsgId, fileName });
 }
 
 export async function getConversation(peerId: string, limit?: number): Promise<ChatMessage[]> {
@@ -128,12 +128,12 @@ export async function sendGroupMessageTyped(groupId: string, content: string, ms
   return await invoke("send_group_message_typed", { groupId, content, msgType, clientMsgId });
 }
 
-export async function sendGroupFile(groupId: string, filePath: string, clientMsgId?: string): Promise<ChatMessage> {
-  return await invoke("send_group_file", { groupId, filePath, clientMsgId });
+export async function sendGroupFile(groupId: string, filePath: string, clientMsgId?: string, fileName?: string | null): Promise<ChatMessage> {
+  return await invoke("send_group_file", { groupId, filePath, clientMsgId, fileName });
 }
 
-export async function sendGroupSticker(groupId: string, filePath: string, clientMsgId?: string): Promise<ChatMessage> {
-  return await invoke("send_group_sticker", { groupId, filePath, clientMsgId });
+export async function sendGroupSticker(groupId: string, filePath: string, clientMsgId?: string, fileName?: string | null): Promise<ChatMessage> {
+  return await invoke("send_group_sticker", { groupId, filePath, clientMsgId, fileName });
 }
 
 export async function getGroupMessages(groupId: string, limit?: number): Promise<ChatMessage[]> {

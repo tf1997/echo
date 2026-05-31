@@ -4,7 +4,7 @@ import type { GroupInfo } from "../api";
 import { MessageBubble, DateDivider } from "./MessageBubble";
 import { HistorySearchView } from "./HistorySearchView";
 import { formatDateLabel, makeSearchHitId } from "./messageUtils";
-import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, sendMessage, sendMessageTyped, sendGroupMessage, sendGroupMessageTyped, renameGroup, leaveGroup, dissolveGroup, inviteToGroup } from "../api";
+import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, sendMessage, sendMessageTyped, sendFile, sendSticker, sendGroupMessage, sendGroupMessageTyped, sendGroupFile, sendGroupSticker, renameGroup, leaveGroup, dissolveGroup, inviteToGroup, readFileBase64 } from "../api";
 import type { ForwardCardData } from "./MessageBubble";
 import { open } from "@tauri-apps/api/dialog";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
@@ -104,6 +104,52 @@ function formatSpeed(bytesPerSec: number | undefined): string {
 
 type ForwardMode = "individual" | "merged";
 
+function isAttachmentMessage(message: ChatMessage): boolean {
+  return message.msg_type === "file" || message.msg_type === "sticker";
+}
+
+function fallbackForwardText(message: ChatMessage): string {
+  if (message.msg_type === "file") return `📎 ${message.file_name || message.content || "文件"}`;
+  if (message.msg_type === "sticker") return "[表情]";
+  if (message.msg_type === "forward_card") return "[聊天记录]";
+  return message.content;
+}
+
+async function buildForwardCard(messages: ChatMessage[]): Promise<ForwardCardData> {
+  const items = await Promise.all(messages.map(async (message) => {
+    const item: ForwardCardData["items"][number] = {
+      sender: message.sender_name,
+      content: message.content,
+      msg_type: message.msg_type,
+      timestamp: message.timestamp,
+      file_name: message.file_name,
+      file_size: message.file_size,
+    };
+
+    if (isAttachmentMessage(message)) {
+      item.content = fallbackForwardText(message);
+      if (message.file_path) {
+        try {
+          const file = await readFileBase64(message.file_path);
+          item.file_data = file.base64;
+          item.mime = file.mime;
+        } catch {
+          item.attachment_error = "文件不可用";
+        }
+      } else {
+        item.attachment_error = "文件不可用";
+      }
+    }
+
+    return item;
+  }));
+
+  return {
+    title: `${messages[0]?.sender_name ?? ""} 等人的聊天记录`,
+    items,
+  };
+}
+
 interface ForwardModalProps {
   messages: ChatMessage[];
   mode: ForwardMode;
@@ -127,17 +173,26 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
     try {
       const sorted = [...messages].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
       if (mode === "merged") {
-        const card: ForwardCardData = {
-          title: `${sorted[0]?.sender_name ?? ""} 等人的聊天记录`,
-          items: sorted.map((m) => ({ sender: m.sender_name, content: m.content, msg_type: m.msg_type, timestamp: m.timestamp })),
-        };
+        const card = await buildForwardCard(sorted);
         const json = JSON.stringify(card);
         if (isGroup) await sendGroupMessageTyped(targetId, json, "forward_card");
         else await sendMessageTyped(targetId, json, "forward_card");
       } else {
         for (const m of sorted) {
-          if (isGroup) await sendGroupMessage(targetId, m.content);
-          else await sendMessage(targetId, m.content);
+          if (m.msg_type === "file" && m.file_path) {
+            if (isGroup) await sendGroupFile(targetId, m.file_path, undefined, m.file_name);
+            else await sendFile(targetId, m.file_path, undefined, m.file_name);
+          } else if (m.msg_type === "sticker" && m.file_path) {
+            if (isGroup) await sendGroupSticker(targetId, m.file_path, undefined, m.file_name);
+            else await sendSticker(targetId, m.file_path, undefined, m.file_name);
+          } else if (m.msg_type === "forward_card") {
+            if (isGroup) await sendGroupMessageTyped(targetId, m.content, "forward_card");
+            else await sendMessageTyped(targetId, m.content, "forward_card");
+          } else {
+            const content = isAttachmentMessage(m) ? fallbackForwardText(m) : m.content;
+            if (isGroup) await sendGroupMessage(targetId, content);
+            else await sendMessage(targetId, content);
+          }
         }
       }
       setSent((prev) => new Set([...prev, targetId]));

@@ -1,7 +1,7 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
 import type { ReactNode } from "react";
 import type { ChatMessage } from "../types";
-import { openFile, openFolder } from "../api";
+import { openFile, openFolder, saveTempFile } from "../api";
 import { WebviewWindow } from "@tauri-apps/api/window";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
 import { makeSearchHitId } from "./messageUtils";
@@ -10,7 +10,19 @@ const MAX_PREVIEW_BYTES = 20 * 1024 * 1024;
 
 export interface ForwardCardData {
   title: string;
-  items: { sender: string; content: string; msg_type: string; timestamp: string }[];
+  items: ForwardCardItem[];
+}
+
+export interface ForwardCardItem {
+  sender: string;
+  content: string;
+  msg_type: string;
+  timestamp: string;
+  file_name?: string | null;
+  file_size?: number | null;
+  file_data?: string;
+  mime?: string | null;
+  attachment_error?: string | null;
 }
 
 interface MessageBubbleProps {
@@ -102,6 +114,31 @@ function handleOpenFolder(filePath: string | null) {
   if (filePath) openFolder(filePath).catch(console.error);
 }
 
+function getForwardItemText(item: ForwardCardItem): string {
+  if (item.msg_type === "file") return item.file_name ? `📎 ${item.file_name}` : "[文件]";
+  if (item.msg_type === "sticker") return item.file_name ? `[图片] ${item.file_name}` : "[图片]";
+  if (item.msg_type === "forward_card") return "[聊天记录]";
+  return item.content;
+}
+
+function isForwardAttachment(item: ForwardCardItem): boolean {
+  return item.msg_type === "file" || item.msg_type === "sticker";
+}
+
+function isForwardImage(item: ForwardCardItem): boolean {
+  if (item.mime?.startsWith("image/")) return true;
+  return isImageFile(item.file_name ?? null);
+}
+
+function base64ToBytes(base64: string): number[] {
+  const binary = atob(base64);
+  const bytes = new Array<number>(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
 async function copyTextToClipboard(text: string) {
   try {
     if (navigator.clipboard?.writeText) {
@@ -158,7 +195,30 @@ function ImagePreview({ filePath, fileSize }: { filePath: string; fileSize: numb
 
 function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean }) {
   const [expanded, setExpanded] = useState(false);
+  const [savingIndex, setSavingIndex] = useState<number | null>(null);
+  const [savedPaths, setSavedPaths] = useState<Record<number, string>>({});
   const preview = data.items.slice(0, 3);
+
+  const downloadForwardAttachment = useCallback(async (item: ForwardCardItem, index: number) => {
+    const savedPath = savedPaths[index];
+    if (savedPath) {
+      handleOpenFile(savedPath);
+      return;
+    }
+    if (!item.file_data || savingIndex !== null) return;
+
+    setSavingIndex(index);
+    try {
+      const fileName = item.file_name || "file";
+      const path = await saveTempFile(base64ToBytes(item.file_data), fileName);
+      setSavedPaths((prev) => ({ ...prev, [index]: path }));
+    } catch (error) {
+      console.error("Failed to save forwarded attachment:", error);
+    } finally {
+      setSavingIndex(null);
+    }
+  }, [savedPaths, savingIndex]);
+
   return (
     <div
       className={`w-56 cursor-pointer rounded-xl overflow-hidden border ${isOwn ? "border-indigo-400/30 bg-indigo-700/60" : "border-gray-600 bg-gray-600"}`}
@@ -169,7 +229,7 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
         {preview.map((item, i) => (
           <p key={i} className="text-xs opacity-70 truncate leading-5">
             <span className="font-medium">{item.sender}：</span>
-            {item.msg_type === "file" ? "[文件]" : item.content}
+            {getForwardItemText(item)}
           </p>
         ))}
         {data.items.length > 3 && <p className="text-xs opacity-50 mt-0.5">…</p>}
@@ -194,9 +254,44 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
                     <p className="text-xs text-indigo-300">{item.sender}</p>
                     <p className="text-[10px] text-gray-500">{formatTime(item.timestamp)}</p>
                   </div>
-                  <p className="text-sm text-gray-200 whitespace-pre-wrap break-words">
-                    {item.msg_type === "file" ? "[文件]" : item.content}
-                  </p>
+                  {isForwardAttachment(item) ? (
+                    <div className="rounded-lg border border-gray-700 bg-gray-900/40 overflow-hidden">
+                      {item.file_data && isForwardImage(item) ? (
+                        <img
+                          src={`data:${item.mime || "image/*"};base64,${item.file_data}`}
+                          alt=""
+                          className="w-full max-h-56 object-contain bg-black/20"
+                        />
+                      ) : null}
+                      <div className="flex items-center gap-2 px-3 py-2">
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm text-gray-200 truncate">{item.file_name || (item.msg_type === "sticker" ? "图片" : "文件")}</p>
+                          {item.file_size ? <p className="text-xs text-gray-500">{formatFileSize(item.file_size)}</p> : null}
+                          {!item.file_data ? <p className="text-xs text-red-300">{item.attachment_error || "文件不可下载"}</p> : null}
+                        </div>
+                        <button
+                          disabled={!item.file_data || savingIndex !== null}
+                          onClick={() => downloadForwardAttachment(item, i)}
+                          className="flex-shrink-0 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 text-xs text-white"
+                        >
+                          {savedPaths[i] ? "打开" : savingIndex === i ? "保存中" : "下载"}
+                        </button>
+                        {savedPaths[i] ? (
+                          <button
+                            onClick={() => handleOpenFolder(savedPaths[i])}
+                            className="flex-shrink-0 w-7 h-7 rounded-lg hover:bg-white/10 flex items-center justify-center"
+                            title="在文件夹中显示"
+                          >
+                            <svg className="w-4 h-4 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-gray-200 whitespace-pre-wrap break-words">
+                      {getForwardItemText(item)}
+                    </p>
+                  )}
                 </div>
               ))}
             </div>
