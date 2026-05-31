@@ -1,9 +1,10 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
 import type { ReactNode } from "react";
 import type { ChatMessage } from "../types";
-import { readFileBase64, openFile, openFolder } from "../api";
+import { openFile, openFolder } from "../api";
 import { WebviewWindow } from "@tauri-apps/api/window";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
+import { makeSearchHitId } from "./messageUtils";
 
 const MAX_PREVIEW_BYTES = 20 * 1024 * 1024;
 
@@ -36,24 +37,6 @@ export function DateDivider({ date }: { date: string }) {
   );
 }
 
-export function formatDateLabel(ts: string): string {
-  try {
-    const date = new Date(ts);
-    const now = new Date();
-    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const yesterday = new Date(today.getTime() - 86400000);
-    const msgDay = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-    if (msgDay.getTime() === today.getTime()) return "今天";
-    if (msgDay.getTime() === yesterday.getTime()) return "昨天";
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, "0");
-    const day = String(date.getDate()).padStart(2, "0");
-    return year === now.getFullYear() ? `${month}月${day}日` : `${year}年${month}月${day}日`;
-  } catch {
-    return "";
-  }
-}
-
 function formatTime(ts: string): string {
   try {
     const date = new Date(ts);
@@ -71,10 +54,6 @@ function isImageFile(name: string | null): boolean {
 
 function getCopyableBubbleText(message: ChatMessage): string {
   return message.msg_type === "text" ? message.content : "";
-}
-
-export function makeSearchHitId(messageId: number, occurrenceIndex: number): string {
-  return `search-hit-${messageId}-${occurrenceIndex}`;
 }
 
 function renderTextWithSearchHighlights(text: string, query: string, messageId: number, activeSearchHitId?: string): ReactNode {
@@ -149,18 +128,11 @@ async function copyTextToClipboard(text: string) {
 }
 
 function ImagePreview({ filePath, fileSize }: { filePath: string; fileSize: number | null }) {
-  const [src, setSrc] = useState<string | null>(null);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    if (fileSize !== null && fileSize > MAX_PREVIEW_BYTES) { setFailed(true); return; }
-    readFileBase64(filePath)
-      .then((data) => setSrc(`data:${data.mime};base64,${data.base64}`))
-      .catch(() => setFailed(true));
-  }, [filePath, fileSize]);
+  const [failedPath, setFailedPath] = useState<string | null>(null);
+  const src = convertFileSrc(filePath);
+  const failed = failedPath === filePath;
 
   const openPreview = useCallback(() => {
-    if (!src) return;
     const fileName = filePath.replace(/\\/g, "/").split("/").pop() || "image";
     new WebviewWindow(`image-preview-${Date.now()}`, {
       url: convertFileSrc(filePath),
@@ -170,16 +142,16 @@ function ImagePreview({ filePath, fileSize }: { filePath: string; fileSize: numb
       center: true,
       resizable: true,
     });
-  }, [src, filePath]);
+  }, [filePath]);
 
-  if (failed || !src) return null;
+  if (failed || (fileSize !== null && fileSize > MAX_PREVIEW_BYTES)) return null;
   return (
     <img
       src={src}
       alt=""
       className="w-full max-h-[320px] object-contain cursor-pointer rounded hover:opacity-90 transition-opacity"
       onClick={openPreview}
-      onError={() => setFailed(true)}
+      onError={() => setFailedPath(filePath)}
     />
   );
 }

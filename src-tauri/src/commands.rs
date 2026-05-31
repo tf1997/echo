@@ -727,6 +727,7 @@ pub async fn check_peer_online(
 pub async fn get_conversation(
     state: State<'_, AppState>,
     peer_id: String,
+    limit: Option<i64>,
 ) -> Result<Vec<ChatMessage>, String> {
     let runtime_opt = { state.runtime.read().await.clone() };
     let Some(runtime) = runtime_opt.as_ref() else {
@@ -735,7 +736,7 @@ pub async fn get_conversation(
 
     state
         .db
-        .get_conversation(&peer_id, &runtime.my_id)
+        .get_conversation(&peer_id, &runtime.my_id, limit)
         .await
         .map_err(|e| e.to_string())
 }
@@ -937,6 +938,124 @@ pub async fn search_messages(
     }
 
     Ok(groups.into_values().collect())
+}
+
+#[tauri::command]
+pub async fn search_conversation_messages(
+    state: State<'_, AppState>,
+    peer_id: String,
+    query: String,
+    limit: Option<i64>,
+    filter: Option<String>,
+    day_start: Option<String>,
+    day_end: Option<String>,
+) -> Result<Vec<ChatMessage>, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let runtime_opt = { state.runtime.read().await.clone() };
+    let Some(runtime) = runtime_opt.as_ref() else {
+        return Ok(vec![]);
+    };
+
+    state
+        .db
+        .search_conversation_messages(
+            &peer_id,
+            &runtime.my_id,
+            query,
+            limit,
+            filter.as_deref(),
+            day_start.as_deref(),
+            day_end.as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn search_group_messages(
+    state: State<'_, AppState>,
+    group_id: String,
+    query: String,
+    limit: Option<i64>,
+    filter: Option<String>,
+    day_start: Option<String>,
+    day_end: Option<String>,
+) -> Result<Vec<ChatMessage>, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(vec![]);
+    }
+
+    state
+        .db
+        .search_group_messages(
+            &group_id,
+            query,
+            limit,
+            filter.as_deref(),
+            day_start.as_deref(),
+            day_end.as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_conversation_history(
+    state: State<'_, AppState>,
+    peer_id: String,
+    before_id: Option<i64>,
+    limit: Option<i64>,
+    filter: Option<String>,
+    day_start: Option<String>,
+    day_end: Option<String>,
+) -> Result<Vec<ChatMessage>, String> {
+    let runtime_opt = { state.runtime.read().await.clone() };
+    let Some(runtime) = runtime_opt.as_ref() else {
+        return Ok(vec![]);
+    };
+
+    state
+        .db
+        .get_conversation_history(
+            &peer_id,
+            &runtime.my_id,
+            before_id,
+            limit,
+            filter.as_deref(),
+            day_start.as_deref(),
+            day_end.as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_group_history(
+    state: State<'_, AppState>,
+    group_id: String,
+    before_id: Option<i64>,
+    limit: Option<i64>,
+    filter: Option<String>,
+    day_start: Option<String>,
+    day_end: Option<String>,
+) -> Result<Vec<ChatMessage>, String> {
+    state
+        .db
+        .get_group_history(
+            &group_id,
+            before_id,
+            limit,
+            filter.as_deref(),
+            day_start.as_deref(),
+            day_end.as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1167,8 +1286,12 @@ pub async fn send_group_message_typed(
 }
 
 #[tauri::command]
-pub async fn get_group_messages(state: State<'_, AppState>, group_id: String) -> Result<Vec<ChatMessage>, String> {
-    state.db.get_group_messages(&group_id).await.map_err(|e| e.to_string())
+pub async fn get_group_messages(
+    state: State<'_, AppState>,
+    group_id: String,
+    limit: Option<i64>,
+) -> Result<Vec<ChatMessage>, String> {
+    state.db.get_group_messages(&group_id, limit).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]

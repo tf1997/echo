@@ -46,6 +46,34 @@ function isEndpointLike(value: string) {
   return /^.+:\d+$/.test(value.trim());
 }
 
+const MESSAGE_FETCH_LIMIT = 500;
+
+function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
+  if (left.length !== right.length) return false;
+
+  for (let i = 0; i < left.length; i++) {
+    const a = left[i];
+    const b = right[i];
+    if (
+      a.id !== b.id ||
+      a.sender_id !== b.sender_id ||
+      a.receiver_id !== b.receiver_id ||
+      a.content !== b.content ||
+      a.msg_type !== b.msg_type ||
+      a.file_path !== b.file_path ||
+      a.file_name !== b.file_name ||
+      a.file_size !== b.file_size ||
+      a.timestamp !== b.timestamp ||
+      a.is_read !== b.is_read ||
+      a.client_msg_id !== b.client_msg_id
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
@@ -77,6 +105,7 @@ function App() {
   const unreadInitRef = useRef(true);
   const groupUnreadInitRef = useRef(true);
   const onlineGraceUntilRef = useRef(new Map<string, number>());
+  const loadPeerStateInFlightRef = useRef(false);
 
   // Silent WAV (1 sample) — used only to unlock autoplay policy on first click
   const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
@@ -87,8 +116,13 @@ function App() {
     const warmup = () => {
       // Create during user gesture — required for running state
       if (!audioCtxRef.current) {
-        const Ctor = window.AudioContext || (window as any).webkitAudioContext;
-        audioCtxRef.current = new Ctor();
+        const audioWindow = window as Window & typeof globalThis & {
+          webkitAudioContext?: typeof AudioContext;
+        };
+        const AudioContextCtor = window.AudioContext ?? audioWindow.webkitAudioContext;
+        if (AudioContextCtor) {
+          audioCtxRef.current = new AudioContextCtor();
+        }
       }
       // Belt-and-suspenders: also play a silent sound through an Audio element
       const a = new Audio(SILENT_WAV);
@@ -400,7 +434,13 @@ function App() {
     if (!appInfo?.initialized) return;
 
     const interval = setInterval(() => {
-      loadPeerState().catch(console.error);
+      if (loadPeerStateInFlightRef.current) return;
+      loadPeerStateInFlightRef.current = true;
+      loadPeerState()
+        .catch(console.error)
+        .finally(() => {
+          loadPeerStateInFlightRef.current = false;
+        });
     }, 2000);
 
     return () => {
@@ -408,25 +448,61 @@ function App() {
     };
   }, [appInfo?.initialized, loadPeerState]);
 
+  const selectedPeerId = selectedPeer?.id ?? null;
+
   // Poll contact messages
   useEffect(() => {
-    if (!appInfo?.initialized || !selectedPeer) return;
+    if (!appInfo?.initialized || !selectedPeerId) return;
+    let cancelled = false;
+    let inFlight = false;
+    const activePeerId = selectedPeerId;
     const interval = setInterval(() => {
-      const activePeerId = selectedPeer.id;
-      getConversation(activePeerId).then(setMessages).catch(console.error);
-      markRead(activePeerId).catch(console.error);
+      if (inFlight) return;
+      inFlight = true;
+      getConversation(activePeerId, MESSAGE_FETCH_LIMIT)
+        .then((nextMessages) => {
+          if (cancelled) return;
+          setMessages((currentMessages) =>
+            areMessageListsEqual(currentMessages, nextMessages) ? currentMessages : nextMessages
+          );
+          return markRead(activePeerId);
+        })
+        .catch(console.error)
+        .finally(() => {
+          inFlight = false;
+        });
     }, 1000);
-    return () => clearInterval(interval);
-  }, [appInfo?.initialized, selectedPeer]);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [appInfo?.initialized, selectedPeerId]);
 
   // Poll group messages
   useEffect(() => {
     if (!appInfo?.initialized || !selectedGroupId) return;
+    let cancelled = false;
+    let inFlight = false;
     const interval = setInterval(() => {
-      getGroupMessages(selectedGroupId).then(setMessages).catch(console.error);
-      markGroupRead(selectedGroupId).catch(console.error);
+      if (inFlight) return;
+      inFlight = true;
+      getGroupMessages(selectedGroupId, MESSAGE_FETCH_LIMIT)
+        .then((nextMessages) => {
+          if (cancelled) return;
+          setMessages((currentMessages) =>
+            areMessageListsEqual(currentMessages, nextMessages) ? currentMessages : nextMessages
+          );
+          return markGroupRead(selectedGroupId);
+        })
+        .catch(console.error)
+        .finally(() => {
+          inFlight = false;
+        });
     }, 1000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [appInfo?.initialized, selectedGroupId]);
 
   // Load groups (with unread + last message)
@@ -449,7 +525,7 @@ function App() {
     setMessages([]);
     try {
       const [conv] = await Promise.all([
-        getConversation(peer.id),
+        getConversation(peer.id, MESSAGE_FETCH_LIMIT),
         markRead(peer.id),
       ]);
       setMessages(conv);
@@ -475,7 +551,7 @@ function App() {
     setMessages([]);
     try {
       const [msgs] = await Promise.all([
-        getGroupMessages(groupId),
+        getGroupMessages(groupId, MESSAGE_FETCH_LIMIT),
         markGroupRead(groupId),
       ]);
       setMessages(msgs);

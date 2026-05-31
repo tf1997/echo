@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use log::info;
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqlitePoolOptions, Pool, Row, Sqlite};
+use sqlx::{sqlite::{SqlitePoolOptions, SqliteRow}, Pool, Row, Sqlite};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserProfile {
@@ -99,6 +99,56 @@ pub struct ChatMessage {
 
 pub struct Database {
     pool: Pool<Sqlite>,
+}
+
+const DEFAULT_MESSAGE_LIMIT: i64 = 500;
+const MAX_MESSAGE_LIMIT: i64 = 1000;
+const DEFAULT_SEARCH_LIMIT: i64 = 200;
+const MAX_SEARCH_LIMIT: i64 = 500;
+
+fn normalize_message_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(DEFAULT_MESSAGE_LIMIT).max(1).min(MAX_MESSAGE_LIMIT)
+}
+
+fn normalize_search_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(DEFAULT_SEARCH_LIMIT).max(1).min(MAX_SEARCH_LIMIT)
+}
+
+fn message_filter_clause(filter: Option<&str>) -> &'static str {
+    match filter {
+        Some("file") => "AND msg_type = 'file'",
+        Some("image") => {
+            "AND (msg_type = 'sticker' OR (msg_type = 'file' AND (
+                lower(COALESCE(file_name, '')) LIKE '%.png'
+                OR lower(COALESCE(file_name, '')) LIKE '%.jpg'
+                OR lower(COALESCE(file_name, '')) LIKE '%.jpeg'
+                OR lower(COALESCE(file_name, '')) LIKE '%.gif'
+                OR lower(COALESCE(file_name, '')) LIKE '%.webp'
+                OR lower(COALESCE(file_name, '')) LIKE '%.bmp'
+                OR lower(COALESCE(file_name, '')) LIKE '%.svg'
+                OR lower(COALESCE(file_name, '')) LIKE '%.ico'
+                OR lower(COALESCE(file_name, '')) LIKE '%.tiff'
+            )))"
+        }
+        _ => "",
+    }
+}
+
+fn chat_message_from_row(row: &SqliteRow) -> ChatMessage {
+    ChatMessage {
+        id: row.get("id"),
+        sender_id: row.get("sender_id"),
+        sender_name: row.get("sender_name"),
+        receiver_id: row.get("receiver_id"),
+        content: row.get("content"),
+        msg_type: row.get("msg_type"),
+        file_path: row.get("file_path"),
+        file_name: row.get("file_name"),
+        file_size: row.get("file_size"),
+        timestamp: row.get("timestamp"),
+        is_read: row.get::<bool, _>("is_read"),
+        client_msg_id: row.try_get("client_msg_id").ok(),
+    }
 }
 
 impl Database {
@@ -200,6 +250,22 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("Failed to create messages index")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_conversation_recent
+             ON messages(sender_id, receiver_id, id DESC)",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create recent conversation messages index")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_group_recent
+             ON messages(group_id, id DESC)",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create recent group messages index")?;
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_messages_search
@@ -803,11 +869,16 @@ impl Database {
         Ok(())
     }
 
-    pub async fn get_group_messages(&self, group_id: &str) -> Result<Vec<ChatMessage>> {
+    pub async fn get_group_messages(&self, group_id: &str, limit: Option<i64>) -> Result<Vec<ChatMessage>> {
+        let limit = normalize_message_limit(limit);
         let rows = sqlx::query(
             "SELECT id, sender_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
-             FROM messages WHERE group_id = ? ORDER BY id ASC"
-        ).bind(group_id).fetch_all(&self.pool).await.context("Failed to get group messages")?;
+             FROM (
+                 SELECT id, sender_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+                 FROM messages WHERE group_id = ? ORDER BY id DESC LIMIT ?
+             ) AS recent_messages
+             ORDER BY id ASC"
+        ).bind(group_id).bind(limit).fetch_all(&self.pool).await.context("Failed to get group messages")?;
         Ok(rows.iter().map(|r| ChatMessage {
             id: r.get("id"), sender_id: r.get("sender_id"), sender_name: r.get("sender_name"),
             receiver_id: String::new(), content: r.get("content"), msg_type: r.get("msg_type"),
@@ -1134,18 +1205,24 @@ impl Database {
         })
     }
 
-    pub async fn get_conversation(&self, peer_id: &str, my_id: &str) -> Result<Vec<ChatMessage>> {
+    pub async fn get_conversation(&self, peer_id: &str, my_id: &str, limit: Option<i64>) -> Result<Vec<ChatMessage>> {
+        let limit = normalize_message_limit(limit);
         log::info!("get_conversation: peer_id={}, my_id={}", peer_id, my_id);
         let rows = sqlx::query(
             "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
-             FROM messages
-             WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
+             FROM (
+                 SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+                 FROM messages
+                 WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
+                 ORDER BY id DESC LIMIT ?
+             ) AS recent_messages
              ORDER BY id ASC"
         )
         .bind(my_id)
         .bind(peer_id)
         .bind(peer_id)
         .bind(my_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
         .context("Failed to fetch conversation")?;
@@ -1169,6 +1246,193 @@ impl Database {
             .collect();
 
         Ok(messages)
+    }
+
+    pub async fn get_conversation_history(
+        &self,
+        peer_id: &str,
+        my_id: &str,
+        before_id: Option<i64>,
+        limit: Option<i64>,
+        filter: Option<&str>,
+        day_start: Option<&str>,
+        day_end: Option<&str>,
+    ) -> Result<Vec<ChatMessage>> {
+        let limit = normalize_message_limit(limit);
+        let before_clause = if before_id.is_some() { "AND id < ?" } else { "" };
+        let filter_clause = message_filter_clause(filter);
+        let day_clause = if day_start.is_some() && day_end.is_some() {
+            "AND timestamp >= ? AND timestamp < ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+             FROM (
+                 SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+                 FROM messages
+                 WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+                   {before_clause}
+                   {filter_clause}
+                   {day_clause}
+                 ORDER BY id DESC LIMIT ?
+             ) AS history_messages
+             ORDER BY id ASC"
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(my_id)
+            .bind(peer_id)
+            .bind(peer_id)
+            .bind(my_id);
+        if let Some(before_id) = before_id {
+            query = query.bind(before_id);
+        }
+        if let (Some(day_start), Some(day_end)) = (day_start, day_end) {
+            query = query.bind(day_start).bind(day_end);
+        }
+        let rows = query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to fetch conversation history")?;
+
+        Ok(rows.iter().map(chat_message_from_row).collect())
+    }
+
+    pub async fn get_group_history(
+        &self,
+        group_id: &str,
+        before_id: Option<i64>,
+        limit: Option<i64>,
+        filter: Option<&str>,
+        day_start: Option<&str>,
+        day_end: Option<&str>,
+    ) -> Result<Vec<ChatMessage>> {
+        let limit = normalize_message_limit(limit);
+        let before_clause = if before_id.is_some() { "AND id < ?" } else { "" };
+        let filter_clause = message_filter_clause(filter);
+        let day_clause = if day_start.is_some() && day_end.is_some() {
+            "AND timestamp >= ? AND timestamp < ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+             FROM (
+                 SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+                 FROM messages
+                 WHERE group_id = ?
+                   {before_clause}
+                   {filter_clause}
+                   {day_clause}
+                 ORDER BY id DESC LIMIT ?
+             ) AS history_messages
+             ORDER BY id ASC"
+        );
+        let mut query = sqlx::query(&sql).bind(group_id);
+        if let Some(before_id) = before_id {
+            query = query.bind(before_id);
+        }
+        if let (Some(day_start), Some(day_end)) = (day_start, day_end) {
+            query = query.bind(day_start).bind(day_end);
+        }
+        let rows = query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to fetch group history")?;
+
+        Ok(rows.iter().map(chat_message_from_row).collect())
+    }
+
+    pub async fn search_conversation_messages(
+        &self,
+        peer_id: &str,
+        my_id: &str,
+        query: &str,
+        limit: Option<i64>,
+        filter: Option<&str>,
+        day_start: Option<&str>,
+        day_end: Option<&str>,
+    ) -> Result<Vec<ChatMessage>> {
+        let pattern = format!("%{}%", query);
+        let limit = normalize_search_limit(limit);
+        let filter_clause = message_filter_clause(filter);
+        let day_clause = if day_start.is_some() && day_end.is_some() {
+            "AND timestamp >= ? AND timestamp < ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+             FROM messages
+             WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+               AND (content LIKE ? OR file_name LIKE ?)
+               {filter_clause}
+               {day_clause}
+             ORDER BY id DESC
+             LIMIT ?"
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(my_id)
+            .bind(peer_id)
+            .bind(peer_id)
+            .bind(my_id)
+            .bind(&pattern)
+            .bind(&pattern);
+        if let (Some(day_start), Some(day_end)) = (day_start, day_end) {
+            query = query.bind(day_start).bind(day_end);
+        }
+        let rows = query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to search conversation messages")?;
+
+        Ok(rows.iter().map(chat_message_from_row).collect())
+    }
+
+    pub async fn search_group_messages(
+        &self,
+        group_id: &str,
+        query: &str,
+        limit: Option<i64>,
+        filter: Option<&str>,
+        day_start: Option<&str>,
+        day_end: Option<&str>,
+    ) -> Result<Vec<ChatMessage>> {
+        let pattern = format!("%{}%", query);
+        let limit = normalize_search_limit(limit);
+        let filter_clause = message_filter_clause(filter);
+        let day_clause = if day_start.is_some() && day_end.is_some() {
+            "AND timestamp >= ? AND timestamp < ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+             FROM messages
+             WHERE group_id = ?
+               AND (content LIKE ? OR file_name LIKE ?)
+               {filter_clause}
+               {day_clause}
+             ORDER BY id DESC
+             LIMIT ?"
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(group_id)
+            .bind(&pattern)
+            .bind(&pattern);
+        if let (Some(day_start), Some(day_end)) = (day_start, day_end) {
+            query = query.bind(day_start).bind(day_end);
+        }
+        let rows = query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to search group messages")?;
+
+        Ok(rows.iter().map(chat_message_from_row).collect())
     }
 
     pub async fn search_messages(&self, my_id: &str, query: &str) -> Result<Vec<ChatMessage>> {

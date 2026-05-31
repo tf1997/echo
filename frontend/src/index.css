@@ -322,6 +322,270 @@ body {
   color: color-mix(in srgb, var(--echo-accent-muted) 72%, var(--echo-muted) 28%) !important;
 }
 
+.history-filter-tabs {
+  background-color: var(--echo-control) !important;
+  border: 1px solid var(--echo-border);
+}
+
+.history-filter-button {
+  color: var(--echo-text-soft) !important;
+}
+
+.history-filter-button:hover {
+  background-color: var(--echo-control-hover) !important;
+  color: var(--echo-text) !important;
+}
+
+.history-filter-button-active,
+.history-filter-button-active:hover {
+  background-color: var(--echo-accent) !important;
+  color: #ffffff !important;
+}
+
+.history-date-picker {
+  z-index: 20;
+}
+
+.history-date-trigger {
+  min-width: 7.75rem;
+  max-width: 9.5rem;
+  background-color: var(--echo-control) !important;
+  border: 1px solid var(--echo-border);
+  color: var(--echo-text-soft) !important;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.history-date-trigger:hover,
+.history-date-trigger:focus-visible {
+  background-color: var(--echo-control-hover) !important;
+  border-color: var(--echo-border-soft);
+  color: var(--echo-text) !important;
+}
+
+.history-date-trigger:focus-visible {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--echo-accent) 26%, transparent);
+}
+
+.history-date-trigger-active {
+  color: var(--echo-text) !important;
+  border-color: color-mix(in srgb, var(--echo-accent) 48%, var(--echo-border));
+}
+
+.history-date-popover {
+  position: absolute;
+  top: calc(100% + 0.5rem);
+  right: 0;
+  width: min(15rem, calc(100vw - 2rem));
+  padding: 0.65rem;
+  border: 1px solid var(--echo-border);
+  border-radius: 0.75rem;
+  background: var(--echo-panel);
+  color: var(--echo-text);
+  box-shadow: 0 18px 46px var(--echo-shadow);
+}
+
+.history-calendar-header {
+  display: grid;
+  grid-template-columns: 2rem 1fr 2rem;
+  align-items: center;
+  gap: 0.25rem;
+  margin-bottom: 0.5rem;
+  color: var(--echo-text);
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-align: center;
+}
+
+.history-calendar-nav {
+  width: 2rem;
+  height: 2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.5rem;
+  color: var(--echo-muted);
+}
+
+.history-calendar-nav:hover,
+.history-calendar-nav:focus-visible {
+  background-color: var(--echo-control-hover);
+  color: var(--echo-text);
+}
+
+.history-calendar-weekdays,
+.history-calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 0.2rem;
+}
+
+.history-calendar-weekdays {
+  margin-bottom: 0.25rem;
+  color: var(--echo-muted);
+  font-size: 0.68rem;
+  text-align: center;
+}
+
+.history-calendar-day,
+.history-calendar-day-empty {
+  width: 1.7rem;
+  height: 1.7rem;
+  justify-self: center;
+}
+
+.history-calendar-day {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.45rem;
+  color: var(--echo-text-soft);
+  font-size: 0.74rem;
+  line-height: 1;
+  transition: background-color 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.history-calendar-day:hover,
+.history-calendar-day:focus-visible {
+  background-color: var(--echo-control-hover);
+  color: var(--echo-text);
+}
+
+.history-calendar-day-today {
+  color: var(--echo-accent-muted);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--echo-accent) 46%, transparent);
+}
+
+.history-calendar-day-active,
+.history-calendar-day-active:hover,
+.history-calendar-day-active:focus-visible {
+  background-color: var(--echo-accent) !important;
+  color: #ffffff !important;
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--echo-accent) 28%, transparent);
+}
+
+.history-calendar-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+  padding-top: 0.55rem;
+  border-top: 1px solid color-mix(in srgb, var(--echo-border) 72%, transparent);
+}
+
+.history-calendar-text-button {
+  min-height: 1.7rem;
+  padding: 0 0.45rem;
+  border-radius: 0.45rem;
+  color: var(--echo-accent-muted);
+  font-size: 0.72rem;
+}
+
+.history-calendar-text-button:hover,
+.history-calendar-text-button:focus-visible {
+  background-color: var(--echo-control-hover);
+  color: var(--echo-text);
+}
+
+.history-toolbar {
+  background-color: color-mix(in srgb, var(--echo-bg-soft) 88%, transparent) !important;
+  border-color: var(--echo-border) !important;
+}
+
+.history-icon-button {
+  color: var(--echo-muted) !important;
+}
+
+.history-icon-button:hover {
+  background-color: var(--echo-control-hover) !important;
+  color: var(--echo-text) !important;
+}
+
+.history-result-row {
+  border-color: color-mix(in srgb, var(--echo-border) 72%, transparent) !important;
+}
+
+.history-result-row:hover {
+  background-color: color-mix(in srgb, var(--echo-control) 72%, transparent) !important;
+}
+
+.history-highlight {
+  background-color: color-mix(in srgb, var(--echo-accent) 24%, transparent) !important;
+  border-radius: 4px;
+  color: var(--echo-text) !important;
+  padding: 0 0.125rem;
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--echo-accent) 55%, transparent);
+}
+
+:root[data-theme="daylight"] .history-date-popover {
+  background: #ffffff;
+  border-color: #d6e5eb;
+  box-shadow: 0 18px 42px rgb(33 66 82 / 0.16);
+}
+
+:root[data-theme="daylight"] .history-calendar-day-active,
+:root[data-theme="daylight"] .history-calendar-day-active:hover,
+:root[data-theme="daylight"] .history-calendar-day-active:focus-visible {
+  background-color: #2f8097 !important;
+  color: #ffffff !important;
+}
+
+:root[data-theme="wechat"] .history-date-trigger {
+  background: linear-gradient(180deg, #f5f7f5 0%, var(--wechat-action) 100%) !important;
+  color: var(--wechat-action-text) !important;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.58);
+}
+
+:root[data-theme="wechat"] .history-date-trigger:hover,
+:root[data-theme="wechat"] .history-date-trigger:focus-visible {
+  background: var(--wechat-action-hover) !important;
+  border-color: #c5cec7;
+  color: #26322a !important;
+}
+
+:root[data-theme="wechat"] .history-date-popover {
+  background: linear-gradient(180deg, #fbfcfb 0%, #f4f7f4 100%);
+  border-color: var(--wechat-control-border);
+  box-shadow: 0 18px 42px rgb(35 54 41 / 0.14);
+}
+
+:root[data-theme="wechat"] .history-calendar-weekdays {
+  color: #738078;
+}
+
+:root[data-theme="wechat"] .history-calendar-day {
+  color: #344139;
+}
+
+:root[data-theme="wechat"] .history-calendar-day:hover,
+:root[data-theme="wechat"] .history-calendar-day:focus-visible {
+  background-color: #e8eee8;
+  color: #111b15;
+}
+
+:root[data-theme="wechat"] .history-calendar-day-today {
+  color: #26794a;
+  box-shadow: inset 0 0 0 1px rgb(48 161 87 / 0.38);
+}
+
+:root[data-theme="wechat"] .history-calendar-day-active,
+:root[data-theme="wechat"] .history-calendar-day-active:hover,
+:root[data-theme="wechat"] .history-calendar-day-active:focus-visible {
+  background: linear-gradient(180deg, var(--wechat-accent-top) 0%, var(--wechat-accent-bottom) 100%) !important;
+  color: #102015 !important;
+  box-shadow: 0 8px 18px rgb(80 150 60 / 0.2), inset 0 0 0 1px rgb(255 255 255 / 0.34);
+}
+
+:root[data-theme="wechat"] .history-calendar-text-button {
+  color: #3b734d;
+}
+
+:root[data-theme="daylight"] .history-highlight,
+:root[data-theme="wechat"] .history-highlight {
+  background-color: color-mix(in srgb, var(--echo-own-bubble) 42%, #ffffff 58%) !important;
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--echo-accent) 38%, transparent);
+  color: var(--echo-text) !important;
+}
+
 :root[data-theme="daylight"] .app-sidebar {
   background: linear-gradient(180deg, #fbfdfe 0%, #f3f8fa 100%) !important;
   border-color: #d7e5eb !important;

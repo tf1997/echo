@@ -1,10 +1,13 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import type { ChatMessage, Peer } from "../types";
 import type { GroupInfo } from "../api";
-import { MessageBubble, DateDivider, formatDateLabel, makeSearchHitId } from "./MessageBubble";
-import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, readFileBase64, sendMessage, sendMessageTyped, sendGroupMessage, sendGroupMessageTyped, renameGroup, leaveGroup, dissolveGroup, inviteToGroup } from "../api";
+import { MessageBubble, DateDivider } from "./MessageBubble";
+import { HistorySearchView } from "./HistorySearchView";
+import { formatDateLabel, makeSearchHitId } from "./messageUtils";
+import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, sendMessage, sendMessageTyped, sendGroupMessage, sendGroupMessageTyped, renameGroup, leaveGroup, dissolveGroup, inviteToGroup } from "../api";
 import type { ForwardCardData } from "./MessageBubble";
 import { open } from "@tauri-apps/api/dialog";
+import { convertFileSrc } from "@tauri-apps/api/tauri";
 
 export interface PendingMessage {
   id: number;
@@ -84,12 +87,12 @@ async function readFileAndSave(file: File): Promise<string> {
 const EMOJIS = ["😀","😂","🤣","😍","🥰","😘","😜","🤪","😎","🤩","😢","😭","😤","😡","🤬","👍","👎","👏","🙌","💪","🎉","🔥","❤️","💔","💯","✅","❌","⭐","🌟","📎","📁","💡","🎵","🌹","🍕","☕","🚀","🐱","🐶","🦊","🐼","👋","🤝","🙏","💀","👻","🤖","🎂","🏆","🥇","💩"];
 
 function EmojiThumb({ path }: { path: string }) {
-  const [src, setSrc] = useState<string>("");
-  useEffect(() => {
-    readFileBase64(path).then((d) => setSrc(`data:${d.mime};base64,${d.base64}`)).catch(() => {});
-  }, [path]);
-  if (!src) return <div className="w-full h-full bg-gray-700 rounded" />;
-  return <img src={src} alt="" className="w-full h-full object-contain" />;
+  const [failedPath, setFailedPath] = useState<string | null>(null);
+  const src = convertFileSrc(path);
+  const failed = failedPath === path;
+
+  if (failed) return <div className="w-full h-full bg-gray-700 rounded" />;
+  return <img src={src} alt="" className="w-full h-full object-contain" onError={() => setFailedPath(path)} />;
 }
 
 function formatSpeed(bytesPerSec: number | undefined): string {
@@ -196,7 +199,8 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
   );
 }
 
-export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated }: ChatWindowProps) {
+export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated }: ChatWindowProps) {
+  const peerId = peer?.id ?? null;
   const [inputText, setInputText] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
@@ -206,6 +210,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
   const [deletingEmoji, setDeletingEmoji] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [showSearch, setShowSearch] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
   const [searchIndex, setSearchIndex] = useState(0);
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
@@ -342,12 +347,16 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
   // Clear pending when switching peers + focus input + mark pending scroll
   useEffect(() => {
     setPendingMessages([]);
+    setShowHistory(false);
+    setShowSearch(false);
+    setSearchQuery("");
+    setSearchIndex(0);
     nearBottomRef.current = true;
     pendingScrollRef.current = true;
-    if (peer) {
+    if (peerId) {
       requestAnimationFrame(() => inputRef.current?.focus());
     }
-  }, [peer?.id]);
+  }, [peerId]);
 
   const handleScroll = useCallback(() => {
     const el = messagesContainerRef.current;
@@ -605,7 +614,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
 
   // Tauri native file-drop events (HTML5 dataTransfer.files is empty in Tauri webview)
   useEffect(() => {
-    if (!peer) return;
+    if (!peerId) return;
     let unlistenHover: (() => void) | undefined;
     let unlistenDrop: (() => void) | undefined;
     let unlistenCancelled: (() => void) | undefined;
@@ -644,7 +653,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       unlistenDrop?.();
       unlistenCancelled?.();
     };
-  }, [peer?.id, onSendFile]);
+  }, [peerId, onSendFile]);
 
   const handlePickFile = async () => {
     const selected = await open({ multiple: true });
@@ -747,7 +756,25 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
           <p className="text-xs text-gray-400">{isGroup ? "群聊" : (peer.online ? `${peer.ip}:${peer.port}` : "离线")}</p>
         </div>
         <button
-          onClick={() => { setShowSearch((v) => !v); setSearchQuery(""); setSearchIndex(0); }}
+          type="button"
+          onClick={() => {
+            setForwardModal(null);
+            exitSelectMode();
+            setShowSearch(false);
+            setSearchQuery("");
+            setSearchIndex(0);
+            setShowHistory(true);
+          }}
+          className={`flex-shrink-0 h-8 px-2.5 rounded-lg flex items-center gap-1.5 text-xs hover:bg-gray-700 ${showHistory ? "bg-gray-700 text-white" : "text-gray-400 hover:text-white"}`}
+          title="聊天记录"
+        >
+          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
+          </svg>
+          <span>聊天记录</span>
+        </button>
+        <button
+          onClick={() => { setShowHistory(false); setShowSearch((v) => !v); setSearchQuery(""); setSearchIndex(0); }}
           className="flex-shrink-0 w-8 h-8 rounded-lg hover:bg-gray-700 flex items-center justify-center text-gray-400 hover:text-white"
           title="搜索消息"
         >
@@ -767,6 +794,16 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
           </button>
         )}
       </div>
+      {showHistory ? (
+        <HistorySearchView
+          peer={peer}
+          myId={myId}
+          isGroup={isGroup}
+          groupId={groupId}
+          onClose={() => setShowHistory(false)}
+        />
+      ) : (
+      <>
       {showSearch && (() => {
         return (
           <div className="flex items-center gap-2 px-4 py-2 bg-gray-900/60 border-b border-gray-700">
@@ -1031,6 +1068,8 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
         </div>
         <p className="text-[10px] text-gray-600 mt-1.5 ml-1">Enter 发送 · Shift+Enter 换行 · Ctrl+V 粘贴图片 · 拖拽/📎 发送文件</p>
       </div>
+      </>
+      )}
     </div>
     {/* Group info panel */}
     {isGroup && showGroupPanel && groupInfo && (

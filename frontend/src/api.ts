@@ -37,8 +37,9 @@ export async function sendSticker(peerId: string, filePath: string, clientMsgId?
   return await invoke("send_sticker", { peerId, filePath, clientMsgId });
 }
 
-export async function getConversation(peerId: string): Promise<ChatMessage[]> {
-  return await invoke("get_conversation", { peerId });
+export async function getConversation(peerId: string, limit?: number): Promise<ChatMessage[]> {
+  const args = limit === undefined ? { peerId } : { peerId, limit };
+  return await invoke("get_conversation", args);
 }
 
 export async function markRead(peerId: string): Promise<void> {
@@ -135,8 +136,9 @@ export async function sendGroupSticker(groupId: string, filePath: string, client
   return await invoke("send_group_sticker", { groupId, filePath, clientMsgId });
 }
 
-export async function getGroupMessages(groupId: string): Promise<ChatMessage[]> {
-  return await invoke("get_group_messages", { groupId });
+export async function getGroupMessages(groupId: string, limit?: number): Promise<ChatMessage[]> {
+  const args = limit === undefined ? { groupId } : { groupId, limit };
+  return await invoke("get_group_messages", args);
 }
 
 export async function renameGroup(groupId: string, newName: string): Promise<void> {
@@ -202,8 +204,44 @@ export interface SearchResult {
   messages: SearchHit[];
 }
 
+export type HistoryFilter = "all" | "file" | "image";
+
 export async function searchMessages(query: string): Promise<SearchResult[]> {
   return await invoke("search_messages", { query });
+}
+
+export async function getConversationHistory(peerId: string, beforeId?: number, limit?: number, filter?: HistoryFilter, dayStart?: string, dayEnd?: string): Promise<ChatMessage[]> {
+  return await invoke("get_conversation_history", {
+    peerId,
+    beforeId,
+    limit,
+    filter: filter === "all" ? undefined : filter,
+    dayStart,
+    dayEnd,
+  });
+}
+
+export async function getGroupHistory(groupId: string, beforeId?: number, limit?: number, filter?: HistoryFilter, dayStart?: string, dayEnd?: string): Promise<ChatMessage[]> {
+  return await invoke("get_group_history", {
+    groupId,
+    beforeId,
+    limit,
+    filter: filter === "all" ? undefined : filter,
+    dayStart,
+    dayEnd,
+  });
+}
+
+export async function searchConversationMessages(peerId: string, query: string, limit?: number, filter?: HistoryFilter, dayStart?: string, dayEnd?: string): Promise<ChatMessage[]> {
+  const args = limit === undefined ? { peerId, query, dayStart, dayEnd } : { peerId, query, limit, dayStart, dayEnd };
+  if (filter && filter !== "all") return await invoke("search_conversation_messages", { ...args, filter });
+  return await invoke("search_conversation_messages", args);
+}
+
+export async function searchGroupChatMessages(groupId: string, query: string, limit?: number, filter?: HistoryFilter, dayStart?: string, dayEnd?: string): Promise<ChatMessage[]> {
+  const args = limit === undefined ? { groupId, query, dayStart, dayEnd } : { groupId, query, limit, dayStart, dayEnd };
+  if (filter && filter !== "all") return await invoke("search_group_messages", { ...args, filter });
+  return await invoke("search_group_messages", args);
 }
 
 export async function checkPeerOnline(peerId: string, ip: string, port: number): Promise<boolean> {
