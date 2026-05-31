@@ -31,6 +31,7 @@ interface HistorySearchViewProps {
     messageId?: number | null;
     nonce: number;
   } | null;
+  onJumpToMessage?: (messageId: number) => void;
   onClose: () => void;
 }
 
@@ -156,7 +157,7 @@ function getCalendarCells(month: Date): (Date | null)[] {
   return cells;
 }
 
-export function HistorySearchView({ peer, myId, isGroup, groupId, initialSearchRequest = null, onClose }: HistorySearchViewProps) {
+export function HistorySearchView({ peer, myId, isGroup, groupId, initialSearchRequest = null, onJumpToMessage, onClose }: HistorySearchViewProps) {
   const [filter, setFilter] = useState<HistoryFilter>("all");
   const [selectedDay, setSelectedDay] = useState("");
   const [datePickerOpen, setDatePickerOpen] = useState(false);
@@ -601,9 +602,11 @@ export function HistorySearchView({ peer, myId, isGroup, groupId, initialSearchR
             return (
               <div key={message.id}>
                 {showDivider ? <DateDivider date={label} /> : null}
-                <div
+                <button
+                  type="button"
                   data-history-message-id={message.id}
-                  className={`history-result-row px-4 py-3 border-b border-gray-700/60 ${focused ? "history-result-row-focused" : ""}`}
+                  onClick={() => onJumpToMessage?.(message.id)}
+                  className={`history-result-row block w-full text-left px-4 py-3 border-b border-gray-700/60 ${focused ? "history-result-row-focused" : ""}`}
                 >
                   <div className="flex items-center gap-2 mb-1">
                     <span className="text-xs font-medium text-indigo-300 truncate">{sender}</span>
@@ -611,11 +614,14 @@ export function HistorySearchView({ peer, myId, isGroup, groupId, initialSearchR
                     {typeLabel ? (
                       <span className="text-[10px] text-gray-500 flex-shrink-0">{typeLabel}</span>
                     ) : null}
+                    {onJumpToMessage ? (
+                      <span className="history-jump-label ml-auto flex-shrink-0">定位</span>
+                    ) : null}
                   </div>
                   <p className="text-sm text-gray-200 whitespace-pre-wrap break-words">
                     {highlightText(text, trimmedQuery)}
                   </p>
-                </div>
+                </button>
               </div>
             );
           })

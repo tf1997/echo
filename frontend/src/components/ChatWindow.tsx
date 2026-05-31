@@ -43,6 +43,7 @@ interface ChatWindowProps {
   onSendFile: (filePath: string, clientMsgId?: string) => Promise<void | ChatMessage>;
   onSendSticker: (filePath: string, clientMsgId?: string) => Promise<ChatMessage>;
   onGroupUpdated?: () => void;
+  onLoadHistoryContext?: (messageId: number) => Promise<void>;
   historySearchRequest?: {
     query: string;
     messageId?: number | null;
@@ -270,7 +271,7 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
   );
 }
 
-export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated, historySearchRequest = null }: ChatWindowProps) {
+export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, historySearchRequest = null }: ChatWindowProps) {
   const peerId = peer?.id ?? null;
   const [inputText, setInputText] = useState("");
   const [isDragging, setIsDragging] = useState(false);
@@ -290,7 +291,12 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
   const [groupNameEdit, setGroupNameEdit] = useState("");
   const [groupActionBusy, setGroupActionBusy] = useState("");
   const [groupPanelError, setGroupPanelError] = useState("");
+  const [groupMemberQuery, setGroupMemberQuery] = useState("");
+  const [groupInviteQuery, setGroupInviteQuery] = useState("");
+  const [contextHighlightId, setContextHighlightId] = useState<number | null>(null);
   const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const pendingJumpMessageIdRef = useRef<number | null>(null);
+  const contextHighlightTimerRef = useRef<number | null>(null);
 
   const exitSelectMode = useCallback(() => { setSelectMode(false); setSelectedIds(new Set()); }, []);
 
@@ -429,6 +435,60 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
 
   const pendingScrollRef = useRef(false);
 
+  const scrollToMessage = useCallback((messageId: number) => {
+    requestAnimationFrame(() => {
+      messageRefs.current.get(messageId)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  }, []);
+
+  const highlightContextMessage = useCallback((messageId: number) => {
+    setContextHighlightId(messageId);
+    if (contextHighlightTimerRef.current !== null) {
+      window.clearTimeout(contextHighlightTimerRef.current);
+    }
+    contextHighlightTimerRef.current = window.setTimeout(() => {
+      setContextHighlightId(null);
+      contextHighlightTimerRef.current = null;
+    }, 2600);
+  }, []);
+
+  const handleJumpToHistoryMessage = useCallback(async (messageId: number) => {
+    pendingJumpMessageIdRef.current = messageId;
+    setShowHistory(false);
+    setShowSearch(false);
+    setSearchQuery("");
+    setSearchIndex(0);
+    nearBottomRef.current = false;
+    try {
+      if (!messages.some((message) => message.id === messageId)) {
+        await onLoadHistoryContext?.(messageId);
+      }
+    } catch (error) {
+      pendingJumpMessageIdRef.current = null;
+      console.error("Failed to load history context:", error);
+      return;
+    }
+    highlightContextMessage(messageId);
+    scrollToMessage(messageId);
+  }, [highlightContextMessage, messages, onLoadHistoryContext, scrollToMessage]);
+
+  useEffect(() => {
+    const messageId = pendingJumpMessageIdRef.current;
+    if (messageId === null || showHistory) return;
+    if (!messageRefs.current.has(messageId)) return;
+    pendingJumpMessageIdRef.current = null;
+    highlightContextMessage(messageId);
+    scrollToMessage(messageId);
+  }, [highlightContextMessage, messages, scrollToMessage, showHistory]);
+
+  useEffect(() => {
+    return () => {
+      if (contextHighlightTimerRef.current !== null) {
+        window.clearTimeout(contextHighlightTimerRef.current);
+      }
+    };
+  }, []);
+
   // Clear pending when switching peers + focus input + mark pending scroll
   useEffect(() => {
     setPendingMessages([]);
@@ -436,6 +496,10 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     setShowSearch(false);
     setSearchQuery("");
     setSearchIndex(0);
+    setContextHighlightId(null);
+    setGroupMemberQuery("");
+    setGroupInviteQuery("");
+    pendingJumpMessageIdRef.current = null;
     nearBottomRef.current = true;
     pendingScrollRef.current = true;
     if (peerId) {
@@ -809,6 +873,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     setGroupPanelError("");
     try {
       await inviteToGroup(groupInfo.group_id, [peerId]);
+      setGroupInviteQuery("");
       onGroupUpdated?.();
     } catch (error) {
       await reportGroupActionError(error);
@@ -903,6 +968,38 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       messageRefs.current.get(hit.messageId)?.scrollIntoView({ behavior: "smooth", block: "center" });
     });
   };
+  const groupMembers = groupInfo?.members ?? [];
+  const memberQuery = groupMemberQuery.trim().toLowerCase();
+  const visibleGroupMembers = memberQuery
+    ? groupMembers.filter((member) => {
+        const displayName = member.peer_id === myId ? (myName || member.username || "我") : (member.username || member.peer_id);
+        return [
+          displayName,
+          member.username,
+          member.department,
+          member.peer_id,
+          member.is_online ? "在线" : "离线",
+          groupInfo?.creator_id === member.peer_id ? "群主" : "",
+          member.peer_id === myId ? "我" : "",
+        ].some((value) => value.toLowerCase().includes(memberQuery));
+      })
+    : groupMembers;
+  const inviteCandidates = peers.filter((candidate) =>
+    candidate.id !== myId && !groupMembers.some((member) => member.peer_id === candidate.id)
+  );
+  const inviteQuery = groupInviteQuery.trim().toLowerCase();
+  const visibleInviteCandidates = inviteQuery
+    ? inviteCandidates.filter((candidate) =>
+        [
+          candidate.username,
+          candidate.department,
+          candidate.id,
+          candidate.ip,
+          `${candidate.ip}:${candidate.port}`,
+          candidate.online ? "在线" : "离线",
+        ].some((value) => value.toLowerCase().includes(inviteQuery))
+      )
+    : inviteCandidates;
 
   return (
     <div className="flex-1 flex h-full min-w-0">
@@ -965,9 +1062,16 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
         {isGroup && (
           <button
             onClick={() => {
-              setShowGroupPanel((v) => !v);
-              setGroupNameEdit(groupInfo?.name ?? "");
-              setGroupPanelError("");
+              setShowGroupPanel((v) => {
+                const next = !v;
+                if (next) {
+                  setGroupNameEdit(groupInfo?.name ?? "");
+                  setGroupPanelError("");
+                  setGroupMemberQuery("");
+                  setGroupInviteQuery("");
+                }
+                return next;
+              });
             }}
             className={`flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-gray-700 ${showGroupPanel ? "bg-gray-700 text-white" : ""}`}
             title="群信息"
@@ -986,6 +1090,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
           isGroup={isGroup}
           groupId={groupId}
           initialSearchRequest={historySearchRequest}
+          onJumpToMessage={handleJumpToHistoryMessage}
           onClose={() => setShowHistory(false)}
         />
       ) : (
@@ -1093,7 +1198,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
                     message={item}
                     isOwn={item.sender_id === myId}
                     showSender={isGroup}
-                    highlighted={searchMatchIds.has(item.id) && item.id === highlightedId}
+                    highlighted={(searchMatchIds.has(item.id) && item.id === highlightedId) || contextHighlightId === item.id}
                     searchQuery={searchMatchIds.has(item.id) ? searchQuery : ""}
                     activeSearchHitId={item.id === highlightedId ? currentSearchHit?.id : undefined}
                     selectMode={selectMode}
@@ -1260,7 +1365,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     </div>
     {/* Group info panel */}
     {isGroup && showGroupPanel && groupInfo && (
-      <div className="w-64 flex-shrink-0 bg-gray-900 border-l border-gray-700 flex flex-col h-full overflow-y-auto">
+      <div className="w-72 flex-shrink-0 bg-gray-900 border-l border-gray-700 flex flex-col h-full overflow-y-auto">
         <div className="px-4 py-3 border-b border-gray-700 flex items-center justify-between">
           <span className="text-sm font-semibold text-white">群信息</span>
           <button onClick={() => setShowGroupPanel(false)} className="text-gray-500 hover:text-gray-300 text-lg leading-none">×</button>
@@ -1295,42 +1400,98 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
           </div>
           {/* Members */}
           <div>
-            <p className="text-xs text-gray-400 mb-2">成员 ({groupInfo.members?.length || 0}人)</p>
-            <div className="space-y-1.5">
-              {groupInfo.members?.map((m) => {
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <p className="text-xs text-gray-400">成员 ({visibleGroupMembers.length}/{groupMembers.length}人)</p>
+              {memberQuery ? (
+                <button
+                  type="button"
+                  onClick={() => setGroupMemberQuery("")}
+                  className="text-[10px] text-indigo-300 hover:text-indigo-200"
+                >
+                  清除
+                </button>
+              ) : null}
+            </div>
+            <div className="relative mb-2">
+              <svg className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              </svg>
+              <input
+                value={groupMemberQuery}
+                onChange={(e) => setGroupMemberQuery(e.target.value)}
+                placeholder="搜索成员、部门或状态"
+                className="w-full bg-gray-800 border border-gray-600 rounded-lg pl-8 pr-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500 placeholder-gray-500"
+              />
+            </div>
+            <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
+              {visibleGroupMembers.map((m) => {
                 const displayName = m.peer_id === myId ? (myName || m.username || "我") : (m.username || m.peer_id);
                 return (
-                <div key={m.peer_id} className="flex items-center gap-2">
-                  <div className="w-7 h-7 rounded-full bg-gray-600 flex items-center justify-center text-xs font-medium text-white flex-shrink-0">
-                    {displayName.charAt(0).toUpperCase()}
+                  <div key={m.peer_id} className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-gray-800/70">
+                    <div className="w-7 h-7 rounded-full bg-gray-600 flex items-center justify-center text-xs font-medium text-white flex-shrink-0">
+                      {displayName.charAt(0).toUpperCase()}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs text-gray-200 truncate" title={displayName}>{displayName}{m.peer_id === myId ? " (我)" : ""}</p>
+                      <p className="text-[10px] text-gray-500 truncate">
+                        {groupInfo.creator_id === m.peer_id ? "群主" : (m.department || "成员")}
+                      </p>
+                    </div>
+                    <span className={`w-2 h-2 rounded-full flex-shrink-0 ${m.peer_id === myId ? "bg-green-400" : m.is_online ? "bg-green-400" : "bg-gray-600"}`} title={m.peer_id === myId || m.is_online ? "在线" : "离线"} />
                   </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs text-gray-200 truncate">{displayName}{m.peer_id === myId ? " (我)" : ""}</p>
-                    {groupInfo.creator_id === m.peer_id && <p className="text-[10px] text-indigo-400">群主</p>}
-                  </div>
-                  <span className={`w-2 h-2 rounded-full flex-shrink-0 ${m.peer_id === myId ? "bg-green-400" : m.is_online ? "bg-green-400" : "bg-gray-600"}`} />
-                </div>
                 );
               })}
+              {visibleGroupMembers.length === 0 ? (
+                <div className="rounded-lg border border-gray-700 bg-gray-800/60 px-3 py-4 text-center text-xs text-gray-500">
+                  没有匹配成员
+                </div>
+              ) : null}
             </div>
           </div>
           {/* Invite */}
           <div>
-            <p className="text-xs text-gray-400 mb-1">邀请成员</p>
-            <select
-              onChange={async (e) => {
-                const pid = e.target.value;
-                if (pid) await handleInviteMember(pid);
-                e.target.value = "";
-              }}
-              disabled={!!groupActionBusy}
-              className="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 outline-none disabled:opacity-50"
-            >
-              <option value="">{groupActionBusy === "invite" ? "邀请中..." : "选择联系人..."}</option>
-              {peers.filter((p) => p.id !== myId && !groupInfo.members?.some((m) => m.peer_id === p.id)).map((p) => (
-                <option key={p.id} value={p.id}>{p.username}</option>
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <p className="text-xs text-gray-400">邀请成员</p>
+              <span className="text-[10px] text-gray-500">{inviteCandidates.length} 个可邀请</span>
+            </div>
+            <div className="relative mb-2">
+              <svg className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              </svg>
+              <input
+                value={groupInviteQuery}
+                onChange={(e) => setGroupInviteQuery(e.target.value)}
+                disabled={!!groupActionBusy || inviteCandidates.length === 0}
+                placeholder={inviteCandidates.length === 0 ? "没有可邀请联系人" : "搜索联系人、部门或地址"}
+                className="w-full bg-gray-800 border border-gray-600 rounded-lg pl-8 pr-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500 placeholder-gray-500 disabled:opacity-50"
+              />
+            </div>
+            <div className="max-h-44 overflow-y-auto space-y-1 pr-1">
+              {visibleInviteCandidates.map((candidate) => (
+                <button
+                  key={candidate.id}
+                  type="button"
+                  onClick={() => handleInviteMember(candidate.id)}
+                  disabled={!!groupActionBusy}
+                  className="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-gray-800 disabled:opacity-50"
+                >
+                  <div className="w-7 h-7 rounded-full bg-gray-700 flex items-center justify-center text-xs font-medium text-white flex-shrink-0">
+                    {candidate.username.charAt(0).toUpperCase()}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs text-gray-200 truncate" title={candidate.username}>{candidate.username}</p>
+                    <p className="text-[10px] text-gray-500 truncate">{candidate.department || `${candidate.ip}:${candidate.port}`}</p>
+                  </div>
+                  <span className={`w-2 h-2 rounded-full flex-shrink-0 ${candidate.online ? "bg-green-400" : "bg-gray-600"}`} title={candidate.online ? "在线" : "离线"} />
+                  <span className="text-[10px] text-indigo-300 flex-shrink-0">{groupActionBusy === "invite" ? "邀请中" : "邀请"}</span>
+                </button>
               ))}
-            </select>
+              {visibleInviteCandidates.length === 0 ? (
+                <div className="rounded-lg border border-gray-700 bg-gray-800/60 px-3 py-4 text-center text-xs text-gray-500">
+                  {inviteCandidates.length === 0 ? "联系人都已在群内" : "没有匹配联系人"}
+                </div>
+              ) : null}
+            </div>
           </div>
         </div>
         {/* Leave / Dissolve */}

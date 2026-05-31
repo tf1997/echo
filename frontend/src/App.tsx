@@ -11,6 +11,7 @@ import {
   getAppInfo,
   getPeers,
   getConversation,
+  getConversationHistory,
   sendMessage,
   sendFile,
   sendSticker,
@@ -24,6 +25,7 @@ import {
   getScanSubnets,
   setScanSubnets,
   getGroupMessages,
+  getGroupHistory,
   sendGroupMessage,
   sendGroupFile,
   sendGroupSticker,
@@ -781,6 +783,19 @@ function App() {
     void handleSelectGroup(groupId);
   }, [groups, handleSelectGroup, startHistorySearch]);
 
+  const handleLoadHistoryContext = useCallback(async (messageId: number) => {
+    const beforeId = messageId + 1;
+    if (selectedGroupId) {
+      const context = await getGroupHistory(selectedGroupId, beforeId, MESSAGE_FETCH_LIMIT, "all");
+      setMessages(context);
+      return;
+    }
+    if (selectedPeer) {
+      const context = await getConversationHistory(selectedPeer.id, beforeId, MESSAGE_FETCH_LIMIT, "all");
+      setMessages(context);
+    }
+  }, [selectedGroupId, selectedPeer]);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-screen bg-gray-900">
@@ -905,6 +920,7 @@ function App() {
         onSendFile={handleSendFile}
         onSendSticker={handleSendSticker}
         onGroupUpdated={() => listGroups().then(setGroups).catch(() => {})}
+        onLoadHistoryContext={handleLoadHistoryContext}
         historySearchRequest={
           historySearchRequest && (
             selectedGroupId
