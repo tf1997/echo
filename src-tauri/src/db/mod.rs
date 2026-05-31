@@ -311,6 +311,18 @@ impl Database {
         .await
         .context("Failed to create recent conversation messages index")?;
 
+        // Add group_id to messages before any group-message indexes are created.
+        // On a fresh database the base CREATE TABLE does not include this column,
+        // so creating idx_messages_group_recent first would fail during startup.
+        if let Err(error) = sqlx::query("ALTER TABLE messages ADD COLUMN group_id TEXT")
+            .execute(&self.pool).await
+        {
+            let msg = error.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(error).context("Failed to add group_id to messages");
+            }
+        }
+
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_messages_group_recent
              ON messages(group_id, id DESC)",
@@ -360,16 +372,6 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("Failed to create group_members table")?;
-
-        // Add group_id to messages if not exists
-        if let Err(error) = sqlx::query("ALTER TABLE messages ADD COLUMN group_id TEXT")
-            .execute(&self.pool).await
-        {
-            let msg = error.to_string();
-            if !msg.contains("duplicate column name") {
-                return Err(error).context("Failed to add group_id to messages");
-            }
-        }
 
         // Add client_msg_id to messages if not exists
         if let Err(error) = sqlx::query("ALTER TABLE messages ADD COLUMN client_msg_id TEXT")
@@ -1618,5 +1620,27 @@ impl Database {
                 username: row.get("username"),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+
+    #[tokio::test]
+    async fn initializes_fresh_database_with_group_message_index() {
+        let db_path = std::env::temp_dir().join(format!(
+            "echo-fresh-db-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("fresh database should initialize");
+        drop(db);
+
+        let _ = std::fs::remove_file(db_path);
     }
 }

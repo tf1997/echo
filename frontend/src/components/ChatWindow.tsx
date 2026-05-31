@@ -359,12 +359,12 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     let unlisten: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
     import("@tauri-apps/api/event").then(({ listen }) => {
-      listen<{ fileName: string; sent: number; total: number; speed: number }>("file-progress", (event) => {
-        const { fileName, sent, total, speed } = event.payload;
+      listen<{ fileName: string; clientMsgId?: string | null; sent: number; total: number; speed: number }>("file-progress", (event) => {
+        const { fileName, clientMsgId, sent, total, speed } = event.payload;
         const pct = total > 0 ? Math.round((sent / total) * 100) : 0;
         setPendingMessages((prev) =>
           prev.map((p) =>
-            p.file_name === fileName && p.msg_type === "file"
+            (clientMsgId ? p.clientMsgId === clientMsgId : p.file_name === fileName && p.msg_type === "file")
               ? { ...p, progress: pct, speed, status: pct >= 100 ? "sent" as const : p.status }
               : p
           )
@@ -372,16 +372,18 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
         // Remove pending after 2s (real message will be in DB by then)
         if (pct >= 100) {
           setTimeout(() => {
-            setPendingMessages((prev) => prev.filter((p) => p.file_name !== fileName || p.msg_type !== "file"));
+            setPendingMessages((prev) => prev.filter((p) =>
+              clientMsgId ? p.clientMsgId !== clientMsgId : p.file_name !== fileName || p.msg_type !== "file"
+            ));
           }, 2000);
         }
       }).then((fn) => { unlisten = fn; });
 
-      listen<{ fileName: string; error: string }>("file-error", (event) => {
-        const { fileName, error } = event.payload;
+      listen<{ fileName: string; clientMsgId?: string | null; error: string }>("file-error", (event) => {
+        const { fileName, clientMsgId, error } = event.payload;
         setPendingMessages((prev) =>
           prev.map((p) =>
-            p.file_name === fileName
+            (clientMsgId ? p.clientMsgId === clientMsgId : p.file_name === fileName)
               ? { ...p, status: "failed", error }
               : p
           )

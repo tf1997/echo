@@ -48,6 +48,12 @@ function isEndpointLike(value: string) {
 
 const MESSAGE_FETCH_LIMIT = 500;
 
+interface ConversationUpdatedEvent {
+  kind: "contact" | "group";
+  peer_id?: string | null;
+  group_id?: string | null;
+}
+
 function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
   if (left.length !== right.length) return false;
 
@@ -569,12 +575,58 @@ function App() {
 
   const peersRef = useRef(peers);
   const groupsRef = useRef(groups);
+  const selectedPeerRef = useRef<Peer | null>(selectedPeer);
+  const selectedGroupIdRef = useRef<string | null>(selectedGroupId);
   const selectPeerRef = useRef(handleSelectPeer);
   const selectGroupRef = useRef(handleSelectGroup);
   useEffect(() => { peersRef.current = peers; }, [peers]);
   useEffect(() => { groupsRef.current = groups; }, [groups]);
+  useEffect(() => { selectedPeerRef.current = selectedPeer; }, [selectedPeer]);
+  useEffect(() => { selectedGroupIdRef.current = selectedGroupId; }, [selectedGroupId]);
   useEffect(() => { selectPeerRef.current = handleSelectPeer; }, [handleSelectPeer]);
   useEffect(() => { selectGroupRef.current = handleSelectGroup; }, [handleSelectGroup]);
+
+  useEffect(() => {
+    if (!appInfo?.initialized) return;
+
+    let unlisten: (() => void) | undefined;
+    listen<ConversationUpdatedEvent>("conversation-updated", (event) => {
+      const payload = event.payload;
+      loadPeerState().catch(console.error);
+
+      if (payload.kind === "group") {
+        listGroups().then(setGroups).catch(console.error);
+        const groupId = payload.group_id;
+        if (groupId && selectedGroupIdRef.current === groupId) {
+          getGroupMessages(groupId, MESSAGE_FETCH_LIMIT)
+            .then((nextMessages) => {
+              setMessages((currentMessages) =>
+                areMessageListsEqual(currentMessages, nextMessages) ? currentMessages : nextMessages
+              );
+              return markGroupRead(groupId);
+            })
+            .catch(console.error);
+        }
+        return;
+      }
+
+      const peerId = payload.peer_id;
+      if (peerId && selectedPeerRef.current?.id === peerId) {
+        getConversation(peerId, MESSAGE_FETCH_LIMIT)
+          .then((nextMessages) => {
+            setMessages((currentMessages) =>
+              areMessageListsEqual(currentMessages, nextMessages) ? currentMessages : nextMessages
+            );
+            return markRead(peerId);
+          })
+          .catch(console.error);
+      }
+    }).then((fn) => { unlisten = fn; });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [appInfo?.initialized, loadPeerState]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;

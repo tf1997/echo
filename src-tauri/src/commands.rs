@@ -84,6 +84,7 @@ pub async fn get_departments(state: State<'_, AppState>) -> Result<Vec<String>, 
 
 #[tauri::command]
 pub async fn save_profile(
+    app_handle: AppHandle,
     state: State<'_, AppState>,
     payload: SaveProfilePayload,
 ) -> Result<(), String> {
@@ -170,7 +171,7 @@ pub async fn save_profile(
 
         let profile = state.profile.lock().await.clone().unwrap();
         let relay_tx = state.relay_tx.clone();
-        let runtime = RuntimeServices::start(state.db.clone(), &profile, listen_port, relay_tx)
+        let runtime = RuntimeServices::start(app_handle, state.db.clone(), &profile, listen_port, relay_tx)
             .await
             .map_err(|e| e.to_string())?;
         *state.runtime.write().await = Some(Arc::new(runtime));
@@ -415,13 +416,16 @@ async fn send_file_with_kind(
     let handle = app_handle.clone();
     let error_handle = app_handle.clone();
     let bg_kind = file_kind.to_string();
+    let bg_client_msg_id = client_msg_id.clone();
+    let event_client_msg_id = bg_client_msg_id.clone();
     tauri::async_runtime::spawn(async move {
-        match send_file_in_background_with_kind(&bg_path, &bg_name, &bg_peer, my_id, my_name, my_department, listen_port, db, peers_arc, handle, &bg_kind).await {
+        match send_file_in_background_with_kind(&bg_path, &bg_name, &bg_peer, my_id, my_name, my_department, listen_port, db, peers_arc, handle, bg_client_msg_id, &bg_kind).await {
             Ok(msg) => info!("File sent: {}", msg.content),
             Err(e) => {
                 error!("File send failed: {}", e);
                 let _ = error_handle.emit_all("file-error", serde_json::json!({
                     "fileName": bg_name,
+                    "clientMsgId": event_client_msg_id.as_deref(),
                     "error": e.to_string(),
                 }));
             }
@@ -1681,7 +1685,7 @@ async fn send_group_file_with_kind(
             match send_group_file_to_peer_with_progress(
                 &bg_path, &bg_name, file_size, &peer,
                 &bg_my_id, &bg_my_name, &bg_my_dep, listen_port,
-                &bg_gid, &bg_kind, &bg_handle,
+                &bg_gid, &bg_kind, client_msg_id.as_deref(), &bg_handle,
             ).await {
                 Ok(_) => log::info!("Group file sent to {}", peer.id),
                 Err(e) => {
@@ -1694,6 +1698,7 @@ async fn send_group_file_with_kind(
                         log::error!("Failed to queue group file for {}: {}", peer.id, queue_err);
                         let _ = bg_error_handle.emit_all("file-error", serde_json::json!({
                             "fileName": bg_name,
+                            "clientMsgId": client_msg_id.as_deref(),
                             "error": queue_err,
                         }));
                     }
@@ -1708,6 +1713,7 @@ async fn send_group_file_with_kind(
                 log::error!("Failed to queue group file for {}: {}", target_id, e);
                 let _ = bg_error_handle.emit_all("file-error", serde_json::json!({
                     "fileName": bg_name,
+                    "clientMsgId": client_msg_id.as_deref(),
                     "error": e,
                 }));
             } else {
@@ -1718,6 +1724,7 @@ async fn send_group_file_with_kind(
 
     let _ = app_handle.emit_all("file-progress", serde_json::json!({
         "fileName": file_name,
+        "clientMsgId": client_msg_id.as_deref(),
         "sent": file_size,
         "total": file_size,
         "speed": 0,
@@ -1750,6 +1757,7 @@ async fn send_group_file_to_peer_with_progress(
     listen_port: u16,
     group_id: &str,
     file_kind: &str,
+    client_msg_id: Option<&str>,
     app_handle: &tauri::AppHandle,
 ) -> Result<(), String> {
     let transfer = crate::db::PendingFileTransfer {
@@ -1768,6 +1776,7 @@ async fn send_group_file_to_peer_with_progress(
 
     let _ = app_handle.emit_all("file-progress", serde_json::json!({
         "fileName": file_name,
+        "clientMsgId": client_msg_id,
         "sent": 0,
         "total": file_size,
         "speed": 0,
@@ -1780,6 +1789,7 @@ async fn send_group_file_to_peer_with_progress(
 
     let _ = app_handle.emit_all("file-progress", serde_json::json!({
         "fileName": file_name,
+        "clientMsgId": client_msg_id,
         "sent": file_size,
         "total": file_size,
         "speed": 0,

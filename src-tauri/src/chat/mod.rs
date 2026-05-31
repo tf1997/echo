@@ -9,7 +9,9 @@ use tokio::sync::mpsc;
 use crate::contact_sync;
 use crate::db::Database;
 use crate::discovery::{Peer, PeerEntry};
-use tauri::Manager;
+use tauri::{AppHandle, Manager};
+
+const EVENT_CONVERSATION_UPDATED: &str = "conversation-updated";
 
 /// Wire protocol message sent between peers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +50,15 @@ pub struct IncomingMessage {
     pub timestamp: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ConversationUpdated {
+    kind: String,
+    peer_id: Option<String>,
+    group_id: Option<String>,
+}
+
 pub struct ChatServer {
+    app_handle: AppHandle,
     listen_port: u16,
     my_id: String,
     my_name: String,
@@ -62,6 +72,7 @@ pub struct ChatServer {
 
 impl ChatServer {
     pub fn new(
+        app_handle: AppHandle,
         listen_port: u16,
         my_id: String,
         my_name: String,
@@ -73,6 +84,7 @@ impl ChatServer {
     ) -> Self {
         let (incoming_tx, _incoming_rx) = mpsc::unbounded_channel();
         Self {
+            app_handle,
             listen_port,
             my_id,
             my_name,
@@ -111,6 +123,7 @@ impl ChatServer {
         let db = Arc::clone(&self.db);
         let incoming_tx = self.incoming_tx.clone();
         let peers = Arc::clone(&self.peers);
+        let app_handle = self.app_handle.clone();
         let my_id = self.my_id.clone();
         let my_name = self.my_name.clone();
         let my_department = self.my_department.clone();
@@ -126,13 +139,14 @@ impl ChatServer {
                         let db = Arc::clone(&db);
                         let tx = incoming_tx.clone();
                         let peers = Arc::clone(&peers);
+                        let app_handle = app_handle.clone();
                         let my_id = my_id.clone();
                         let my_name = my_name.clone();
                         let my_department = my_department.clone();
                         let my_software_version = my_software_version.clone();
                         let my_mac_address = my_mac_address.clone();
                         tauri::async_runtime::spawn(async move {
-                            if let Err(e) = Self::handle_incoming(stream, peer_addr, db, tx, peers, my_id, my_name, my_department, my_software_version, my_mac_address, my_port).await {
+                            if let Err(e) = Self::handle_incoming(stream, peer_addr, app_handle, db, tx, peers, my_id, my_name, my_department, my_software_version, my_mac_address, my_port).await {
                                 error!("Error handling connection: {}", e);
                             }
                         });
@@ -150,6 +164,7 @@ impl ChatServer {
     async fn handle_incoming(
         stream: TcpStream,
         peer_addr: std::net::SocketAddr,
+        app_handle: AppHandle,
         db: Arc<Database>,
         incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
         peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
@@ -426,6 +441,7 @@ impl ChatServer {
                                 ).await {
                                     error!("Failed to save incoming group file message: {}", e);
                                 }
+                                emit_group_updated(&app_handle, gid);
                             } else {
                                 let receiver_id = &my_id;
                                 if let Err(e) = db
@@ -444,6 +460,7 @@ impl ChatServer {
                                 {
                                     error!("Failed to save incoming file message: {}", e);
                                 }
+                                emit_contact_updated(&app_handle, sender_id);
                             }
 
                             let _ = incoming_tx.send(IncomingMessage {
@@ -464,6 +481,11 @@ impl ChatServer {
                         }
                         "group_created" | "group_dissolved" | "group_member_left" | "profile_updated" => {
                             // System notifications — already handled above, don't save as message
+                            if let Some(ref gid) = msg.group_id {
+                                emit_group_updated(&app_handle, gid);
+                            } else {
+                                emit_contact_updated(&app_handle, &msg.sender_id);
+                            }
                         }
                         _ => {
                             // Text or other message types
@@ -478,9 +500,11 @@ impl ChatServer {
                                     let _ = db.create_group(gid, "(未命名群组)", &msg.sender_id, &[msg.sender_id.clone(), my_id.clone()]).await;
                                     info!("Auto-joined group {} from message", gid);
                                 }
+                                emit_group_updated(&app_handle, gid);
                             } else {
                                 // Private message
                                 let _ = db.save_message(&msg.sender_id, &msg.sender_name, &my_id, &msg.content, &msg.msg_type, msg.file_name.as_deref(), None, msg.file_size.map(|s| s as i64), None).await;
+                                emit_contact_updated(&app_handle, &msg.sender_id);
                             }
 
                             let _ = incoming_tx.send(IncomingMessage {
@@ -528,8 +552,37 @@ impl ChatServer {
             group_id: None,
         };
 
-        self.send_wire_message(peer, &msg).await?;
+        let delivered = match self.send_wire_message(peer, &msg).await {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(
+                    "Direct message delivery to {} failed, queueing for later: {}",
+                    peer.id, err
+                );
+                let json = serde_json::to_string(&msg).context("Failed to serialize queued message")?;
+                self.db
+                    .queue_pending_notification(&peer.id, msg_type, &json)
+                    .await
+                    .context("Failed to queue offline message")?;
+                false
+            }
+        };
         let _ = self.db.add_recent_contact(&peer.id).await;
+        if !delivered {
+            let _ = self
+                .db
+                .upsert_peer_with_profile(
+                    &peer.id,
+                    &peer.username,
+                    &peer.department,
+                    &peer.software_version,
+                    &peer.mac_address,
+                    &peer.ip.to_string(),
+                    peer.port,
+                    false,
+                )
+                .await;
+        }
         let saved = self.db
             .save_message(&self.my_id, &self.my_name, &peer.id, content, msg_type, None, None, None, client_msg_id)
             .await?;
@@ -730,6 +783,28 @@ impl ChatServer {
     }
 }
 
+fn emit_contact_updated(app_handle: &AppHandle, peer_id: &str) {
+    let _ = app_handle.emit_all(
+        EVENT_CONVERSATION_UPDATED,
+        ConversationUpdated {
+            kind: "contact".to_string(),
+            peer_id: Some(peer_id.to_string()),
+            group_id: None,
+        },
+    );
+}
+
+fn emit_group_updated(app_handle: &AppHandle, group_id: &str) {
+    let _ = app_handle.emit_all(
+        EVENT_CONVERSATION_UPDATED,
+        ConversationUpdated {
+            kind: "group".to_string(),
+            peer_id: None,
+            group_id: Some(group_id.to_string()),
+        },
+    );
+}
+
 fn base64_encode(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(data)
@@ -754,10 +829,11 @@ pub async fn send_file_in_background(
     db: Arc<Database>,
     peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
     app_handle: tauri::AppHandle,
+    client_msg_id: Option<String>,
 ) -> Result<crate::db::ChatMessage> {
     send_file_in_background_with_kind(
         file_path, file_name, peer, my_id, my_name, my_department,
-        listen_port, db, peers, app_handle, "file",
+        listen_port, db, peers, app_handle, client_msg_id, "file",
     ).await
 }
 
@@ -772,11 +848,12 @@ pub async fn send_file_in_background_with_kind(
     db: Arc<Database>,
     peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
     app_handle: tauri::AppHandle,
+    client_msg_id: Option<String>,
     file_kind: &str,
 ) -> Result<crate::db::ChatMessage> {
     send_file_in_background_inner(
         file_path, file_name, peer, my_id, my_name, my_department,
-        listen_port, db, peers, app_handle, None, file_kind,
+        listen_port, db, peers, app_handle, None, client_msg_id, file_kind,
     ).await
 }
 
@@ -794,10 +871,11 @@ pub async fn send_file_in_background_grouped(
     peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
     app_handle: tauri::AppHandle,
     group_id: Option<String>,
+    client_msg_id: Option<String>,
 ) -> Result<()> {
     send_file_in_background_inner(
         file_path, file_name, peer, my_id, my_name, my_department,
-        listen_port, db, peers, app_handle, group_id, "file",
+        listen_port, db, peers, app_handle, group_id, client_msg_id, "file",
     ).await.map(|_| ())
 }
 
@@ -813,6 +891,7 @@ async fn send_file_in_background_inner(
     peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
     app_handle: tauri::AppHandle,
     group_id: Option<String>,
+    client_msg_id: Option<String>,
     file_kind: &str,
 ) -> Result<crate::db::ChatMessage> {
     use tokio::fs::File;
@@ -843,7 +922,7 @@ async fn send_file_in_background_inner(
 
     // Emit start event immediately so UI shows progress bar
     let _ = app_handle.emit_all("file-progress", serde_json::json!({
-        "fileName": file_name, "sent": 0, "total": file_size, "speed": 0,
+        "fileName": file_name, "clientMsgId": client_msg_id.as_deref(), "sent": 0, "total": file_size, "speed": 0,
     }));
 
     let mut buf = vec![0u8; CHUNK_SIZE];
@@ -881,7 +960,7 @@ async fn send_file_in_background_inner(
         let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
         let speed = (sent as f64 / elapsed) as u64; // bytes/sec
         let _ = app_handle.emit_all("file-progress", serde_json::json!({
-            "fileName": file_name, "sent": sent, "total": file_size, "speed": speed,
+            "fileName": file_name, "clientMsgId": client_msg_id.as_deref(), "sent": sent, "total": file_size, "speed": speed,
         }));
     }
     stream.flush().await?;
@@ -889,7 +968,7 @@ async fn send_file_in_background_inner(
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
     let speed = (file_size as f64 / elapsed) as u64;
     let _ = app_handle.emit_all("file-progress", serde_json::json!({
-        "fileName": file_name, "sent": file_size, "total": file_size, "speed": speed,
+        "fileName": file_name, "clientMsgId": client_msg_id.as_deref(), "sent": file_size, "total": file_size, "speed": speed,
     }));
 
     info!("File send complete: {} ({} bytes, {} chunks)", file_name, file_size, i);
@@ -910,7 +989,7 @@ async fn send_file_in_background_inner(
         let saved = db.save_message(&my_id, &my_name, &peer.id,
             &content, msg_kind,
             Some(file_path), Some(file_name), Some(file_size as i64),
-            None, // client_msg_id - background file send doesn't use it (placeholder already returned)
+            client_msg_id.as_deref(),
         ).await?;
 
         // Update peer last_seen
@@ -944,7 +1023,7 @@ async fn send_file_in_background_inner(
             file_size: Some(file_size as i64),
             timestamp: chrono::Utc::now().to_rfc3339(),
             is_read: true,
-            client_msg_id: None,
+            client_msg_id,
         })
     }
 }

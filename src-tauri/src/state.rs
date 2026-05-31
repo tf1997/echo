@@ -5,6 +5,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use crate::chat::ChatServer;
 use crate::db::{Database, UserProfile};
 use crate::discovery::{DiscoveryConfig, DiscoveryService, PeerEntry};
+use tauri::AppHandle;
 
 pub struct RuntimeServices {
     pub discovery: RwLock<DiscoveryService>,
@@ -15,6 +16,7 @@ pub struct RuntimeServices {
 
 impl RuntimeServices {
     pub async fn start(
+        app_handle: AppHandle,
         db: Arc<Database>,
         profile: &UserProfile,
         listen_port: u16,
@@ -57,6 +59,7 @@ impl RuntimeServices {
         let peers = discovery.peers_arc();
 
         let chat = ChatServer::new(
+            app_handle,
             listen_port,
             my_id.clone(),
             profile.username.clone(),

@@ -264,7 +264,7 @@ pub fn run() {
 
             let runtime_services = if let Some(profile) = profile.as_ref() {
                 let runtime = tauri::async_runtime::block_on(async {
-                    state::RuntimeServices::start(Arc::clone(&db), profile, listen_port, Some(relay_tx.clone()))
+                    state::RuntimeServices::start(app.handle().clone(), Arc::clone(&db), profile, listen_port, Some(relay_tx.clone()))
                         .await
                         .expect("Failed to start runtime services")
                 });

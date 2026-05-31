@@ -64,16 +64,19 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
 
   useEffect(() => {
     if (!profilePeer) return;
-    const missingMetadata = !profilePeer.software_version || !profilePeer.mac_address;
-    if (!missingMetadata || !profilePeer.ip || !profilePeer.port) return;
+    const peer = profilePeer;
+    const missingMetadata = !peer.software_version || !peer.mac_address;
+    if (!missingMetadata || !peer.ip || !peer.port) return;
 
     let cancelled = false;
-    setRefreshingProfileId(profilePeer.id);
-    refreshPeerProfile(profilePeer.id, profilePeer.ip, profilePeer.port)
+    queueMicrotask(() => {
+      if (!cancelled) setRefreshingProfileId(peer.id);
+    });
+    refreshPeerProfile(peer.id, peer.ip, peer.port)
       .then((stored) => {
         if (cancelled || !stored) return;
         setProfilePeer((current) => {
-          if (!current || current.id !== profilePeer.id) return current;
+          if (!current || current.id !== peer.id) return current;
           return {
             ...current,
             id: stored.peer_id,
@@ -96,7 +99,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
     return () => {
       cancelled = true;
     };
-  }, [profilePeer?.id, profilePeer?.ip, profilePeer?.port, profilePeer?.software_version, profilePeer?.mac_address]);
+  }, [profilePeer]);
 
   // Close theme menu when clicking outside
   useEffect(() => {
