@@ -54,6 +54,14 @@ interface ConversationUpdatedEvent {
   group_id?: string | null;
 }
 
+interface HistorySearchRequest {
+  kind: "contact" | "group";
+  targetId: string;
+  query: string;
+  messageId?: number | null;
+  nonce: number;
+}
+
 function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
   if (left.length !== right.length) return false;
 
@@ -99,8 +107,10 @@ function App() {
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [groups, setGroups] = useState<GroupInfo[]>([]);
   const [themeId, setThemeId] = useState<ThemeId>(() => getInitialTheme());
+  const [historySearchRequest, setHistorySearchRequest] = useState<HistorySearchRequest | null>(null);
   const checkingUpdateRef = useRef(false);
   const departmentPickerRef = useRef<HTMLDivElement | null>(null);
+  const historySearchNonceRef = useRef(0);
 
   // ── notification sound ────────────────────────────────────────────────
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -745,6 +755,32 @@ function App() {
     applyTheme(nextThemeId);
   }, []);
 
+  const startHistorySearch = useCallback((kind: "contact" | "group", targetId: string, query: string, messageId?: number) => {
+    const term = query.trim();
+    if (!term) return;
+    historySearchNonceRef.current += 1;
+    setHistorySearchRequest({
+      kind,
+      targetId,
+      query: term,
+      messageId: messageId ?? null,
+      nonce: historySearchNonceRef.current,
+    });
+  }, []);
+
+  const handleJumpToContactSearchHit = useCallback((peerId: string, query: string, messageId?: number) => {
+    const peer = peers.find((item) => item.id === peerId);
+    if (!peer) return;
+    startHistorySearch("contact", peer.id, query, messageId);
+    void handleSelectPeer(peer);
+  }, [handleSelectPeer, peers, startHistorySearch]);
+
+  const handleJumpToGroupSearchHit = useCallback((groupId: string, query: string, messageId?: number) => {
+    if (!groups.some((group) => group.group_id === groupId)) return;
+    startHistorySearch("group", groupId, query, messageId);
+    void handleSelectGroup(groupId);
+  }, [groups, handleSelectGroup, startHistorySearch]);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-screen bg-gray-900">
@@ -833,10 +869,8 @@ function App() {
         peers={peers}
         selectedPeerId={selectedPeer?.id ?? null}
         onSelectPeer={handleSelectPeer}
-        onJumpToSearchHit={(peerId: string) => {
-          const peer = peers.find((p) => p.id === peerId);
-          if (peer) handleSelectPeer(peer);
-        }}
+        onJumpToSearchHit={handleJumpToContactSearchHit}
+        onJumpToGroupSearchHit={handleJumpToGroupSearchHit}
         myId={appInfo.peer_id}
         myName={appInfo.username}
         myDepartment={appInfo.department}
@@ -867,10 +901,25 @@ function App() {
         groupInfo={selectedGroupId ? groups.find(g => g.group_id === selectedGroupId) ?? null : null}
         peers={peers}
         groups={groups}
-        onSendMessage={selectedGroupId ? ((content: string) => handleSendGroupMsg(selectedGroupId!, content)) : handleSendMessage}
+        onSendMessage={selectedGroupId ? ((content: string, clientMsgId?: string) => handleSendGroupMsg(selectedGroupId!, content, clientMsgId)) : handleSendMessage}
         onSendFile={handleSendFile}
         onSendSticker={handleSendSticker}
         onGroupUpdated={() => listGroups().then(setGroups).catch(() => {})}
+        historySearchRequest={
+          historySearchRequest && (
+            selectedGroupId
+              ? historySearchRequest.kind === "group" && historySearchRequest.targetId === selectedGroupId
+              : selectedPeer
+                ? historySearchRequest.kind === "contact" && historySearchRequest.targetId === selectedPeer.id
+                : false
+          )
+            ? {
+              query: historySearchRequest.query,
+              messageId: historySearchRequest.messageId,
+              nonce: historySearchRequest.nonce,
+            }
+            : null
+        }
       />
     </div>
   );

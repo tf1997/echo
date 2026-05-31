@@ -603,7 +603,6 @@ impl ChatServer {
 
         // 48KB raw → 64KB base64 → fits in ~66KB JSON line (safe for BufReader)
         const CHUNK_SIZE: usize = 48 * 1024;
-        let total_chunks = ((file_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE) as u64;
 
         let mut file = File::open(file_path)
             .await

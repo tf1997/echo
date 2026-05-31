@@ -26,6 +26,11 @@ interface HistorySearchViewProps {
   myId: string;
   isGroup: boolean;
   groupId?: string | null;
+  initialSearchRequest?: {
+    query: string;
+    messageId?: number | null;
+    nonce: number;
+  } | null;
   onClose: () => void;
 }
 
@@ -151,14 +156,15 @@ function getCalendarCells(month: Date): (Date | null)[] {
   return cells;
 }
 
-export function HistorySearchView({ peer, myId, isGroup, groupId, onClose }: HistorySearchViewProps) {
+export function HistorySearchView({ peer, myId, isGroup, groupId, initialSearchRequest = null, onClose }: HistorySearchViewProps) {
   const [filter, setFilter] = useState<HistoryFilter>("all");
   const [selectedDay, setSelectedDay] = useState("");
   const [datePickerOpen, setDatePickerOpen] = useState(false);
   const [pickerMonth, setPickerMonth] = useState(() => getMonthStart(new Date()));
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(() => initialSearchRequest?.query ?? "");
   const [items, setItems] = useState<ChatMessage[]>([]);
   const [results, setResults] = useState<ChatMessage[]>([]);
+  const [focusedMessageId, setFocusedMessageId] = useState<number | null>(() => initialSearchRequest?.messageId ?? null);
   const [hasMore, setHasMore] = useState(true);
   const [loadingInitial, setLoadingInitial] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -318,6 +324,36 @@ export function HistorySearchView({ peer, myId, isGroup, groupId, onClose }: His
     }, 250);
   }, [dayEnd, dayStart, peer.id, targetGroupId]);
 
+  useEffect(() => {
+    const term = initialSearchRequest?.query.trim() ?? "";
+    if (!term) return;
+
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setFilter("all");
+      setSelectedDay("");
+      setDatePickerOpen(false);
+      setQuery(term);
+      setFocusedMessageId(initialSearchRequest?.messageId ?? null);
+      queueSearch(term, "all");
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [initialSearchRequest?.messageId, initialSearchRequest?.nonce, initialSearchRequest?.query, queueSearch]);
+
+  useEffect(() => {
+    if (!focusedMessageId || !trimmedQuery || searching) return;
+    if (!results.some((message) => message.id === focusedMessageId)) return;
+
+    requestAnimationFrame(() => {
+      const target = scrollRef.current?.querySelector<HTMLElement>(`[data-history-message-id="${focusedMessageId}"]`);
+      target?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  }, [focusedMessageId, results, searching, trimmedQuery]);
+
   const handleDayChange = useCallback((day: string) => {
     setSelectedDay(day);
     if (query.trim()) {
@@ -393,6 +429,7 @@ export function HistorySearchView({ peer, myId, isGroup, groupId, onClose }: His
             autoFocus
             value={query}
             onChange={(event) => {
+              setFocusedMessageId(null);
               setQuery(event.target.value);
               queueSearch(event.target.value, filter);
             }}
@@ -406,6 +443,7 @@ export function HistorySearchView({ peer, myId, isGroup, groupId, onClose }: His
             <button
               type="button"
               onClick={() => {
+                setFocusedMessageId(null);
                 setQuery("");
                 queueSearch("", filter);
               }}
@@ -559,10 +597,14 @@ export function HistorySearchView({ peer, myId, isGroup, groupId, onClose }: His
             const text = getResultText(message);
             const sender = message.sender_id === myId ? "我" : message.sender_name;
             const typeLabel = getTypeLabel(message);
+            const focused = focusedMessageId === message.id;
             return (
               <div key={message.id}>
                 {showDivider ? <DateDivider date={label} /> : null}
-                <div className="history-result-row px-4 py-3 border-b border-gray-700/60">
+                <div
+                  data-history-message-id={message.id}
+                  className={`history-result-row px-4 py-3 border-b border-gray-700/60 ${focused ? "history-result-row-focused" : ""}`}
+                >
                   <div className="flex items-center gap-2 mb-1">
                     <span className="text-xs font-medium text-indigo-300 truncate">{sender}</span>
                     <span className="text-[10px] text-gray-500 flex-shrink-0">{formatTimestamp(message.timestamp)}</span>

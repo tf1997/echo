@@ -145,7 +145,6 @@ impl LanDiscovery {
 
         // Scanner thread (unicast subnet probe)
         let scanner_socket = Arc::clone(&socket);
-        let scanner_bytes = serde_json::to_vec(&base_announce).unwrap_or_default();
         let scanner_cancel = Arc::clone(&cancel);
         let scanner_id = config.peer_id;
         let scanner_subnets = Arc::clone(&scan_subnets);
@@ -153,7 +152,6 @@ impl LanDiscovery {
         let scanner_handle = thread::spawn(move || {
             Self::scanner_loop(
                 scanner_socket,
-                scanner_bytes,
                 scanner_id,
                 scanner_subnets,
                 scanner_peers,
@@ -303,7 +301,6 @@ impl LanDiscovery {
     /// Subnet scanner: periodically probes configured /24 subnets via unicast UDP.
     fn scanner_loop(
         socket: Arc<UdpSocket>,
-        mut base_data: Vec<u8>,
         my_id: String,
         subnets: Arc<RwLock<Vec<String>>>,
         peers: Arc<RwLock<HashMap<String, Peer>>>,
@@ -330,7 +327,7 @@ impl LanDiscovery {
                 port: 0,
                 known_peers: Vec::new(),
             };
-            base_data = Self::build_announce_data(&my_info, &peers);
+            let base_data = Self::build_announce_data(&my_info, &peers);
 
             let prefixes = subnets.read().unwrap().clone();
             let start = std::time::Instant::now();
@@ -387,7 +384,7 @@ impl LanDiscovery {
         my_info: AnnouncePacket,
         peers: Arc<RwLock<HashMap<String, Peer>>>,
         cancel: Arc<AtomicBool>,
-        discovery_port: u16,
+        _discovery_port: u16,
         relay_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<PeerEntry>>>,
     ) {
         let mut buf = [0u8; 4096];

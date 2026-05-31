@@ -508,6 +508,11 @@ body {
   background-color: color-mix(in srgb, var(--echo-control) 72%, transparent) !important;
 }
 
+.history-result-row-focused {
+  background-color: color-mix(in srgb, var(--echo-accent) 16%, transparent) !important;
+  box-shadow: inset 3px 0 0 var(--echo-accent);
+}
+
 .history-highlight {
   background-color: color-mix(in srgb, var(--echo-accent) 24%, transparent) !important;
   border-radius: 4px;

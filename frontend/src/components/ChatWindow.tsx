@@ -6,7 +6,7 @@ import { HistorySearchView } from "./HistorySearchView";
 import { formatDateLabel, makeSearchHitId } from "./messageUtils";
 import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, sendMessage, sendMessageTyped, sendFile, sendSticker, sendGroupMessage, sendGroupMessageTyped, sendGroupFile, sendGroupSticker, renameGroup, leaveGroup, dissolveGroup, inviteToGroup, readFileBase64 } from "../api";
 import type { ForwardCardData } from "./MessageBubble";
-import { open } from "@tauri-apps/api/dialog";
+import { ask, message as showDialogMessage, open } from "@tauri-apps/api/dialog";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
 
 export interface PendingMessage {
@@ -43,6 +43,11 @@ interface ChatWindowProps {
   onSendFile: (filePath: string, clientMsgId?: string) => Promise<void | ChatMessage>;
   onSendSticker: (filePath: string, clientMsgId?: string) => Promise<ChatMessage>;
   onGroupUpdated?: () => void;
+  historySearchRequest?: {
+    query: string;
+    messageId?: number | null;
+    nonce: number;
+  } | null;
 }
 
 let pendingId = Date.now();
@@ -254,7 +259,7 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
   );
 }
 
-export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated }: ChatWindowProps) {
+export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated, historySearchRequest = null }: ChatWindowProps) {
   const peerId = peer?.id ?? null;
   const [inputText, setInputText] = useState("");
   const [isDragging, setIsDragging] = useState(false);
@@ -272,9 +277,21 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
   const [forwardModal, setForwardModal] = useState<{ messages: ChatMessage[]; mode: ForwardMode } | null>(null);
   const [showGroupPanel, setShowGroupPanel] = useState(false);
   const [groupNameEdit, setGroupNameEdit] = useState("");
+  const [groupActionBusy, setGroupActionBusy] = useState("");
+  const [groupPanelError, setGroupPanelError] = useState("");
   const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
   const exitSelectMode = useCallback(() => { setSelectMode(false); setSelectedIds(new Set()); }, []);
+
+  useEffect(() => {
+    if (!historySearchRequest?.query.trim()) return;
+    setForwardModal(null);
+    exitSelectMode();
+    setShowSearch(false);
+    setSearchQuery("");
+    setSearchIndex(0);
+    setShowHistory(true);
+  }, [exitSelectMode, historySearchRequest?.nonce, historySearchRequest?.query]);
 
   const handleStartForward = useCallback((msg: ChatMessage) => {
     setSelectMode(true);
@@ -740,6 +757,101 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     e.target.value = "";
   }, [peer, sendFileToPeer]);
 
+  const reportGroupActionError = useCallback(async (error: unknown) => {
+    const text = String(error || "操作失败，请重试");
+    setGroupPanelError(text);
+    await showDialogMessage(text, {
+      title: "群操作失败",
+      type: "error",
+      okLabel: "确定",
+    }).catch(() => {});
+  }, []);
+
+  const handleRenameGroup = useCallback(async () => {
+    if (!groupInfo || groupActionBusy) return;
+    const nextName = groupNameEdit.trim();
+    if (!nextName) {
+      setGroupPanelError("群名称不能为空");
+      return;
+    }
+    if (nextName.length > 50) {
+      setGroupPanelError("群名称不能超过50个字符");
+      return;
+    }
+    if (nextName === groupInfo.name) return;
+
+    setGroupActionBusy("rename");
+    setGroupPanelError("");
+    try {
+      await renameGroup(groupInfo.group_id, nextName);
+      onGroupUpdated?.();
+    } catch (error) {
+      await reportGroupActionError(error);
+    } finally {
+      setGroupActionBusy("");
+    }
+  }, [groupActionBusy, groupInfo, groupNameEdit, onGroupUpdated, reportGroupActionError]);
+
+  const handleInviteMember = useCallback(async (peerId: string) => {
+    if (!groupInfo || !peerId || groupActionBusy) return;
+    setGroupActionBusy("invite");
+    setGroupPanelError("");
+    try {
+      await inviteToGroup(groupInfo.group_id, [peerId]);
+      onGroupUpdated?.();
+    } catch (error) {
+      await reportGroupActionError(error);
+    } finally {
+      setGroupActionBusy("");
+    }
+  }, [groupActionBusy, groupInfo, onGroupUpdated, reportGroupActionError]);
+
+  const handleLeaveGroup = useCallback(async () => {
+    if (!groupInfo || groupActionBusy) return;
+    const confirmed = await ask(`确定退出「${groupInfo.name}」吗？`, {
+      title: "退出群聊",
+      type: "warning",
+      okLabel: "退出",
+      cancelLabel: "取消",
+    });
+    if (!confirmed) return;
+
+    setGroupActionBusy("leave");
+    setGroupPanelError("");
+    try {
+      await leaveGroup(groupInfo.group_id);
+      onGroupUpdated?.();
+      setShowGroupPanel(false);
+    } catch (error) {
+      await reportGroupActionError(error);
+    } finally {
+      setGroupActionBusy("");
+    }
+  }, [groupActionBusy, groupInfo, onGroupUpdated, reportGroupActionError]);
+
+  const handleDissolveGroup = useCallback(async () => {
+    if (!groupInfo || groupActionBusy) return;
+    const confirmed = await ask(`确定解散「${groupInfo.name}」吗？该群会从所有成员列表中移除。`, {
+      title: "解散群聊",
+      type: "warning",
+      okLabel: "解散",
+      cancelLabel: "取消",
+    });
+    if (!confirmed) return;
+
+    setGroupActionBusy("dissolve");
+    setGroupPanelError("");
+    try {
+      await dissolveGroup(groupInfo.group_id);
+      onGroupUpdated?.();
+      setShowGroupPanel(false);
+    } catch (error) {
+      await reportGroupActionError(error);
+    } finally {
+      setGroupActionBusy("");
+    }
+  }, [groupActionBusy, groupInfo, onGroupUpdated, reportGroupActionError]);
+
   if (!peer) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center bg-gray-800 text-gray-400">
@@ -841,7 +953,11 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
         </button>
         {isGroup && (
           <button
-            onClick={() => { setShowGroupPanel((v) => !v); setGroupNameEdit(groupInfo?.name ?? ""); }}
+            onClick={() => {
+              setShowGroupPanel((v) => !v);
+              setGroupNameEdit(groupInfo?.name ?? "");
+              setGroupPanelError("");
+            }}
             className={`flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-gray-700 ${showGroupPanel ? "bg-gray-700 text-white" : ""}`}
             title="群信息"
           >
@@ -853,10 +969,12 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       </div>
       {showHistory ? (
         <HistorySearchView
+          key={`${isGroup ? groupId ?? peer.id : peer.id}:${historySearchRequest?.nonce ?? "manual"}`}
           peer={peer}
           myId={myId}
           isGroup={isGroup}
           groupId={groupId}
+          initialSearchRequest={historySearchRequest}
           onClose={() => setShowHistory(false)}
         />
       ) : (
@@ -1136,25 +1254,32 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
           <button onClick={() => setShowGroupPanel(false)} className="text-gray-500 hover:text-gray-300 text-lg leading-none">×</button>
         </div>
         <div className="px-4 py-3 space-y-4 flex-1">
+          {groupPanelError ? (
+            <div className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+              {groupPanelError}
+            </div>
+          ) : null}
           {/* Group name */}
           <div>
             <p className="text-xs text-gray-400 mb-1">群名称</p>
             <div className="flex gap-1">
               <input
                 value={groupNameEdit}
-                onChange={(e) => setGroupNameEdit(e.target.value)}
+                maxLength={50}
+                disabled={!!groupActionBusy}
+                onChange={(e) => {
+                  setGroupNameEdit(e.target.value);
+                  if (groupPanelError) setGroupPanelError("");
+                }}
                 className="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200 outline-none focus:border-indigo-500"
               />
               <button
-                onClick={async () => {
-                  if (groupNameEdit.trim() && groupNameEdit !== groupInfo.name) {
-                    await renameGroup(groupInfo.group_id, groupNameEdit.trim());
-                    onGroupUpdated?.();
-                  }
-                }}
-                className="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 rounded text-white"
-              >保存</button>
+                onClick={handleRenameGroup}
+                disabled={!!groupActionBusy || !groupNameEdit.trim() || groupNameEdit.trim() === groupInfo.name}
+                className="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 rounded text-white"
+              >{groupActionBusy === "rename" ? "保存中" : "保存"}</button>
             </div>
+            <p className="mt-1 text-[10px] text-gray-500">{groupNameEdit.length}/50</p>
           </div>
           {/* Members */}
           <div>
@@ -1183,12 +1308,13 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
             <select
               onChange={async (e) => {
                 const pid = e.target.value;
-                if (pid) { await inviteToGroup(groupInfo.group_id, [pid]); onGroupUpdated?.(); }
+                if (pid) await handleInviteMember(pid);
                 e.target.value = "";
               }}
-              className="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 outline-none"
+              disabled={!!groupActionBusy}
+              className="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 outline-none disabled:opacity-50"
             >
-              <option value="">选择联系人...</option>
+              <option value="">{groupActionBusy === "invite" ? "邀请中..." : "选择联系人..."}</option>
               {peers.filter((p) => p.id !== myId && !groupInfo.members?.some((m) => m.peer_id === p.id)).map((p) => (
                 <option key={p.id} value={p.id}>{p.username}</option>
               ))}
@@ -1199,14 +1325,16 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
         <div className="px-4 py-3 border-t border-gray-700">
           {groupInfo.creator_id !== myId ? (
             <button
-              onClick={async () => { await leaveGroup(groupInfo.group_id); onGroupUpdated?.(); setShowGroupPanel(false); }}
-              className="w-full py-2 text-sm rounded-lg bg-yellow-700/60 hover:bg-yellow-700 text-yellow-200"
-            >退出群聊</button>
+              onClick={handleLeaveGroup}
+              disabled={!!groupActionBusy}
+              className="w-full py-2 text-sm rounded-lg bg-yellow-700/60 hover:bg-yellow-700 disabled:opacity-50 text-yellow-200"
+            >{groupActionBusy === "leave" ? "退出中..." : "退出群聊"}</button>
           ) : (
             <button
-              onClick={async () => { await dissolveGroup(groupInfo.group_id); onGroupUpdated?.(); setShowGroupPanel(false); }}
-              className="w-full py-2 text-sm rounded-lg bg-red-700/60 hover:bg-red-700 text-red-200"
-            >解散群聊</button>
+              onClick={handleDissolveGroup}
+              disabled={!!groupActionBusy}
+              className="w-full py-2 text-sm rounded-lg bg-red-700/60 hover:bg-red-700 disabled:opacity-50 text-red-200"
+            >{groupActionBusy === "dissolve" ? "解散中..." : "解散群聊"}</button>
           )}
         </div>
       </div>

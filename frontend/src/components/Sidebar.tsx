@@ -1,16 +1,16 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
-import type { Peer, UnreadCount, StoredPeer } from "../types";
-import { searchMessages, discoverByIp, listRecentContacts, removeRecentContact, createGroup, refreshPeerProfile } from "../api";
+import type { ChatMessage, Peer, UnreadCount, StoredPeer } from "../types";
+import { searchMessages, searchGroupChatMessages, discoverByIp, listRecentContacts, removeRecentContact, createGroup, refreshPeerProfile } from "../api";
 import { THEMES } from "../theme";
 import type { ThemeId } from "../theme";
-import type { GroupInfo } from "../api";
-import type { SearchResult } from "../api";
+import type { GroupInfo, SearchResult } from "../api";
 
 interface SidebarProps {
   peers: Peer[];
   selectedPeerId: string | null;
   onSelectPeer: (peer: Peer) => void;
-  onJumpToSearchHit: (peerId: string) => void;
+  onJumpToSearchHit: (peerId: string, query: string, messageId?: number) => void;
+  onJumpToGroupSearchHit: (groupId: string, query: string, messageId?: number) => void;
   myId: string;
   myName: string;
   myDepartment: string;
@@ -29,10 +29,12 @@ interface SidebarProps {
   onThemeChange: (themeId: ThemeId) => void;
 }
 
-export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, mySoftwareVersion, myMacAddress, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit, selectedGroupId, onSelectGroup, groups, themeId, onThemeChange }: SidebarProps) {
+export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, mySoftwareVersion, myMacAddress, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit, onJumpToGroupSearchHit, selectedGroupId, onSelectGroup, groups, themeId, onThemeChange }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [groupSearchResults, setGroupSearchResults] = useState<{ group: GroupInfo; messages: ChatMessage[] }[]>([]);
   const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
   const [showSearch, setShowSearch] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
   const [profilePeer, setProfilePeer] = useState<Peer | null>(null);
@@ -47,9 +49,12 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
   const [newGroupMembers, setNewGroupMembers] = useState<string[]>([]);
+  const [newGroupMemberQuery, setNewGroupMemberQuery] = useState("");
   const [expandedDepts, setExpandedDepts] = useState<Set<string>>(new Set());
   const [groupNameError, setGroupNameError] = useState("");
   const themeMenuRef = useRef<HTMLDivElement>(null);
+  const searchTimerRef = useRef<number | null>(null);
+  const searchSeqRef = useRef(0);
 
   const toggleDept = useCallback((dept: string) => {
     setExpandedDepts((prev) => {
@@ -61,6 +66,14 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   }, []);
 
   useEffect(() => { listRecentContacts().then(setRecentContacts).catch(() => {}); }, [peers, tab]);
+
+  useEffect(() => {
+    return () => {
+      if (searchTimerRef.current !== null) {
+        window.clearTimeout(searchTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!profilePeer) return;
@@ -137,6 +150,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
       setShowCreateGroup(false);
       setNewGroupName("");
       setNewGroupMembers([]);
+      setNewGroupMemberQuery("");
       setGroupNameError("");
     } catch (e) {
       console.error("Failed to create group:", e);
@@ -186,6 +200,21 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
     });
   }, [contactFilter, peers]);
 
+  const groupMemberFilter = newGroupMemberQuery.trim().toLowerCase();
+  const selectableGroupPeers = useMemo(() => {
+    if (!groupMemberFilter) return peers;
+    return peers.filter((peer) => {
+      const fields = [
+        peer.username,
+        peer.department,
+        peer.ip,
+        `${peer.ip}:${peer.port}`,
+        peer.online ? "在线" : "离线",
+      ];
+      return fields.some((field) => field.toLowerCase().includes(groupMemberFilter));
+    });
+  }, [groupMemberFilter, peers]);
+
   // Group peers by department for "contacts" tab
   const deptGroups = new Map<string, Peer[]>();
   for (const p of visiblePeers) {
@@ -209,54 +238,129 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   const groupsTotalUnread = groups.reduce((sum, g) => sum + (g.unread_count || 0), 0);
   const currentTheme = THEMES.find((theme) => theme.id === themeId) ?? THEMES[0];
 
-  const handleSearchChange = useCallback(async (value: string) => {
+  const handleSearchChange = useCallback((value: string) => {
     setSearchQuery(value);
+    searchSeqRef.current += 1;
+    const seq = searchSeqRef.current;
+
+    if (searchTimerRef.current !== null) {
+      window.clearTimeout(searchTimerRef.current);
+      searchTimerRef.current = null;
+    }
+
     if (!value.trim()) {
       setSearchResults([]);
+      setGroupSearchResults([]);
+      setSearchError("");
+      setSearching(false);
       setShowSearch(false);
       return;
     }
-    setSearching(true);
-    setShowSearch(true);
-    try {
-      const results = await searchMessages(value.trim());
-      setSearchResults(results);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setSearching(false);
-    }
-  }, []);
 
-  const handleJumpToHit = useCallback((peerId: string) => {
+    setSearching(true);
+    setSearchError("");
+    setShowSearch(true);
+
+    searchTimerRef.current = window.setTimeout(() => {
+      searchTimerRef.current = null;
+      const term = value.trim();
+      Promise.all([
+        searchMessages(term),
+        Promise.all(groups.map(async (group) => ({
+          group,
+          messages: await searchGroupChatMessages(group.group_id, term, 5).catch(() => []),
+        }))),
+      ])
+        .then(([results, groupResults]) => {
+          if (searchSeqRef.current !== seq) return;
+          setSearchResults(results);
+          setGroupSearchResults(groupResults.filter((result) => result.messages.length > 0));
+        })
+        .catch((e) => {
+          if (searchSeqRef.current !== seq) return;
+          console.error(e);
+          setSearchResults([]);
+          setGroupSearchResults([]);
+          setSearchError("搜索失败，请稍后重试");
+        })
+        .finally(() => {
+          if (searchSeqRef.current === seq) setSearching(false);
+        });
+    }, 250);
+  }, [groups]);
+
+  const clearGlobalSearch = useCallback(() => {
     setShowSearch(false);
     setSearchQuery("");
     setSearchResults([]);
-    onJumpToSearchHit(peerId);
-  }, [onJumpToSearchHit]);
+    setGroupSearchResults([]);
+    setSearchError("");
+    setSearching(false);
+    searchSeqRef.current += 1;
+    if (searchTimerRef.current !== null) {
+      window.clearTimeout(searchTimerRef.current);
+      searchTimerRef.current = null;
+    }
+  }, []);
+
+  const handleJumpToHit = useCallback((peerId: string, messageId?: number) => {
+    const term = searchQuery.trim();
+    clearGlobalSearch();
+    onJumpToSearchHit(peerId, term, messageId);
+  }, [clearGlobalSearch, onJumpToSearchHit, searchQuery]);
+
+  const handleJumpToGroupHit = useCallback((groupId: string, messageId?: number) => {
+    const term = searchQuery.trim();
+    clearGlobalSearch();
+    onJumpToGroupSearchHit(groupId, term, messageId);
+  }, [onJumpToGroupSearchHit, searchQuery, clearGlobalSearch]);
 
   const [manualIp, setManualIp] = useState("");
   const [manualPort, setManualPort] = useState("9527");
   const [searchingIp, setSearchingIp] = useState(false);
   const [ipSearchMsg, setIpSearchMsg] = useState("");
+  const [ipSearchStatus, setIpSearchStatus] = useState<"idle" | "success" | "error">("idle");
 
   const handleDiscoverIp = useCallback(async () => {
     const ip = manualIp.trim();
-    if (!ip) return;
+    const port = Number.parseInt(manualPort.trim(), 10);
+    const validIpv4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/.test(ip);
+    if (!ip) {
+      setIpSearchStatus("error");
+      setIpSearchMsg("请输入 IP 地址");
+      return;
+    }
+    if (!validIpv4) {
+      setIpSearchStatus("error");
+      setIpSearchMsg("请输入有效 IPv4 地址");
+      return;
+    }
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      setIpSearchStatus("error");
+      setIpSearchMsg("端口范围应为 1-65535");
+      return;
+    }
     setSearchingIp(true);
     setIpSearchMsg("");
+    setIpSearchStatus("idle");
     try {
-      const result = await discoverByIp(ip, parseInt(manualPort) || 9527);
+      const result = await discoverByIp(ip, port);
       setIpSearchMsg(result.message);
-      if (!result.online) {
-        // Not found — still allow adding
-      }
+      setIpSearchStatus(result.online ? "success" : "error");
     } catch (e) {
       setIpSearchMsg(String(e));
+      setIpSearchStatus("error");
     } finally {
       setSearchingIp(false);
     }
   }, [manualIp, manualPort]);
+
+  const ipSearchMessageClass =
+    ipSearchStatus === "success"
+      ? "text-green-400"
+      : ipSearchStatus === "error"
+        ? "text-red-400"
+        : "text-gray-400";
 
   return (
     <div className="app-sidebar relative flex flex-col w-72 bg-gray-900 text-white h-full border-r border-gray-700">
@@ -411,9 +515,20 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
             type="text"
             value={searchQuery}
             onChange={(e) => handleSearchChange(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Escape") clearGlobalSearch(); }}
             placeholder="搜索聊天记录..."
-            className="w-full bg-gray-800 text-sm text-gray-200 rounded-lg pl-8 pr-3 py-2 outline-none focus:ring-2 focus:ring-indigo-500 placeholder-gray-500"
+            className="w-full bg-gray-800 text-sm text-gray-200 rounded-lg pl-8 pr-8 py-2 outline-none focus:ring-2 focus:ring-indigo-500 placeholder-gray-500"
           />
+          {searchQuery ? (
+            <button
+              type="button"
+              onClick={clearGlobalSearch}
+              className="absolute right-2 top-1/2 -translate-y-1/2 w-5 h-5 rounded-full text-gray-500 hover:text-gray-300 hover:bg-gray-700 flex items-center justify-center"
+              aria-label="清空聊天记录搜索"
+            >
+              ×
+            </button>
+          ) : null}
         </div>
       </div>
 
@@ -423,7 +538,11 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
           <input
             type="text"
             value={manualIp}
-            onChange={(e) => setManualIp(e.target.value)}
+            onChange={(e) => {
+              setManualIp(e.target.value);
+              setIpSearchMsg("");
+              setIpSearchStatus("idle");
+            }}
             placeholder="IP 地址"
             className="min-w-0 bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
             onKeyDown={(e) => { if (e.key === "Enter") handleDiscoverIp(); }}
@@ -431,7 +550,11 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
           <input
             type="text"
             value={manualPort}
-            onChange={(e) => setManualPort(e.target.value)}
+            onChange={(e) => {
+              setManualPort(e.target.value);
+              setIpSearchMsg("");
+              setIpSearchStatus("idle");
+            }}
             placeholder="9527"
             className="min-w-0 bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
             onKeyDown={(e) => { if (e.key === "Enter") handleDiscoverIp(); }}
@@ -445,7 +568,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
           </button>
         </div>
         {ipSearchMsg && (
-          <p className="text-[10px] text-gray-400 mt-1 truncate">{ipSearchMsg}</p>
+          <p className={`text-[10px] mt-1 truncate ${ipSearchMessageClass}`}>{ipSearchMsg}</p>
         )}
       </div>
 
@@ -454,33 +577,61 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
           <p className="px-4 py-2 text-xs text-gray-400 font-medium uppercase tracking-wider">搜索结果</p>
           {searching ? (
             <p className="px-4 py-3 text-xs text-gray-500">搜索中...</p>
-          ) : searchResults.length === 0 ? (
+          ) : searchError ? (
+            <p className="px-4 py-3 text-xs text-red-400">{searchError}</p>
+          ) : searchResults.length === 0 && groupSearchResults.length === 0 ? (
             <p className="px-4 py-3 text-xs text-gray-500">无匹配结果</p>
           ) : (
-            searchResults.map((result) => (
-              <div key={result.peer_id} className="mb-1">
-                <button
-                  onClick={() => handleJumpToHit(result.peer_id)}
-                  className="w-full text-left px-4 py-2 hover:bg-gray-800"
-                >
-                  <p className="text-xs font-medium text-indigo-400 truncate">{result.peer_name}</p>
-                </button>
-                {result.messages.slice(0, 5).map((hit) => (
+            <>
+              {searchResults.map((result) => (
+                <div key={result.peer_id} className="mb-1">
                   <button
-                    key={hit.id}
                     onClick={() => handleJumpToHit(result.peer_id)}
-                    className="w-full text-left px-4 py-1.5 pl-6 hover:bg-gray-800"
+                    className="w-full text-left px-4 py-2 hover:bg-gray-800"
                   >
-                    <p className="text-xs text-gray-300 truncate">
-                      {hit.msg_type === "file" ? `📎 ${hit.file_name || "文件"}` : hit.content.slice(0, 60)}
-                    </p>
-                    <p className="text-[10px] text-gray-500 mt-0.5">
-                      {hit.sender_name} · {new Date(hit.timestamp).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
-                    </p>
+                    <p className="text-xs font-medium text-indigo-400 truncate">{result.peer_name}</p>
                   </button>
-                ))}
-              </div>
-            ))
+                  {result.messages.slice(0, 5).map((hit) => (
+                    <button
+                      key={hit.id}
+                      onClick={() => handleJumpToHit(result.peer_id, hit.id)}
+                      className="w-full text-left px-4 py-1.5 pl-6 hover:bg-gray-800"
+                    >
+                      <p className="text-xs text-gray-300 truncate">
+                        {hit.msg_type === "file" ? `📎 ${hit.file_name || "文件"}` : hit.content.slice(0, 60)}
+                      </p>
+                      <p className="text-[10px] text-gray-500 mt-0.5">
+                        {hit.sender_name} · {new Date(hit.timestamp).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                      </p>
+                    </button>
+                  ))}
+                </div>
+              ))}
+              {groupSearchResults.map((result) => (
+                <div key={result.group.group_id} className="mb-1">
+                  <button
+                    onClick={() => handleJumpToGroupHit(result.group.group_id)}
+                    className="w-full text-left px-4 py-2 hover:bg-gray-800"
+                  >
+                    <p className="text-xs font-medium text-indigo-400 truncate">群聊 · {result.group.name}</p>
+                  </button>
+                  {result.messages.slice(0, 5).map((hit) => (
+                    <button
+                      key={hit.id}
+                      onClick={() => handleJumpToGroupHit(result.group.group_id, hit.id)}
+                      className="w-full text-left px-4 py-1.5 pl-6 hover:bg-gray-800"
+                    >
+                      <p className="text-xs text-gray-300 truncate">
+                        {hit.msg_type === "file" ? `📎 ${hit.file_name || "文件"}` : hit.msg_type === "sticker" ? "[表情]" : hit.content.slice(0, 60)}
+                      </p>
+                      <p className="text-[10px] text-gray-500 mt-0.5">
+                        {hit.sender_name} · {new Date(hit.timestamp).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                      </p>
+                    </button>
+                  ))}
+                </div>
+              ))}
+            </>
           )}
         </div>
       ) : (
@@ -651,11 +802,34 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                 选择成员 <span className="text-red-400">*</span>
                 <span className="text-gray-500 ml-1">({newGroupMembers.length} 人)</span>
               </label>
+              <div className="relative mb-2">
+                <svg className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+                <input
+                  value={newGroupMemberQuery}
+                  onChange={(e) => setNewGroupMemberQuery(e.target.value)}
+                  placeholder="搜索成员..."
+                  className="w-full bg-gray-900 border border-gray-600 rounded px-8 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500"
+                />
+                {newGroupMemberQuery ? (
+                  <button
+                    type="button"
+                    onClick={() => setNewGroupMemberQuery("")}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 w-5 h-5 rounded-full text-gray-500 hover:text-gray-300 hover:bg-gray-700 flex items-center justify-center"
+                    aria-label="清空成员搜索"
+                  >
+                    ×
+                  </button>
+                ) : null}
+              </div>
               <div className="max-h-40 overflow-y-auto bg-gray-900 border border-gray-600 rounded p-2">
                 {peers.length === 0 ? (
                   <p className="text-xs text-gray-500 text-center py-4">暂无可选成员</p>
+                ) : selectableGroupPeers.length === 0 ? (
+                  <p className="text-xs text-gray-500 text-center py-4">无匹配成员</p>
                 ) : (
-                  peers.map((p) => (
+                  selectableGroupPeers.map((p) => (
                     <label key={p.id} className="flex items-center gap-2 py-1.5 px-2 hover:bg-gray-800 rounded cursor-pointer transition-colors">
                       <input
                         type="checkbox"
@@ -692,6 +866,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                   setShowCreateGroup(false);
                   setNewGroupName("");
                   setNewGroupMembers([]);
+                  setNewGroupMemberQuery("");
                   setGroupNameError("");
                 }}
                 className="flex-1 py-2.5 text-sm font-medium rounded bg-gray-700 hover:bg-gray-600 transition-colors"
