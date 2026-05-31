@@ -17,6 +17,10 @@ export async function listStoredPeers(): Promise<StoredPeer[]> {
   return await invoke("list_stored_peers");
 }
 
+export async function refreshPeerProfile(peerId: string, ip: string, port: number): Promise<StoredPeer | null> {
+  return await invoke("refresh_peer_profile", { peerId, ip, port });
+}
+
 export async function getPeers(): Promise<Peer[]> {
   return await invoke("get_peers");
 }

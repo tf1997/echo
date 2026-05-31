@@ -27,7 +27,13 @@ impl RuntimeServices {
 
         // Persist peer_id for profile
         if profile.peer_id.is_empty() || profile.peer_id != my_id {
-            db.save_user_profile(&my_id, &profile.username, &profile.department)
+            db.save_user_profile(
+                &my_id,
+                &profile.username,
+                &profile.department,
+                &crate::profile_metadata::software_version(),
+                &crate::profile_metadata::mac_address(),
+            )
                 .await
                 .ok();
         }
@@ -55,6 +61,8 @@ impl RuntimeServices {
             my_id.clone(),
             profile.username.clone(),
             profile.department.clone(),
+            crate::profile_metadata::software_version(),
+            crate::profile_metadata::mac_address(),
             db,
             peers,
         );

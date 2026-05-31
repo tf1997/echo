@@ -9,6 +9,8 @@ pub struct UserProfile {
     pub peer_id: String,
     pub username: String,
     pub department: String,
+    pub software_version: String,
+    pub mac_address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +68,8 @@ pub struct StoredPeer {
     pub peer_id: String,
     pub username: String,
     pub department: String,
+    pub software_version: String,
+    pub mac_address: String,
     pub ip: String,
     pub port: u16,
     pub is_online: bool,
@@ -170,7 +174,9 @@ impl Database {
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 peer_id TEXT,
                 username TEXT NOT NULL,
-                department TEXT NOT NULL
+                department TEXT NOT NULL,
+                software_version TEXT NOT NULL DEFAULT '',
+                mac_address TEXT NOT NULL DEFAULT ''
             )",
         )
         .execute(&self.pool)
@@ -198,11 +204,35 @@ impl Database {
             }
         }
 
+        if let Err(error) =
+            sqlx::query("ALTER TABLE user_profile ADD COLUMN software_version TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add software_version column to user_profile");
+            }
+        }
+
+        if let Err(error) =
+            sqlx::query("ALTER TABLE user_profile ADD COLUMN mac_address TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add mac_address column to user_profile");
+            }
+        }
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS peers (
                 peer_id TEXT PRIMARY KEY,
                 username TEXT NOT NULL,
                 department TEXT NOT NULL,
+                software_version TEXT NOT NULL DEFAULT '',
+                mac_address TEXT NOT NULL DEFAULT '',
                 ip TEXT NOT NULL,
                 port INTEGER NOT NULL,
                 is_online INTEGER NOT NULL DEFAULT 1,
@@ -213,6 +243,28 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("Failed to create peers table")?;
+
+        if let Err(error) =
+            sqlx::query("ALTER TABLE peers ADD COLUMN software_version TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add software_version column to peers");
+            }
+        }
+
+        if let Err(error) =
+            sqlx::query("ALTER TABLE peers ADD COLUMN mac_address TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add mac_address column to peers");
+            }
+        }
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS messages (
@@ -418,6 +470,8 @@ impl Database {
         let rows = sqlx::query(
             "SELECT r.peer_id, COALESCE(p.username, r.peer_id) as username,
                     COALESCE(p.department, '') as department,
+                    COALESCE(p.software_version, '') as software_version,
+                    COALESCE(p.mac_address, '') as mac_address,
                     COALESCE(p.ip, '') as ip, COALESCE(p.port, 0) as port,
                     COALESCE(p.is_online, 0) as is_online,
                     COALESCE(p.first_seen_at, '') as first_seen_at,
@@ -443,6 +497,8 @@ impl Database {
             peer_id: r.get("peer_id"),
             username: r.get("username"),
             department: r.get("department"),
+            software_version: r.get("software_version"),
+            mac_address: r.get("mac_address"),
             ip: r.get("ip"),
             port: r.get::<i64, _>("port") as u16,
             is_online: r.get::<bool, _>("is_online"),
@@ -461,7 +517,7 @@ impl Database {
 
 
     pub async fn get_user_profile(&self) -> Result<Option<UserProfile>> {
-        let row = sqlx::query("SELECT peer_id, username, department FROM user_profile WHERE id = 1")
+        let row = sqlx::query("SELECT peer_id, username, department, software_version, mac_address FROM user_profile WHERE id = 1")
             .fetch_optional(&self.pool)
             .await
             .context("Failed to load user profile")?;
@@ -470,21 +526,34 @@ impl Database {
             peer_id: row.try_get::<Option<String>, _>("peer_id").ok().flatten().unwrap_or_default(),
             username: row.get("username"),
             department: row.get("department"),
+            software_version: row.try_get("software_version").unwrap_or_default(),
+            mac_address: row.try_get("mac_address").unwrap_or_default(),
         }))
     }
 
-    pub async fn save_user_profile(&self, peer_id: &str, username: &str, department: &str) -> Result<()> {
+    pub async fn save_user_profile(
+        &self,
+        peer_id: &str,
+        username: &str,
+        department: &str,
+        software_version: &str,
+        mac_address: &str,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO user_profile (id, peer_id, username, department)
-             VALUES (1, ?, ?, ?)
+            "INSERT INTO user_profile (id, peer_id, username, department, software_version, mac_address)
+             VALUES (1, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 peer_id = excluded.peer_id,
                 username = excluded.username,
-                department = excluded.department",
+                department = excluded.department,
+                software_version = excluded.software_version,
+                mac_address = excluded.mac_address",
         )
         .bind(peer_id)
         .bind(username)
         .bind(department)
+        .bind(software_version)
+        .bind(mac_address)
         .execute(&self.pool)
         .await
         .context("Failed to save user profile")?;
@@ -747,6 +816,8 @@ impl Database {
             "SELECT gm.peer_id AS peer_id,
                     COALESCE(NULLIF(p.username, ''), up.username, '') AS username,
                     COALESCE(NULLIF(p.department, ''), up.department, '') AS department,
+                    COALESCE(NULLIF(p.software_version, ''), up.software_version, '') AS software_version,
+                    COALESCE(NULLIF(p.mac_address, ''), up.mac_address, '') AS mac_address,
                     COALESCE(p.ip, '') AS ip,
                     COALESCE(p.port, 0) AS port,
                     COALESCE(p.is_online, 0) AS is_online,
@@ -764,6 +835,8 @@ impl Database {
                 peer_id: r.get("peer_id"),
                 username: r.try_get("username").unwrap_or_default(),
                 department: r.try_get("department").unwrap_or_default(),
+                software_version: r.try_get("software_version").unwrap_or_default(),
+                mac_address: r.try_get("mac_address").unwrap_or_default(),
                 ip: r.try_get("ip").unwrap_or_default(),
                 port: r.try_get::<i64, _>("port").unwrap_or(0) as u16,
                 // Treat self as always online — UI uses this to render the green dot.
@@ -917,6 +990,21 @@ impl Database {
         port: u16,
         is_online: bool,
     ) -> Result<()> {
+        self.upsert_peer_with_profile(peer_id, username, department, "", "", ip, port, is_online)
+            .await
+    }
+
+    pub async fn upsert_peer_with_profile(
+        &self,
+        peer_id: &str,
+        username: &str,
+        department: &str,
+        software_version: &str,
+        mac_address: &str,
+        ip: &str,
+        port: u16,
+        is_online: bool,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
 
         let endpoint_duplicates = sqlx::query("SELECT peer_id FROM peers WHERE ip = ? AND port = ? AND peer_id <> ?")
@@ -968,11 +1056,13 @@ impl Database {
         // empty values — system messages (group_created, group_dissolved, group_member_left)
         // historically carried empty sender_name and would otherwise wipe good peer data.
         sqlx::query(
-            "INSERT INTO peers (peer_id, username, department, ip, port, is_online, first_seen_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO peers (peer_id, username, department, software_version, mac_address, ip, port, is_online, first_seen_at, last_seen_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(peer_id) DO UPDATE SET
                 username = CASE WHEN excluded.username = '' THEN peers.username ELSE excluded.username END,
                 department = CASE WHEN excluded.department = '' THEN peers.department ELSE excluded.department END,
+                software_version = CASE WHEN excluded.software_version = '' THEN peers.software_version ELSE excluded.software_version END,
+                mac_address = CASE WHEN excluded.mac_address = '' THEN peers.mac_address ELSE excluded.mac_address END,
                 ip = excluded.ip,
                 port = excluded.port,
                 is_online = excluded.is_online,
@@ -981,6 +1071,8 @@ impl Database {
         .bind(peer_id)
         .bind(username)
         .bind(department)
+        .bind(software_version)
+        .bind(mac_address)
         .bind(ip)
         .bind(port as i64)
         .bind(if is_online { 1 } else { 0 })
@@ -1085,7 +1177,7 @@ impl Database {
 
     pub async fn list_stored_peers(&self) -> Result<Vec<StoredPeer>> {
         let rows = sqlx::query(
-            "SELECT peer_id, username, department, ip, port, is_online, first_seen_at, last_seen_at
+            "SELECT peer_id, username, department, software_version, mac_address, ip, port, is_online, first_seen_at, last_seen_at
              FROM peers
              ORDER BY is_online DESC, last_seen_at DESC",
         )
@@ -1099,6 +1191,8 @@ impl Database {
                 peer_id: row.get("peer_id"),
                 username: row.get("username"),
                 department: row.get("department"),
+                software_version: row.get("software_version"),
+                mac_address: row.get("mac_address"),
                 ip: row.get("ip"),
                 port: row.get::<i64, _>("port") as u16,
                 is_online: row.get::<bool, _>("is_online"),
@@ -1110,7 +1204,7 @@ impl Database {
 
     pub async fn get_stored_peer(&self, peer_id: &str) -> Result<Option<StoredPeer>> {
         let row = sqlx::query(
-            "SELECT peer_id, username, department, ip, port, is_online, first_seen_at, last_seen_at
+            "SELECT peer_id, username, department, software_version, mac_address, ip, port, is_online, first_seen_at, last_seen_at
              FROM peers
              WHERE peer_id = ?",
         )
@@ -1123,6 +1217,8 @@ impl Database {
             peer_id: row.get("peer_id"),
             username: row.get("username"),
             department: row.get("department"),
+            software_version: row.get("software_version"),
+            mac_address: row.get("mac_address"),
             ip: row.get("ip"),
             port: row.get::<i64, _>("port") as u16,
             is_online: row.get::<bool, _>("is_online"),
@@ -1133,7 +1229,7 @@ impl Database {
 
     pub async fn find_peer_by_identity(&self, username: &str, department: &str) -> Result<Option<StoredPeer>> {
         let row = sqlx::query(
-            "SELECT peer_id, username, department, ip, port, is_online, first_seen_at, last_seen_at
+            "SELECT peer_id, username, department, software_version, mac_address, ip, port, is_online, first_seen_at, last_seen_at
              FROM peers
              WHERE username = ? AND department = ?
              ORDER BY is_online DESC, last_seen_at DESC
@@ -1149,6 +1245,8 @@ impl Database {
             peer_id: row.get("peer_id"),
             username: row.get("username"),
             department: row.get("department"),
+            software_version: row.get("software_version"),
+            mac_address: row.get("mac_address"),
             ip: row.get("ip"),
             port: row.get::<i64, _>("port") as u16,
             is_online: row.get::<bool, _>("is_online"),

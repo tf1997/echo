@@ -25,6 +25,10 @@ struct AnnouncePacket {
     id: String,
     username: String,
     department: String,
+    #[serde(default)]
+    software_version: String,
+    #[serde(default)]
+    mac_address: String,
     ip: String,
     port: u16,
     /// Optional: list of peers this node knows about (for peer relay / 网桥)
@@ -37,6 +41,8 @@ pub struct LanDiscoveryConfig {
     pub peer_id: String,
     pub username: String,
     pub department: String,
+    pub software_version: String,
+    pub mac_address: String,
     pub listen_port: u16,
     pub local_ip: IpAddr,
     pub scan_subnets: Vec<String>,
@@ -102,6 +108,8 @@ impl LanDiscovery {
             id: config.peer_id.clone(),
             username: config.username.clone(),
             department: config.department.clone(),
+            software_version: config.software_version.clone(),
+            mac_address: config.mac_address.clone(),
             ip: config.local_ip.to_string(),
             port: config.listen_port,
             known_peers: Vec::new(),
@@ -257,7 +265,10 @@ impl LanDiscovery {
                 .filter(|p| p.online)
                 .map(|p| PeerEntry {
                     id: p.id.clone(), username: p.username.clone(),
-                    department: p.department.clone(), ip: p.ip.to_string(), port: p.port,
+                    department: p.department.clone(),
+                    software_version: p.software_version.clone(),
+                    mac_address: p.mac_address.clone(),
+                    ip: p.ip.to_string(), port: p.port,
                 })
                 .collect();
         }
@@ -313,6 +324,8 @@ impl LanDiscovery {
                 id: my_id.clone(),
                 username: String::new(),
                 department: String::new(),
+                software_version: String::new(),
+                mac_address: String::new(),
                 ip: String::new(),
                 port: 0,
                 known_peers: Vec::new(),
@@ -405,10 +418,12 @@ impl LanDiscovery {
                     };
 
                     // Register the announcing peer
-                    let peer = Peer::new(
+                    let peer = Peer::new_with_profile(
                         packet.id.clone(),
                         packet.username.clone(),
                         packet.department.clone(),
+                        packet.software_version.clone(),
+                        packet.mac_address.clone(),
                         remote_ip,
                         packet.port,
                     );
@@ -427,6 +442,8 @@ impl LanDiscovery {
                             id: peer.id.clone(),
                             username: peer.username.clone(),
                             department: peer.department.clone(),
+                            software_version: peer.software_version.clone(),
+                            mac_address: peer.mac_address.clone(),
                             ip: remote_ip,
                             port: packet.port,
                             online: true,
@@ -441,10 +458,12 @@ impl LanDiscovery {
                             if let Ok(ip) = entry.ip.parse::<IpAddr>() {
                                 peers_map.insert(
                                     entry.id.clone(),
-                                    Peer::with_online(
+                                    Peer::with_online_details(
                                         entry.id.clone(),
                                         entry.username.clone(),
                                         entry.department.clone(),
+                                        entry.software_version.clone(),
+                                        entry.mac_address.clone(),
                                         ip,
                                         entry.port,
                                         false,
@@ -488,12 +507,16 @@ impl LanDiscovery {
                             id: my_info.id.clone(),
                             username: my_info.username.clone(),
                             department: my_info.department.clone(),
+                            software_version: my_info.software_version.clone(),
+                            mac_address: my_info.mac_address.clone(),
                             ip: my_info.ip.clone(),
                             port: my_info.port,
                             known_peers: vec![PeerEntry {
                                 id: peer.id.clone(),
                                 username: peer.username.clone(),
                                 department: peer.department.clone(),
+                                software_version: peer.software_version.clone(),
+                                mac_address: peer.mac_address.clone(),
                                 ip: remote_ip.to_string(),
                                 port: packet.port,
                             }],

@@ -16,6 +16,8 @@ pub struct DiscoveryConfig {
     pub peer_id: String,
     pub username: String,
     pub department: String,
+    pub software_version: String,
+    pub mac_address: String,
     pub listen_port: u16,
     pub scan_subnets: Vec<String>,
     /// Channel to forward UDP-relayed peers to async DB layer.
@@ -34,6 +36,8 @@ impl DiscoveryConfig {
             peer_id: peer_id.into(),
             username: username.into(),
             department: department.into(),
+            software_version: crate::profile_metadata::software_version(),
+            mac_address: crate::profile_metadata::mac_address(),
             listen_port,
             scan_subnets,
             relay_tx: None,
@@ -99,6 +103,12 @@ impl DiscoveryService {
                 if !peer.department.is_empty() {
                     existing.department = peer.department;
                 }
+                if !peer.software_version.is_empty() {
+                    existing.software_version = peer.software_version;
+                }
+                if !peer.mac_address.is_empty() {
+                    existing.mac_address = peer.mac_address;
+                }
             }
         } else {
             map.insert(
@@ -107,6 +117,8 @@ impl DiscoveryService {
                     id: peer.id,
                     username: peer.username,
                     department: peer.department,
+                    software_version: peer.software_version,
+                    mac_address: peer.mac_address,
                     ip: peer.ip,
                     port: peer.port,
                     online: peer.online,
@@ -165,6 +177,8 @@ impl DiscoveryService {
                 ("id", self.config.peer_id.as_str()),
                 ("username", self.config.username.as_str()),
                 ("department", self.config.department.as_str()),
+                ("software_version", self.config.software_version.as_str()),
+                ("mac_address", self.config.mac_address.as_str()),
                 ("port", port_str.as_str()),
             ];
 
@@ -201,6 +215,8 @@ impl DiscoveryService {
             peer_id: self.config.peer_id.clone(),
             username: self.config.username.clone(),
             department: self.config.department.clone(),
+            software_version: self.config.software_version.clone(),
+            mac_address: self.config.mac_address.clone(),
             listen_port: self.config.listen_port,
             local_ip,
             scan_subnets: self.config.scan_subnets.clone(),
@@ -249,6 +265,8 @@ impl DiscoveryService {
             ("id", self.config.peer_id.as_str()),
             ("username", username),
             ("department", department),
+            ("software_version", self.config.software_version.as_str()),
+            ("mac_address", self.config.mac_address.as_str()),
             ("port", port_str.as_str()),
         ];
 
@@ -331,6 +349,16 @@ impl DiscoveryService {
             .map(|v| v.val_str().to_string())
             .unwrap_or_else(|| "未分组".to_string());
 
+        let software_version = properties
+            .get("software_version")
+            .map(|v| v.val_str().to_string())
+            .unwrap_or_default();
+
+        let mac_address = properties
+            .get("mac_address")
+            .map(|v| v.val_str().to_string())
+            .unwrap_or_default();
+
         let port: u16 = properties
             .get("port")
             .and_then(|v| v.val_str().parse().ok())
@@ -344,7 +372,15 @@ impl DiscoveryService {
             }
         };
 
-        let peer = Peer::new(peer_id.clone(), username.clone(), department, ip, port);
+        let peer = Peer::new_with_profile(
+            peer_id.clone(),
+            username.clone(),
+            department,
+            software_version,
+            mac_address,
+            ip,
+            port,
+        );
 
         let mut peers_map = peers.write().expect("peers lock poisoned");
         let now = std::time::SystemTime::now()
@@ -357,6 +393,8 @@ impl DiscoveryService {
             .map(|existing| {
                 existing.username != peer.username
                     || existing.department != peer.department
+                    || existing.software_version != peer.software_version
+                    || existing.mac_address != peer.mac_address
                     || existing.ip != peer.ip
                     || existing.port != peer.port
                     || !existing.online
@@ -369,6 +407,8 @@ impl DiscoveryService {
                 id: peer.id.clone(),
                 username: peer.username.clone(),
                 department: peer.department.clone(),
+                software_version: peer.software_version.clone(),
+                mac_address: peer.mac_address.clone(),
                 ip: peer.ip,
                 port: peer.port,
                 online: true,

@@ -17,6 +17,10 @@ pub struct ContactSummaryEntry {
     pub peer_id: String,
     pub username: String,
     pub department: String,
+    #[serde(default)]
+    pub software_version: String,
+    #[serde(default)]
+    pub mac_address: String,
     pub ip: String,
     pub port: u16,
     /// `last_seen_at` unix timestamp — used as version for delta comparison.
@@ -40,6 +44,8 @@ pub async fn build_summaries(
     my_id: &str,
     my_name: &str,
     my_department: &str,
+    my_software_version: &str,
+    my_mac_address: &str,
     my_port: u16,
     my_ip: &str,
 ) -> Vec<ContactSummaryEntry> {
@@ -53,6 +59,8 @@ pub async fn build_summaries(
         peer_id: my_id.to_string(),
         username: my_name.to_string(),
         department: my_department.to_string(),
+        software_version: my_software_version.to_string(),
+        mac_address: my_mac_address.to_string(),
         ip: my_ip.to_string(),
         port: my_port,
         version: 0,
@@ -65,6 +73,8 @@ pub async fn build_summaries(
                 peer_id: sp.peer_id.clone(),
                 username: sp.username.clone(),
                 department: sp.department.clone(),
+                software_version: sp.software_version.clone(),
+                mac_address: sp.mac_address.clone(),
                 ip: sp.ip.clone(),
                 port: sp.port,
                 version: sp.last_seen_at.parse::<i64>().unwrap_or(0),
@@ -80,6 +90,8 @@ pub async fn build_summaries(
                     peer_id: p.id.clone(),
                     username: p.username.clone(),
                     department: p.department.clone(),
+                    software_version: p.software_version.clone(),
+                    mac_address: p.mac_address.clone(),
                     ip: p.ip.to_string(),
                     port: p.port,
                     version: p.last_seen,
@@ -132,13 +144,33 @@ fn merge_into_memory(
     }
     if let Ok(ip) = entry.ip.parse::<std::net::IpAddr>() {
         if let Ok(mut map) = peers_map.write() {
-            if !map.contains_key(&entry.peer_id) {
+            if let Some(existing) = map.get_mut(&entry.peer_id) {
+                if !entry.username.is_empty() {
+                    existing.username = entry.username.clone();
+                }
+                if !entry.department.is_empty() {
+                    existing.department = entry.department.clone();
+                }
+                if !entry.software_version.is_empty() {
+                    existing.software_version = entry.software_version.clone();
+                }
+                if !entry.mac_address.is_empty() {
+                    existing.mac_address = entry.mac_address.clone();
+                }
+                existing.ip = ip;
+                existing.port = entry.port;
+                if entry.version > 0 {
+                    existing.last_seen = entry.version;
+                }
+            } else {
                 map.insert(
                     entry.peer_id.clone(),
-                    Peer::with_online(
+                    Peer::with_online_details(
                         entry.peer_id.clone(),
                         entry.username.clone(),
                         entry.department.clone(),
+                        entry.software_version.clone(),
+                        entry.mac_address.clone(),
                         ip,
                         entry.port,
                         false,
@@ -165,6 +197,8 @@ pub async fn handle_contact_summary(
     my_id: &str,
     my_name: &str,
     my_department: &str,
+    my_software_version: &str,
+    my_mac_address: &str,
     my_port: u16,
     my_ip: &str,
     sender_id: &str,
@@ -203,10 +237,12 @@ pub async fn handle_contact_summary(
         }
         // Persist
         let _ = db
-            .upsert_peer(
+            .upsert_peer_with_profile(
                 &entry.peer_id,
                 &entry.username,
                 &entry.department,
+                &entry.software_version,
+                &entry.mac_address,
                 &entry.ip,
                 entry.port,
                 false,
@@ -221,7 +257,17 @@ pub async fn handle_contact_summary(
     }
 
     // 2. Build our summary
-    let our_summaries = build_summaries(db, peers_map, my_id, my_name, my_department, my_port, my_ip).await;
+    let our_summaries = build_summaries(
+        db,
+        peers_map,
+        my_id,
+        my_name,
+        my_department,
+        my_software_version,
+        my_mac_address,
+        my_port,
+        my_ip,
+    ).await;
 
     // 3. Compute what they're missing
     let our_set: HashSet<&str> = our_summaries.iter().map(|s| s.peer_id.as_str()).collect();
@@ -246,6 +292,8 @@ pub async fn handle_contact_summary(
         sender_id: my_id.to_string(),
         sender_name: my_name.to_string(),
         sender_department: my_department.to_string(),
+        sender_software_version: my_software_version.to_string(),
+        sender_mac_address: my_mac_address.to_string(),
         sender_port: my_port,
         receiver_id: sender_id.to_string(),
         content: response_content,
@@ -298,10 +346,12 @@ pub async fn handle_contact_sync_res(
         }
         let _ = db.add_recent_contact(&entry.peer_id).await;
         let _ = db
-            .upsert_peer(
+            .upsert_peer_with_profile(
                 &entry.peer_id,
                 &entry.username,
                 &entry.department,
+                &entry.software_version,
+                &entry.mac_address,
                 &entry.ip,
                 entry.port,
                 false,
@@ -324,10 +374,12 @@ pub async fn handle_contact_sync_res(
         }
         let _ = db.add_recent_contact(&entry.peer_id).await;
         let _ = db
-            .upsert_peer(
+            .upsert_peer_with_profile(
                 &entry.peer_id,
                 &entry.username,
                 &entry.department,
+                &entry.software_version,
+                &entry.mac_address,
                 &entry.ip,
                 entry.port,
                 false,
@@ -356,19 +408,33 @@ pub async fn exchange_with_peer(
     my_id: &str,
     my_name: &str,
     my_department: &str,
+    my_software_version: &str,
+    my_mac_address: &str,
     my_port: u16,
     my_ip: &str,
     target_ip: &str,
     target_port: u16,
     target_id: &str,
 ) {
-    let summaries = build_summaries(db, peers_map, my_id, my_name, my_department, my_port, my_ip).await;
+    let summaries = build_summaries(
+        db,
+        peers_map,
+        my_id,
+        my_name,
+        my_department,
+        my_software_version,
+        my_mac_address,
+        my_port,
+        my_ip,
+    ).await;
     let content = serde_json::to_string(&summaries).unwrap_or_else(|_| "[]".to_string());
 
     let msg = WireMessage {
         sender_id: my_id.to_string(),
         sender_name: my_name.to_string(),
         sender_department: my_department.to_string(),
+        sender_software_version: my_software_version.to_string(),
+        sender_mac_address: my_mac_address.to_string(),
         sender_port: my_port,
         receiver_id: target_id.to_string(),
         content,

@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import type { Peer, UnreadCount, StoredPeer } from "../types";
-import { searchMessages, discoverByIp, listRecentContacts, removeRecentContact, createGroup } from "../api";
+import { searchMessages, discoverByIp, listRecentContacts, removeRecentContact, createGroup, refreshPeerProfile } from "../api";
 import { THEMES } from "../theme";
 import type { ThemeId } from "../theme";
 import type { GroupInfo } from "../api";
@@ -14,6 +14,8 @@ interface SidebarProps {
   myId: string;
   myName: string;
   myDepartment: string;
+  mySoftwareVersion: string;
+  myMacAddress: string;
   myIp: string;
   myPort: number;
   onEditProfile: () => void;
@@ -27,12 +29,14 @@ interface SidebarProps {
   onThemeChange: (themeId: ThemeId) => void;
 }
 
-export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit, selectedGroupId, onSelectGroup, groups, themeId, onThemeChange }: SidebarProps) {
+export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myDepartment, mySoftwareVersion, myMacAddress, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit, selectedGroupId, onSelectGroup, groups, themeId, onThemeChange }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
+  const [profilePeer, setProfilePeer] = useState<Peer | null>(null);
+  const [refreshingProfileId, setRefreshingProfileId] = useState("");
   const [showThemeMenu, setShowThemeMenu] = useState(false);
   const [copied, setCopied] = useState("");
   const [subnetInput, setSubnetInput] = useState(scanSubnets.join(", "));
@@ -57,6 +61,42 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   }, []);
 
   useEffect(() => { listRecentContacts().then(setRecentContacts).catch(() => {}); }, [peers, tab]);
+
+  useEffect(() => {
+    if (!profilePeer) return;
+    const missingMetadata = !profilePeer.software_version || !profilePeer.mac_address;
+    if (!missingMetadata || !profilePeer.ip || !profilePeer.port) return;
+
+    let cancelled = false;
+    setRefreshingProfileId(profilePeer.id);
+    refreshPeerProfile(profilePeer.id, profilePeer.ip, profilePeer.port)
+      .then((stored) => {
+        if (cancelled || !stored) return;
+        setProfilePeer((current) => {
+          if (!current || current.id !== profilePeer.id) return current;
+          return {
+            ...current,
+            id: stored.peer_id,
+            username: stored.username,
+            department: stored.department,
+            software_version: stored.software_version ?? "",
+            mac_address: stored.mac_address ?? "",
+            ip: stored.ip,
+            port: stored.port,
+            online: stored.is_online,
+            last_seen: stored.last_seen_at ? new Date(stored.last_seen_at).getTime() / 1000 : current.last_seen,
+          };
+        });
+      })
+      .catch(console.error)
+      .finally(() => {
+        if (!cancelled) setRefreshingProfileId("");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [profilePeer?.id, profilePeer?.ip, profilePeer?.port, profilePeer?.software_version, profilePeer?.mac_address]);
 
   // Close theme menu when clicking outside
   useEffect(() => {
@@ -132,6 +172,8 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
       const fields = [
         peer.username,
         peer.department,
+        peer.software_version ?? "",
+        peer.mac_address ?? "",
         peer.ip,
         `${peer.ip}:${peer.port}`,
         peer.online ? "在线" : "离线",
@@ -214,7 +256,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   }, [manualIp, manualPort]);
 
   return (
-    <div className="app-sidebar flex flex-col w-72 bg-gray-900 text-white h-full border-r border-gray-700">
+    <div className="app-sidebar relative flex flex-col w-72 bg-gray-900 text-white h-full border-r border-gray-700">
       <div className="p-4 border-b border-gray-700 relative">
         <div className="flex items-center gap-3">
           <button
@@ -253,7 +295,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
             </div>
             <div className="space-y-1.5 text-xs">
               <div className="flex items-center gap-1">
-                <span className="text-gray-400 w-14 flex-shrink-0">Peer ID</span>
+                <span className="text-gray-400 w-16 flex-shrink-0">Peer ID</span>
                 <span className="text-gray-200 font-mono text-[10px] truncate flex-1" title={myId}>{myId.slice(0, 16)}...</span>
                 <button onClick={() => copyToClipboard(myId, "Peer ID")} className="flex-shrink-0 w-5 h-5 rounded hover:bg-white/10 flex items-center justify-center">
                   {copied === "Peer ID" ? (
@@ -264,10 +306,10 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                 </button>
               </div>
               <div className="flex items-center gap-1">
-                <span className="text-gray-400 w-14 flex-shrink-0">IP</span>
+                <span className="text-gray-400 w-16 flex-shrink-0">IP</span>
                 <span className="text-gray-200 font-mono flex-1">{myIp}</span>
-                <button onClick={() => copyToClipboard(`${myIp}:${myPort}`, "IP:端口")} className="flex-shrink-0 w-5 h-5 rounded hover:bg-white/10 flex items-center justify-center">
-                  {copied === "IP:端口" ? (
+                <button onClick={() => copyToClipboard(myIp, "IP")} className="flex-shrink-0 w-5 h-5 rounded hover:bg-white/10 flex items-center justify-center">
+                  {copied === "IP" ? (
                     <span className="text-[10px] text-green-400">✓</span>
                   ) : (
                     <svg className="w-3 h-3 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
@@ -275,19 +317,35 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                 </button>
               </div>
               <div className="flex items-center gap-1">
-                <span className="text-gray-400 w-14 flex-shrink-0">端口</span>
+                <span className="text-gray-400 w-16 flex-shrink-0">端口</span>
                 <span className="text-gray-200 font-mono flex-1">{myPort}</span>
                 <div className="w-5 h-5" />
               </div>
               <div className="flex items-center gap-1">
-                <span className="text-gray-400 w-14 flex-shrink-0">用户名</span>
+                <span className="text-gray-400 w-16 flex-shrink-0">用户名</span>
                 <span className="text-gray-200 flex-1">{myName}</span>
                 <div className="w-5 h-5" />
               </div>
               <div className="flex items-center gap-1">
-                <span className="text-gray-400 w-14 flex-shrink-0">部门</span>
+                <span className="text-gray-400 w-16 flex-shrink-0">部门</span>
                 <span className="text-gray-200 flex-1">{myDepartment}</span>
                 <div className="w-5 h-5" />
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="text-gray-400 w-16 flex-shrink-0">软件版本</span>
+                <span className="text-gray-200 font-mono flex-1 truncate">{mySoftwareVersion || "未知"}</span>
+                <div className="w-5 h-5" />
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="text-gray-400 w-16 flex-shrink-0">MAC地址</span>
+                <span className="text-gray-200 font-mono text-[10px] truncate flex-1" title={myMacAddress || "未知"}>{myMacAddress || "未知"}</span>
+                <button onClick={() => copyToClipboard(myMacAddress, "MAC地址")} disabled={!myMacAddress} className="flex-shrink-0 w-5 h-5 rounded hover:bg-white/10 disabled:opacity-30 flex items-center justify-center">
+                  {copied === "MAC地址" ? (
+                    <span className="text-[10px] text-green-400">✓</span>
+                  ) : (
+                    <svg className="w-3 h-3 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                  )}
+                </button>
               </div>
             </div>
             <div className="border-t border-gray-700 my-3 pt-3">
@@ -449,10 +507,20 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
               ) : (
                 recentContacts.map(r => {
                   const livePeer = peerById.get(r.peer_id);
-                  const peer: Peer = livePeer ?? { id: r.peer_id, username: r.username, department: r.department, ip: r.ip, port: r.port, online: r.is_online, last_seen: r.last_seen_at ? new Date(r.last_seen_at).getTime() / 1000 : undefined };
+                  const peer: Peer = livePeer ?? {
+                    id: r.peer_id,
+                    username: r.username,
+                    department: r.department,
+                    software_version: r.software_version ?? "",
+                    mac_address: r.mac_address ?? "",
+                    ip: r.ip,
+                    port: r.port,
+                    online: r.is_online,
+                    last_seen: r.last_seen_at ? new Date(r.last_seen_at).getTime() / 1000 : undefined,
+                  };
                   return (
                     <div key={r.peer_id} className="group relative">
-                      <PeerItem peer={peer} isSelected={selectedPeerId === r.peer_id} unread={unreadMap.get(r.peer_id) ?? 0} onClick={() => onSelectPeer(peer)} />
+                      <PeerItem peer={peer} isSelected={selectedPeerId === r.peer_id} unread={unreadMap.get(r.peer_id) ?? 0} onClick={() => onSelectPeer(peer)} onAvatarClick={() => setProfilePeer(peer)} />
                       <button onClick={(e) => { e.stopPropagation(); handleRemoveRecent(r.peer_id); }} className="absolute right-2 top-3 hidden group-hover:flex w-5 h-5 rounded-full bg-gray-600 hover:bg-red-600 items-center justify-center text-[10px]" title="移除">×</button>
                     </div>
                   );
@@ -525,7 +593,7 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                         </span>
                       </button>
                       {expanded && deptPeers.map(peer => (
-                        <PeerItem key={peer.id} peer={peer} isSelected={selectedPeerId === peer.id} unread={unreadMap.get(peer.id) ?? 0} onClick={() => onSelectPeer(peer)} />
+                        <PeerItem key={peer.id} peer={peer} isSelected={selectedPeerId === peer.id} unread={unreadMap.get(peer.id) ?? 0} onClick={() => onSelectPeer(peer)} onAvatarClick={() => setProfilePeer(peer)} />
                       ))}
                     </div>
                   );
@@ -537,6 +605,16 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
           </div>
         </div>
       )}
+
+      {profilePeer ? (
+        <PeerProfileCard
+          peer={profilePeer}
+          copied={copied}
+          refreshing={refreshingProfileId === profilePeer.id}
+          onCopy={copyToClipboard}
+          onClose={() => setProfilePeer(null)}
+        />
+      ) : null}
 
       {/* Create group dialog */}
       {showCreateGroup && (
@@ -666,31 +744,123 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
   );
 }
 
-function PeerItem({ peer, isSelected, unread, onClick }: { peer: Peer; isSelected: boolean; unread: number; onClick: () => void }) {
+function PeerItem({ peer, isSelected, unread, onClick, onAvatarClick }: { peer: Peer; isSelected: boolean; unread: number; onClick: () => void; onAvatarClick: () => void }) {
   return (
-    <button
-      onClick={onClick}
+    <div
       className={`sidebar-list-item w-full flex items-center gap-3 px-4 py-3 transition-colors ${
         isSelected ? "sidebar-list-item-active bg-indigo-600/30 border-l-2 border-indigo-400" : "hover:bg-gray-800 border-l-2 border-transparent"
       }`}
     >
-      <div className="relative">
+      <button
+        type="button"
+        onClick={(event) => {
+          event.stopPropagation();
+          onAvatarClick();
+        }}
+        className="relative flex-shrink-0 rounded-full focus:outline-none focus:ring-2 focus:ring-indigo-400"
+        title="查看个人信息"
+        aria-label={`查看${peer.username}的个人信息`}
+      >
         <div className="w-9 h-9 rounded-full bg-gray-600 flex items-center justify-center text-sm font-medium">
           {peer.username.charAt(0).toUpperCase()}
         </div>
         <div className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-gray-900 ${peer.online ? "bg-green-400" : "bg-gray-500"}`} />
-      </div>
-      <div className="flex-1 min-w-0 text-left">
+      </button>
+      <button
+        type="button"
+        onClick={onClick}
+        className="flex-1 min-w-0 text-left"
+      >
         <p className="text-sm font-medium truncate">{peer.username}</p>
         <p className="text-xs text-gray-400 truncate">{peer.department}</p>
         <p className="text-[10px] text-gray-500 truncate">{peer.online ? `${peer.ip}:${peer.port}` : "离线"}</p>
-      </div>
+      </button>
       {unread > 0 && !isSelected && (
         <div className="flex-shrink-0 w-5 h-5 rounded-full bg-red-500 flex items-center justify-center text-[10px] font-bold">
           {unread > 99 ? "99+" : unread}
         </div>
       )}
-    </button>
+    </div>
+  );
+}
+
+function formatPeerLastSeen(peer: Peer) {
+  if (peer.online) return "在线";
+  if (!peer.last_seen) return "未知";
+  return new Date(peer.last_seen * 1000).toLocaleString("zh-CN", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function PeerProfileCard({ peer, copied, refreshing, onCopy, onClose }: { peer: Peer; copied: string; refreshing: boolean; onCopy: (text: string, label: string) => void; onClose: () => void }) {
+  const endpoint = peer.ip && peer.port ? `${peer.ip}:${peer.port}` : "";
+  const rows = [
+    { label: "Peer ID", value: peer.id, copyLabel: "好友Peer ID", mono: true },
+    { label: "用户名", value: peer.username },
+    { label: "部门", value: peer.department || "未分组" },
+    { label: "软件版本", value: peer.software_version || (refreshing ? "获取中..." : "未知"), mono: true },
+    { label: "MAC地址", value: peer.mac_address || (refreshing ? "获取中..." : "未知"), copyLabel: peer.mac_address ? "好友MAC地址" : undefined, mono: true },
+    { label: "IP:端口", value: endpoint || "未知", copyLabel: endpoint ? "好友IP:端口" : undefined, mono: true },
+    { label: "状态", value: formatPeerLastSeen(peer) },
+  ];
+
+  return (
+    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/50 px-4">
+      <div className="w-full rounded-xl border border-gray-600 bg-gray-800 p-4 shadow-2xl">
+        <div className="mb-4 flex items-center gap-3">
+          <div className="relative flex-shrink-0">
+            <div className="w-12 h-12 rounded-full bg-gray-600 flex items-center justify-center text-lg font-semibold">
+              {peer.username.charAt(0).toUpperCase()}
+            </div>
+            <div className={`absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full border-2 border-gray-800 ${peer.online ? "bg-green-400" : "bg-gray-500"}`} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-sm font-semibold text-gray-100">{peer.username}</p>
+            <p className="truncate text-xs text-gray-400">{peer.department || "未分组"}</p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex-shrink-0 w-7 h-7 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 flex items-center justify-center"
+            aria-label="关闭"
+          >
+            ×
+          </button>
+        </div>
+        <div className="space-y-2 text-xs">
+          {rows.map((row) => (
+            <div key={row.label} className="flex items-center gap-2">
+              <span className="w-16 flex-shrink-0 text-gray-400">{row.label}</span>
+              <span
+                className={`min-w-0 flex-1 truncate text-gray-200 ${row.mono ? "font-mono text-[10px]" : ""}`}
+                title={row.value}
+              >
+                {row.value}
+              </span>
+              {row.copyLabel && row.value !== "未知" ? (
+                <button
+                  type="button"
+                  onClick={() => onCopy(row.value, row.copyLabel!)}
+                  className="flex-shrink-0 w-6 h-6 rounded hover:bg-white/10 flex items-center justify-center"
+                  title={`复制${row.label}`}
+                >
+                  {copied === row.copyLabel ? (
+                    <span className="text-[10px] text-green-400">✓</span>
+                  ) : (
+                    <svg className="w-3.5 h-3.5 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                  )}
+                </button>
+              ) : (
+                <div className="w-6 h-6 flex-shrink-0" />
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 

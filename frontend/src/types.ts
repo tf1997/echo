@@ -2,6 +2,8 @@ export interface Peer {
   id: string;
   username: string;
   department: string;
+  software_version?: string;
+  mac_address?: string;
   ip: string;
   port: number;
   online: boolean;
@@ -12,6 +14,8 @@ export interface StoredPeer {
   peer_id: string;
   username: string;
   department: string;
+  software_version?: string;
+  mac_address?: string;
   ip: string;
   port: number;
   is_online: boolean;
@@ -39,6 +43,8 @@ export interface AppInfo {
   peer_id: string;
   username: string;
   department: string;
+  software_version: string;
+  mac_address: string;
   listen_port: number;
   my_ip: string;
 }

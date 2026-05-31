@@ -14,6 +14,8 @@ pub struct AppInfo {
     pub peer_id: String,
     pub username: String,
     pub department: String,
+    pub software_version: String,
+    pub mac_address: String,
     pub listen_port: u16,
     pub my_ip: String,
 }
@@ -39,6 +41,8 @@ pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String>
             peer_id: runtime.my_id.clone(),
             username: profile.username,
             department: profile.department,
+            software_version: crate::profile_metadata::software_version(),
+            mac_address: crate::profile_metadata::mac_address(),
             listen_port: runtime.listen_port,
             my_ip,
         })
@@ -48,6 +52,8 @@ pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String>
             peer_id: String::new(),
             username: String::new(),
             department: String::new(),
+            software_version: crate::profile_metadata::software_version(),
+            mac_address: crate::profile_metadata::mac_address(),
             listen_port: std::env::var("ECHO_PORT")
                 .ok()
                 .and_then(|value| value.parse::<u16>().ok())
@@ -102,7 +108,13 @@ pub async fn save_profile(
 
     state
         .db
-        .save_user_profile(&existing_peer_id, username, department)
+        .save_user_profile(
+            &existing_peer_id,
+            username,
+            department,
+            &crate::profile_metadata::software_version(),
+            &crate::profile_metadata::mac_address(),
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -110,6 +122,8 @@ pub async fn save_profile(
         peer_id: existing_peer_id,
         username: username.to_string(),
         department: department.to_string(),
+        software_version: crate::profile_metadata::software_version(),
+        mac_address: crate::profile_metadata::mac_address(),
     };
 
     *state.profile.lock().await = Some(profile.clone());
@@ -138,6 +152,8 @@ pub async fn save_profile(
         let payload = serde_json::json!({
             "username": username,
             "department": department,
+            "software_version": profile.software_version,
+            "mac_address": profile.mac_address,
         }).to_string();
 
         let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
@@ -166,6 +182,80 @@ pub async fn save_profile(
 #[tauri::command]
 pub async fn list_stored_peers(state: State<'_, AppState>) -> Result<Vec<StoredPeer>, String> {
     state.db.list_stored_peers().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn refresh_peer_profile(
+    state: State<'_, AppState>,
+    peer_id: String,
+    ip: String,
+    port: u16,
+) -> Result<Option<StoredPeer>, String> {
+    let my_profile = state.profile.lock().await.clone();
+    let (my_id, my_port) = {
+        let runtime_opt = { state.runtime.read().await.clone() };
+        match runtime_opt.as_ref() {
+            Some(runtime) => (runtime.my_id.clone(), runtime.listen_port),
+            None => return Err("应用尚未初始化".to_string()),
+        }
+    };
+    let my_name = my_profile
+        .as_ref()
+        .map(|profile| profile.username.as_str())
+        .unwrap_or("");
+    let my_department = my_profile
+        .as_ref()
+        .map(|profile| profile.department.as_str())
+        .unwrap_or("");
+
+    let addr = format!("{}:{}", ip, port);
+    let Some(identity) = probe_identity(&addr, &my_id, my_name, my_department, my_port).await else {
+        return state
+            .db
+            .get_stored_peer(&peer_id)
+            .await
+            .map_err(|e| e.to_string());
+    };
+
+    let remote_port = if identity.port == 0 { port } else { identity.port };
+    let remote_ip = if identity.ip.is_empty() { ip } else { identity.ip };
+    let parsed_ip = remote_ip
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| "无效的联系人 IP 地址".to_string())?;
+
+    state
+        .db
+        .upsert_peer_with_profile(
+            &identity.peer_id,
+            &identity.username,
+            &identity.department,
+            &identity.software_version,
+            &identity.mac_address,
+            &remote_ip,
+            remote_port,
+            true,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
+        let peer = crate::discovery::Peer::new_with_profile(
+            identity.peer_id.clone(),
+            identity.username,
+            identity.department,
+            identity.software_version,
+            identity.mac_address,
+            parsed_ip,
+            remote_port,
+        );
+        runtime.discovery.read().await.register_peer(peer);
+    }
+
+    state
+        .db
+        .get_stored_peer(&identity.peer_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -210,10 +300,12 @@ pub async fn send_message_typed(
         .await
         .map_err(|e| e.to_string())?
     {
-        Peer::new(
+        Peer::new_with_profile(
             stored_peer.peer_id,
             stored_peer.username,
             stored_peer.department,
+            stored_peer.software_version,
+            stored_peer.mac_address,
             stored_peer.ip.parse().map_err(|_| "无效的联系人 IP 地址".to_string())?,
             stored_peer.port,
         )
@@ -277,10 +369,12 @@ async fn send_file_with_kind(
         .await
         .map_err(|e| e.to_string())?
     {
-        Peer::new(
+        Peer::new_with_profile(
             stored_peer.peer_id,
             stored_peer.username,
             stored_peer.department,
+            stored_peer.software_version,
+            stored_peer.mac_address,
             stored_peer.ip.parse().map_err(|_| "无效的联系人 IP 地址".to_string())?,
             stored_peer.port,
         )
@@ -370,6 +464,8 @@ struct RemoteIdentity {
     peer_id: String,
     username: String,
     department: String,
+    software_version: String,
+    mac_address: String,
     ip: String,
     port: u16,
 }
@@ -398,6 +494,8 @@ async fn probe_identity(
         sender_id: my_id.to_string(),
         sender_name: my_name.to_string(),
         sender_department: my_department.to_string(),
+        sender_software_version: crate::profile_metadata::software_version(),
+        sender_mac_address: crate::profile_metadata::mac_address(),
         sender_port: my_port,
         receiver_id: String::new(),
         content: String::new(),
@@ -428,6 +526,8 @@ async fn probe_identity(
         peer_id: msg.sender_id,
         username: msg.sender_name,
         department: msg.sender_department,
+        software_version: msg.sender_software_version,
+        mac_address: msg.sender_mac_address,
         ip: peer_addr
             .map(|addr| addr.ip().to_string())
             .unwrap_or_else(|| addr.rsplit_once(':').map(|(ip, _)| ip.to_string()).unwrap_or_default()),
@@ -478,6 +578,8 @@ pub async fn discover_by_ip(
                 .filter(|p| p.online)
                 .map(|p| serde_json::json!({
                     "id": p.id, "username": p.username, "department": p.department,
+                    "software_version": p.software_version,
+                    "mac_address": p.mac_address,
                     "ip": p.ip.to_string(), "port": p.port,
                 }))
                 .collect()
@@ -488,6 +590,8 @@ pub async fn discover_by_ip(
         "id": my_id,
         "username": my_profile.as_ref().map(|p| p.username.as_str()).unwrap_or(""),
         "department": my_profile.as_ref().map(|p| p.department.as_str()).unwrap_or(""),
+        "software_version": crate::profile_metadata::software_version(),
+        "mac_address": crate::profile_metadata::mac_address(),
         "ip": "",
         "port": my_port,
         "known_peers": our_known,
@@ -519,10 +623,12 @@ pub async fn discover_by_ip(
         let remote_parsed_ip = remote_ip
             .parse::<std::net::IpAddr>()
             .unwrap_or(parsed_ip);
-        let peer = crate::discovery::Peer::new(
+        let peer = crate::discovery::Peer::new_with_profile(
             identity.peer_id.clone(),
             identity.username.clone(),
             identity.department.clone(),
+            identity.software_version.clone(),
+            identity.mac_address.clone(),
             remote_parsed_ip,
             remote_port,
         );
@@ -537,10 +643,12 @@ pub async fn discover_by_ip(
 
         state
             .db
-            .upsert_peer(
+            .upsert_peer_with_profile(
                 &identity.peer_id,
                 &identity.username,
                 &identity.department,
+                &identity.software_version,
+                &identity.mac_address,
                 &remote_ip,
                 remote_port,
                 true,
@@ -635,10 +743,20 @@ pub async fn discover_by_ip(
         .as_ref()
         .map(|peer| peer.department.clone())
         .unwrap_or_default();
-    let peer = crate::discovery::Peer::new(
+    let display_version = stored_peer
+        .as_ref()
+        .map(|peer| peer.software_version.clone())
+        .unwrap_or_default();
+    let display_mac = stored_peer
+        .as_ref()
+        .map(|peer| peer.mac_address.clone())
+        .unwrap_or_default();
+    let peer = crate::discovery::Peer::new_with_profile(
         pid.clone(),
         display_name.clone(),
         display_department.clone(),
+        display_version,
+        display_mac,
         parsed_ip,
         port,
     );
@@ -716,6 +834,14 @@ pub async fn check_peer_online(
         .as_ref()
         .map(|peer| peer.department.clone())
         .unwrap_or_default();
+    let software_version = stored
+        .as_ref()
+        .map(|peer| peer.software_version.clone())
+        .unwrap_or_default();
+    let mac_address = stored
+        .as_ref()
+        .map(|peer| peer.mac_address.clone())
+        .unwrap_or_default();
 
     if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
         if online {
@@ -727,7 +853,16 @@ pub async fn check_peer_online(
 
     let _ = state
         .db
-        .upsert_peer(&peer_id, &username, &department, &ip, port, online)
+        .upsert_peer_with_profile(
+            &peer_id,
+            &username,
+            &department,
+            &software_version,
+            &mac_address,
+            &ip,
+            port,
+            online,
+        )
         .await;
 
     Ok(online)
@@ -1749,7 +1884,10 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
                 let addr = format!("{}:{}", ip, port);
                 let wm = crate::chat::WireMessage {
                     sender_id: p.sender_id.clone(), sender_name: p.sender_name.clone(),
-                    sender_department: String::new(), sender_port: listen_port,
+                    sender_department: String::new(),
+                    sender_software_version: crate::profile_metadata::software_version(),
+                    sender_mac_address: crate::profile_metadata::mac_address(),
+                    sender_port: listen_port,
                     receiver_id: peer_id.clone(), content: p.content.clone(),
                     msg_type: p.msg_type.clone(), file_name: None, file_size: None, file_data: None,
                     file_kind: None,
@@ -1888,6 +2026,8 @@ async fn send_group_file_payloads_over_tcp(
             sender_id: transfer.sender_id.clone(),
             sender_name: transfer.sender_name.clone(),
             sender_department: transfer.sender_department.clone(),
+            sender_software_version: crate::profile_metadata::software_version(),
+            sender_mac_address: crate::profile_metadata::mac_address(),
             sender_port: transfer.sender_port,
             receiver_id: transfer.peer_id.clone(),
             content: base64_encode_std(&buf[..n]),
@@ -1938,6 +2078,8 @@ fn build_notification_json(
         "sender_id": sender_id,
         "sender_name": sender_name,
         "sender_department": sender_department,
+        "sender_software_version": crate::profile_metadata::software_version(),
+        "sender_mac_address": crate::profile_metadata::mac_address(),
         "sender_port": sender_port,
         "receiver_id": receiver_id,
         "content": content,
@@ -2096,6 +2238,8 @@ async fn build_member_directory(
                 id: self_id.to_string(),
                 username: self_name.to_string(),
                 department: self_department.to_string(),
+                software_version: crate::profile_metadata::software_version(),
+                mac_address: crate::profile_metadata::mac_address(),
                 ip: my_ip.clone(),
                 port: self_port,
             });
@@ -2106,6 +2250,8 @@ async fn build_member_directory(
                 id: p.id.clone(),
                 username: p.username.clone(),
                 department: p.department.clone(),
+                software_version: p.software_version.clone(),
+                mac_address: p.mac_address.clone(),
                 ip: p.ip.to_string(),
                 port: p.port,
             });
@@ -2116,6 +2262,8 @@ async fn build_member_directory(
                 id: sp.peer_id,
                 username: sp.username,
                 department: sp.department,
+                software_version: sp.software_version,
+                mac_address: sp.mac_address,
                 ip: sp.ip,
                 port: sp.port,
             });
@@ -2125,6 +2273,8 @@ async fn build_member_directory(
                 id: id.clone(),
                 username: String::new(),
                 department: String::new(),
+                software_version: String::new(),
+                mac_address: String::new(),
                 ip: String::new(),
                 port: 0,
             });

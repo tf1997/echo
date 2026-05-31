@@ -341,9 +341,12 @@ function App() {
         id: item.peer_id,
         username: item.username,
         department: item.department,
+        software_version: item.software_version ?? "",
+        mac_address: item.mac_address ?? "",
         ip: item.ip,
         port: item.port,
         online: item.is_online || graceKey > now,
+        last_seen: item.last_seen_at ? new Date(item.last_seen_at).getTime() / 1000 : undefined,
       };
       if (item.is_online) {
         onlineGraceUntilRef.current.set(peer.id, now + onlineGraceMs);
@@ -358,6 +361,7 @@ function App() {
     for (const peer of onlinePeers) {
       const endpointKey = `${peer.ip}:${peer.port}`;
       const existingId = endpointToId.get(endpointKey);
+      const cachedPeer = existingId ? map.get(existingId) : map.get(peer.id);
       if (existingId && existingId !== peer.id) {
         map.delete(existingId);
         onlineGraceUntilRef.current.delete(existingId);
@@ -368,6 +372,9 @@ function App() {
       }
       map.set(peer.id, {
         ...peer,
+        software_version: peer.software_version || cachedPeer?.software_version || "",
+        mac_address: peer.mac_address || cachedPeer?.mac_address || "",
+        last_seen: peer.last_seen ?? cachedPeer?.last_seen,
         online: peer.online || (onlineGraceUntilRef.current.get(peer.id) ?? 0) > now,
       });
     }
@@ -781,6 +788,8 @@ function App() {
         myId={appInfo.peer_id}
         myName={appInfo.username}
         myDepartment={appInfo.department}
+        mySoftwareVersion={appInfo.software_version}
+        myMacAddress={appInfo.mac_address}
         myIp={appInfo.my_ip}
         myPort={appInfo.listen_port}
         onEditProfile={openEditProfile}
@@ -797,7 +806,7 @@ function App() {
         onThemeChange={handleThemeChange}
       />
       <ChatWindow
-        peer={selectedGroupId ? { id: selectedGroupId, username: groups.find(g => g.group_id === selectedGroupId)?.name || "群聊", department: "", ip: "", port: 0, online: true } : selectedPeer}
+        peer={selectedGroupId ? { id: selectedGroupId, username: groups.find(g => g.group_id === selectedGroupId)?.name || "群聊", department: "", software_version: "", mac_address: "", ip: "", port: 0, online: true } : selectedPeer}
         messages={messages}
         myId={appInfo.peer_id}
         myName={appInfo.username}

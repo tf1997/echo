@@ -3,6 +3,7 @@ mod commands;
 mod contact_sync;
 mod db;
 mod discovery;
+mod profile_metadata;
 mod state;
 mod tray;
 mod windows_event_log;
@@ -297,10 +298,12 @@ pub fn run() {
                             continue;
                         }
                         let _ = processor_db
-                            .upsert_peer(
+                            .upsert_peer_with_profile(
                                 &entry.id,
                                 &entry.username,
                                 &entry.department,
+                                &entry.software_version,
+                                &entry.mac_address,
                                 &entry.ip,
                                 entry.port,
                                 false,
@@ -332,10 +335,12 @@ pub fn run() {
                         let disc = runtime.discovery.write().await;
                         for sp in &stored {
                             if let Ok(ip) = sp.ip.parse::<IpAddr>() {
-                                let peer = Peer::new(
+                                let peer = Peer::new_with_profile(
                                     sp.peer_id.clone(),
                                     sp.username.clone(),
                                     sp.department.clone(),
+                                    sp.software_version.clone(),
+                                    sp.mac_address.clone(),
                                     ip,
                                     sp.port,
                                 );
@@ -350,6 +355,9 @@ pub fn run() {
             // Health check: concurrent TCP checks with proper lock handling
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let mut metadata_probe_last: std::collections::HashMap<String, i64> =
+                    std::collections::HashMap::new();
+
                 use tokio::net::TcpStream;
                 use std::net::SocketAddr;
 
@@ -361,12 +369,12 @@ pub fn run() {
                             .as_secs() as i64;
 
                         // Snapshot peers, then release all locks
-                        let snapshot: Vec<(String, String, String, IpAddr, u16)> = {
+                        let snapshot: Vec<(String, String, String, String, String, IpAddr, u16)> = {
                             let runtime_opt = { state.runtime.read().await.clone() };
                             if let Some(runtime) = runtime_opt.as_ref() {
                                 runtime.discovery.read().await.get_peers()
                                     .into_iter()
-                                    .map(|p| (p.id, p.username, p.department, p.ip, p.port))
+                                    .map(|p| (p.id, p.username, p.department, p.software_version, p.mac_address, p.ip, p.port))
                                     .collect()
                             } else {
                                 vec![]
@@ -380,7 +388,7 @@ pub fn run() {
                         // Concurrent TCP detection using JoinSet to prevent blocking
                         let mut tasks = tokio::task::JoinSet::new();
 
-                        for (id, username, department, ip, port) in snapshot {
+                        for (id, username, department, software_version, mac_address, ip, port) in snapshot {
                             tasks.spawn(async move {
                                 // Support both IPv4 and IPv6 with SocketAddr
                                 let addr = SocketAddr::new(ip, port);
@@ -392,24 +400,41 @@ pub fn run() {
                                 .map(|r| r.is_ok())
                                 .unwrap_or(false);
 
-                                (id, username, department, ip, port, tcp_ok)
+                                (id, username, department, software_version, mac_address, ip, port, tcp_ok)
                             });
                         }
 
                         // Process concurrent check results
                         while let Some(res) = tasks.join_next().await {
-                            if let Ok((id, username, department, ip, port, tcp_ok)) = res {
+                            if let Ok((id, username, department, software_version, mac_address, ip, port, tcp_ok)) = res {
                                 if tcp_ok {
                                     // TCP success → peer is alive, refresh last_seen
                                     if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
                                         runtime.discovery.write().await.touch_peer(&id);
                                     }
-                                    let _ = state.db.upsert_peer(&id, &username, &department, &ip.to_string(), port, true).await;
+                                    let _ = state.db.upsert_peer_with_profile(&id, &username, &department, &software_version, &mac_address, &ip.to_string(), port, true).await;
                                     let db = state.db.clone();
                                     let pid = id.clone();
                                     tauri::async_runtime::spawn(async move {
                                         crate::commands::deliver_pending_to_peer(&db, &pid).await;
                                     });
+                                    if software_version.is_empty() || mac_address.is_empty() {
+                                        let should_probe = metadata_probe_last
+                                            .get(&id)
+                                            .map(|last| now - *last >= 300)
+                                            .unwrap_or(true);
+                                        if should_probe {
+                                            metadata_probe_last.insert(id.clone(), now);
+                                            if let Some(runtime) = { state.runtime.read().await.clone() } {
+                                                let target_id = id.clone();
+                                                let target_ip = ip.to_string();
+                                                tauri::async_runtime::spawn(async move {
+                                                    let chat = runtime.chat.lock().await;
+                                                    chat.exchange_contacts(&target_ip, port, &target_id).await;
+                                                });
+                                            }
+                                        }
+                                    }
                                     log::debug!("HealthCheck: {} TCP OK → deliver pending", username);
                                 } else {
                                     // TCP fail → check if last_seen is too old
@@ -426,8 +451,18 @@ pub fn run() {
                                         if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
                                             runtime.discovery.write().await.set_online(&id, false);
                                         }
-                                        let _ = state.db.upsert_peer(&id, &username, &department, &ip.to_string(), port, false).await;
-                                        let updated = Peer::with_online(id.clone(), username.clone(), department.clone(), ip, port, false, now);
+                                        let _ = state.db.upsert_peer_with_profile(&id, &username, &department, &software_version, &mac_address, &ip.to_string(), port, false).await;
+                                        let updated = Peer::with_online_details(
+                                            id.clone(),
+                                            username.clone(),
+                                            department.clone(),
+                                            software_version.clone(),
+                                            mac_address.clone(),
+                                            ip,
+                                            port,
+                                            false,
+                                            now,
+                                        );
                                         let _ = app_handle.emit_all("peer-discovered", &updated);
                                         log::info!("HealthCheck: {} → OFFLINE (tcp failed, age>15s)", username);
                                     }
@@ -491,7 +526,17 @@ pub fn run() {
                     }
 
                     // Extract sync params once; release locks before I/O
-                    let (db, peers, my_id, my_name, my_department, my_port, my_ip) = {
+                    let (
+                        db,
+                        peers,
+                        my_id,
+                        my_name,
+                        my_department,
+                        my_software_version,
+                        my_mac_address,
+                        my_port,
+                        my_ip,
+                    ) = {
                         let runtime_opt = { state.runtime.read().await.clone() };
                         let Some(runtime) = runtime_opt.as_ref() else { continue };
                         let chat = runtime.chat.lock().await;
@@ -507,6 +552,8 @@ pub fn run() {
                             chat.my_id().to_string(),
                             chat.my_name().to_string(),
                             chat.my_department().to_string(),
+                            chat.my_software_version().to_string(),
+                            chat.my_mac_address().to_string(),
                             chat.listen_port(),
                             my_ip,
                         )
@@ -526,6 +573,8 @@ pub fn run() {
                             &my_id,
                             &my_name,
                             &my_department,
+                            &my_software_version,
+                            &my_mac_address,
                             my_port,
                             &my_ip,
                             &p.ip.to_string(),
@@ -544,6 +593,7 @@ pub fn run() {
             commands::get_departments,
             commands::save_profile,
             commands::list_stored_peers,
+            commands::refresh_peer_profile,
             commands::get_peers,
             commands::send_message,
             commands::send_message_typed,

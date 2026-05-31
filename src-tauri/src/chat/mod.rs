@@ -17,6 +17,10 @@ pub struct WireMessage {
     pub sender_id: String,
     pub sender_name: String,
     pub sender_department: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender_software_version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender_mac_address: String,
     pub sender_port: u16,
     pub receiver_id: String,
     pub content: String,
@@ -49,6 +53,8 @@ pub struct ChatServer {
     my_id: String,
     my_name: String,
     my_department: String,
+    my_software_version: String,
+    my_mac_address: String,
     db: Arc<Database>,
     incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
     peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
@@ -60,6 +66,8 @@ impl ChatServer {
         my_id: String,
         my_name: String,
         my_department: String,
+        my_software_version: String,
+        my_mac_address: String,
         db: Arc<Database>,
         peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
     ) -> Self {
@@ -69,6 +77,8 @@ impl ChatServer {
             my_id,
             my_name,
             my_department,
+            my_software_version,
+            my_mac_address,
             db,
             incoming_tx,
             peers,
@@ -78,6 +88,8 @@ impl ChatServer {
     pub fn my_id(&self) -> &str { &self.my_id }
     pub fn my_name(&self) -> &str { &self.my_name }
     pub fn my_department(&self) -> &str { &self.my_department }
+    pub fn my_software_version(&self) -> &str { &self.my_software_version }
+    pub fn my_mac_address(&self) -> &str { &self.my_mac_address }
     pub fn listen_port(&self) -> u16 { self.listen_port }
     pub fn db(&self) -> &Arc<Database> { &self.db }
     pub fn peers(&self) -> &Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>> { &self.peers }
@@ -102,6 +114,8 @@ impl ChatServer {
         let my_id = self.my_id.clone();
         let my_name = self.my_name.clone();
         let my_department = self.my_department.clone();
+        let my_software_version = self.my_software_version.clone();
+        let my_mac_address = self.my_mac_address.clone();
         let my_port = self.listen_port;
 
         tauri::async_runtime::spawn(async move {
@@ -115,8 +129,10 @@ impl ChatServer {
                         let my_id = my_id.clone();
                         let my_name = my_name.clone();
                         let my_department = my_department.clone();
+                        let my_software_version = my_software_version.clone();
+                        let my_mac_address = my_mac_address.clone();
                         tauri::async_runtime::spawn(async move {
-                            if let Err(e) = Self::handle_incoming(stream, peer_addr, db, tx, peers, my_id, my_name, my_department, my_port).await {
+                            if let Err(e) = Self::handle_incoming(stream, peer_addr, db, tx, peers, my_id, my_name, my_department, my_software_version, my_mac_address, my_port).await {
                                 error!("Error handling connection: {}", e);
                             }
                         });
@@ -140,6 +156,8 @@ impl ChatServer {
         my_id: String,
         my_name: String,
         my_department: String,
+        my_software_version: String,
+        my_mac_address: String,
         my_port: u16,
     ) -> Result<()> {
         let (reader, mut writer) = stream.into_split();
@@ -165,6 +183,8 @@ impl ChatServer {
                             &my_id,
                             &my_name,
                             &my_department,
+                            &my_software_version,
+                            &my_mac_address,
                             my_port,
                             my_ip,
                             &msg.sender_id,
@@ -190,6 +210,8 @@ impl ChatServer {
                             sender_id: my_id.clone(),
                             sender_name: my_name.clone(),
                             sender_department: my_department.clone(),
+                            sender_software_version: my_software_version.clone(),
+                            sender_mac_address: my_mac_address.clone(),
                             sender_port: my_port,
                             receiver_id: msg.sender_id.clone(),
                             content: String::new(),
@@ -215,9 +237,15 @@ impl ChatServer {
                     for entry in &msg.known_peers {
                         if entry.id == my_id || entry.ip.is_empty() || entry.port == 0 { continue; }
                         if entry.ip.parse::<std::net::IpAddr>().is_err() { continue; }
-                        let _ = db.upsert_peer(
-                            &entry.id, &entry.username, &entry.department,
-                            &entry.ip, entry.port, false,
+                        let _ = db.upsert_peer_with_profile(
+                            &entry.id,
+                            &entry.username,
+                            &entry.department,
+                            &entry.software_version,
+                            &entry.mac_address,
+                            &entry.ip,
+                            entry.port,
+                            false,
                         ).await;
                     }
 
@@ -268,10 +296,12 @@ impl ChatServer {
 
                     // Register the sender as a peer in DB
                     if let Err(e) = db
-                        .upsert_peer(
+                            .upsert_peer_with_profile(
                             &msg.sender_id,
                             &msg.sender_name,
                             &msg.sender_department,
+                            &msg.sender_software_version,
+                            &msg.sender_mac_address,
                             &peer_addr.ip().to_string(),
                             msg.sender_port,
                             true,
@@ -288,10 +318,12 @@ impl ChatServer {
                             std::net::IpAddr::V6(ip) => std::net::IpAddr::V6(ip),
                         };
                         let pid = format!("{}:{}", peer_addr.ip(), msg.sender_port);
-                        let new_peer = Peer::new(
+                        let new_peer = Peer::new_with_profile(
                             pid.clone(),
                             msg.sender_name.clone(),
                             msg.sender_department.clone(),
+                            msg.sender_software_version.clone(),
+                            msg.sender_mac_address.clone(),
                             remote_ip,
                             msg.sender_port,
                         );
@@ -305,6 +337,12 @@ impl ChatServer {
                                 if let Some(existing) = map.values_mut().find(|p| p.ip == remote_ip && p.port == msg.sender_port) {
                                     existing.username = msg.sender_name.clone();
                                     existing.department = msg.sender_department.clone();
+                                    if !msg.sender_software_version.is_empty() {
+                                        existing.software_version = msg.sender_software_version.clone();
+                                    }
+                                    if !msg.sender_mac_address.is_empty() {
+                                        existing.mac_address = msg.sender_mac_address.clone();
+                                    }
                                     existing.online = true;
                                 }
                             }
@@ -313,9 +351,12 @@ impl ChatServer {
                             for entry in &msg.known_peers {
                                 if entry.id != my_id && !map.contains_key(&entry.id) {
                                     if let Ok(entry_ip) = entry.ip.parse::<std::net::IpAddr>() {
-                                        let relay = Peer::with_online(
+                                        let relay = Peer::with_online_details(
                                             entry.id.clone(), entry.username.clone(),
-                                            entry.department.clone(), entry_ip, entry.port, false, 0,
+                                            entry.department.clone(),
+                                            entry.software_version.clone(),
+                                            entry.mac_address.clone(),
+                                            entry_ip, entry.port, false, 0,
                                         );
                                         map.insert(entry.id.clone(), relay.clone());
                                         info!("Chat relay: discovered {} via {}", entry.username, msg.sender_name);
@@ -329,9 +370,15 @@ impl ChatServer {
                         for entry in &msg.known_peers {
                             if entry.id == my_id || entry.ip.is_empty() || entry.port == 0 { continue; }
                             if entry.ip.parse::<std::net::IpAddr>().is_err() { continue; }
-                            let _ = db.upsert_peer(
-                                &entry.id, &entry.username, &entry.department,
-                                &entry.ip, entry.port, false,
+                            let _ = db.upsert_peer_with_profile(
+                                &entry.id,
+                                &entry.username,
+                                &entry.department,
+                                &entry.software_version,
+                                &entry.mac_address,
+                                &entry.ip,
+                                entry.port,
+                                false,
                             ).await;
                         }
                     }
@@ -467,6 +514,8 @@ impl ChatServer {
             sender_id: self.my_id.clone(),
             sender_name: self.my_name.clone(),
             sender_department: self.my_department.clone(),
+            sender_software_version: self.my_software_version.clone(),
+            sender_mac_address: self.my_mac_address.clone(),
             sender_port: self.listen_port,
             receiver_id: peer.id.clone(),
             content: content.to_string(),
@@ -527,6 +576,8 @@ impl ChatServer {
                 sender_id: self.my_id.clone(),
                 sender_name: self.my_name.clone(),
                 sender_department: self.my_department.clone(),
+                sender_software_version: self.my_software_version.clone(),
+                sender_mac_address: self.my_mac_address.clone(),
                 sender_port: self.listen_port,
                 receiver_id: peer.id.clone(),
                 content: base64_encode(&buf[..n]),
@@ -611,6 +662,8 @@ impl ChatServer {
                     id: p.id.clone(),
                     username: p.username.clone(),
                     department: p.department.clone(),
+                    software_version: p.software_version.clone(),
+                    mac_address: p.mac_address.clone(),
                     ip: p.ip.to_string(),
                     port: p.port,
                 })
@@ -631,6 +684,8 @@ impl ChatServer {
             &self.my_id,
             &self.my_name,
             &self.my_department,
+            &self.my_software_version,
+            &self.my_mac_address,
             self.listen_port,
             my_ip,
             target_ip,
@@ -655,6 +710,12 @@ impl ChatServer {
                 }
                 if !peer.department.is_empty() {
                     existing.department = peer.department.clone();
+                }
+                if !peer.software_version.is_empty() {
+                    existing.software_version = peer.software_version.clone();
+                }
+                if !peer.mac_address.is_empty() {
+                    existing.mac_address = peer.mac_address.clone();
                 }
                 info!("bump_last_seen: {} updated (online, last_seen={})", existing.id, now);
             } else {
@@ -773,7 +834,10 @@ async fn send_file_in_background_inner(
     let peers_list: Vec<PeerEntry> = if let Ok(map) = peers.read() {
         map.values().filter(|p| p.online).map(|p| PeerEntry {
             id: p.id.clone(), username: p.username.clone(),
-            department: p.department.clone(), ip: p.ip.to_string(), port: p.port,
+            department: p.department.clone(),
+            software_version: p.software_version.clone(),
+            mac_address: p.mac_address.clone(),
+            ip: p.ip.to_string(), port: p.port,
         }).collect()
     } else { Vec::new() };
 
@@ -794,7 +858,10 @@ async fn send_file_in_background_inner(
         let is_last = n < CHUNK_SIZE || (file_size as usize) <= ((i as usize + 1) * CHUNK_SIZE);
         let msg = WireMessage {
             sender_id: my_id.clone(), sender_name: my_name.clone(),
-            sender_department: my_department.clone(), sender_port: listen_port,
+            sender_department: my_department.clone(),
+            sender_software_version: crate::profile_metadata::software_version(),
+            sender_mac_address: crate::profile_metadata::mac_address(),
+            sender_port: listen_port,
             receiver_id: peer.id.clone(),
             content: base64_encode(&buf[..n]),
             msg_type: if is_last { "file_end".to_string() } else { "file_chunk".to_string() },
