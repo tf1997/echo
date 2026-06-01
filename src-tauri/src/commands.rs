@@ -1048,7 +1048,10 @@ pub fn open_folder(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
         std::process::Command::new("explorer")
+            .creation_flags(CREATE_NO_WINDOW)
             .arg(parent)
             .spawn()
             .map_err(|e| e.to_string())?;
@@ -1062,7 +1065,7 @@ pub struct SearchResult {
     pub peer_name: String,
     pub messages: Vec<SearchHit>,
 }
-
+                         
 #[derive(Serialize)]
 pub struct SearchHit {
     pub id: i64,

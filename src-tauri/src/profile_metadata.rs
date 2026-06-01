@@ -123,13 +123,15 @@ fn mac_from_block(block: &str) -> Option<String> {
 
 #[cfg(windows)]
 fn detect_mac_from_getmac() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     let output = std::process::Command::new("getmac")
         .args(["/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    output.status.success().then_some(())?;
 
     String::from_utf8_lossy(&output.stdout)
         .split(|ch| ch == ',' || ch == '"' || ch == '\r' || ch == '\n')

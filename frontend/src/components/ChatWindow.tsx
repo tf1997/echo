@@ -34,6 +34,7 @@ interface ChatWindowProps {
   messages: ChatMessage[];
   myId: string;
   myName?: string;
+  conversationResetKey: number;
   isGroup?: boolean;
   groupId?: string | null;
   groupInfo?: GroupInfo | null;
@@ -274,7 +275,7 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
   );
 }
 
-export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, historySearchRequest = null }: ChatWindowProps) {
+export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, historySearchRequest = null }: ChatWindowProps) {
   const peerId = peer?.id ?? null;
   const [inputText, setInputText] = useState("");
   const [isDragging, setIsDragging] = useState(false);
@@ -492,10 +493,14 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     };
   }, []);
 
-  // Clear pending when switching peers + focus input + mark pending scroll
+  // Clear transient UI only when the app confirms an intentional conversation switch.
+  // Background peer refreshes can change peer.id for the same endpoint and should not
+  // close the history view.
   useEffect(() => {
     setPendingMessages([]);
-    setShowHistory(false);
+    if (!historySearchRequest?.query.trim()) {
+      setShowHistory(false);
+    }
     setShowSearch(false);
     setSearchQuery("");
     setSearchIndex(0);
@@ -505,10 +510,8 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     pendingJumpMessageIdRef.current = null;
     nearBottomRef.current = true;
     pendingScrollRef.current = true;
-    if (peerId) {
-      requestAnimationFrame(() => inputRef.current?.focus());
-    }
-  }, [peerId]);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, [conversationResetKey, historySearchRequest?.query]);
 
   const handleScroll = useCallback(() => {
     const el = messagesContainerRef.current;
@@ -1041,6 +1044,9 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
         ].some((value) => value.toLowerCase().includes(inviteQuery))
       )
     : inviteCandidates;
+  const historyConversationKey = isGroup
+    ? `group:${groupId ?? peer.id}`
+    : `contact:${peer.ip && peer.port ? `${peer.ip}:${peer.port}` : peer.id}`;
 
   return (
     <div className="flex-1 flex h-full min-w-0">
@@ -1125,7 +1131,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       </div>
       {showHistory ? (
         <HistorySearchView
-          key={`${isGroup ? groupId ?? peer.id : peer.id}:${historySearchRequest?.nonce ?? "manual"}`}
+          key={`${historyConversationKey}:${historySearchRequest?.nonce ?? "manual"}`}
           peer={peer}
           myId={myId}
           isGroup={isGroup}

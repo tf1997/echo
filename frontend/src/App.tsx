@@ -64,6 +64,17 @@ interface HistorySearchRequest {
   nonce: number;
 }
 
+type ConversationKind = "contact" | "group";
+
+interface ActiveConversation {
+  kind: ConversationKind;
+  id: string;
+}
+
+interface SelectConversationOptions {
+  preserveHistory?: boolean;
+}
+
 function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
   if (left.length !== right.length) return false;
 
@@ -90,6 +101,15 @@ function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
   return true;
 }
 
+function reconcileFetchedMessages(currentMessages: ChatMessage[], nextMessages: ChatMessage[]) {
+  // A transient empty response can happen during peer refresh or event races; keep
+  // the visible chat stable until a non-empty refresh arrives.
+  if (currentMessages.length > 0 && nextMessages.length === 0) {
+    return currentMessages;
+  }
+  return areMessageListsEqual(currentMessages, nextMessages) ? currentMessages : nextMessages;
+}
+
 function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
@@ -110,6 +130,7 @@ function App() {
   const [groups, setGroups] = useState<GroupInfo[]>([]);
   const [themeId, setThemeId] = useState<ThemeId>(() => getInitialTheme());
   const [historySearchRequest, setHistorySearchRequest] = useState<HistorySearchRequest | null>(null);
+  const [conversationResetKey, setConversationResetKey] = useState(0);
   const checkingUpdateRef = useRef(false);
   const departmentPickerRef = useRef<HTMLDivElement | null>(null);
   const historySearchNonceRef = useRef(0);
@@ -124,6 +145,8 @@ function App() {
   const groupUnreadInitRef = useRef(true);
   const onlineGraceUntilRef = useRef(new Map<string, number>());
   const loadPeerStateInFlightRef = useRef(false);
+  const activeConversationRef = useRef<ActiveConversation | null>(null);
+  const selectionNonceRef = useRef(0);
 
   // Silent WAV (1 sample) — used only to unlock autoplay policy on first click
   const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
@@ -380,20 +403,23 @@ function App() {
       const endpointKey = `${peer.ip}:${peer.port}`;
       const existingId = endpointToId.get(endpointKey);
       const cachedPeer = existingId ? map.get(existingId) : map.get(peer.id);
-      if (existingId && existingId !== peer.id) {
-        map.delete(existingId);
-        onlineGraceUntilRef.current.delete(existingId);
-      }
-      endpointToId.set(endpointKey, peer.id);
+      // Keep the stored conversation id stable for a known endpoint. Discovery can
+      // report endpoint-shaped ids before DB identity migration catches up.
+      const displayId = existingId ?? peer.id;
+      endpointToId.set(endpointKey, displayId);
       if (peer.online) {
-        onlineGraceUntilRef.current.set(peer.id, now + onlineGraceMs);
+        onlineGraceUntilRef.current.set(displayId, now + onlineGraceMs);
       }
-      map.set(peer.id, {
-        ...peer,
+      map.set(displayId, {
+        id: displayId,
+        username: peer.username || cachedPeer?.username || displayId,
+        department: peer.department || cachedPeer?.department || "",
         software_version: peer.software_version || cachedPeer?.software_version || "",
         mac_address: peer.mac_address || cachedPeer?.mac_address || "",
+        ip: peer.ip,
+        port: peer.port,
         last_seen: peer.last_seen ?? cachedPeer?.last_seen,
-        online: peer.online || (onlineGraceUntilRef.current.get(peer.id) ?? 0) > now,
+        online: peer.online || (onlineGraceUntilRef.current.get(displayId) ?? 0) > now,
       });
     }
 
@@ -475,6 +501,23 @@ function App() {
 
   const selectedPeerId = selectedPeer?.id ?? null;
 
+  useEffect(() => {
+    if (selectedGroupId) {
+      activeConversationRef.current = { kind: "group", id: selectedGroupId };
+      return;
+    }
+    if (selectedPeerId) {
+      activeConversationRef.current = { kind: "contact", id: selectedPeerId };
+      return;
+    }
+    activeConversationRef.current = null;
+  }, [selectedPeerId, selectedGroupId]);
+
+  const isActiveConversation = useCallback((kind: ConversationKind, id: string) => {
+    const active = activeConversationRef.current;
+    return active?.kind === kind && active.id === id;
+  }, []);
+
   // Poll contact messages
   useEffect(() => {
     if (!appInfo?.initialized || !selectedPeerId) return;
@@ -486,10 +529,8 @@ function App() {
       inFlight = true;
       getConversation(activePeerId, MESSAGE_FETCH_LIMIT)
         .then((nextMessages) => {
-          if (cancelled) return;
-          setMessages((currentMessages) =>
-            areMessageListsEqual(currentMessages, nextMessages) ? currentMessages : nextMessages
-          );
+          if (cancelled || !isActiveConversation("contact", activePeerId)) return;
+          setMessages((currentMessages) => reconcileFetchedMessages(currentMessages, nextMessages));
           return markRead(activePeerId);
         })
         .catch(console.error)
@@ -501,7 +542,7 @@ function App() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [appInfo?.initialized, selectedPeerId]);
+  }, [appInfo?.initialized, selectedPeerId, isActiveConversation]);
 
   // Poll group messages
   useEffect(() => {
@@ -513,10 +554,8 @@ function App() {
       inFlight = true;
       getGroupMessages(selectedGroupId, MESSAGE_FETCH_LIMIT)
         .then((nextMessages) => {
-          if (cancelled) return;
-          setMessages((currentMessages) =>
-            areMessageListsEqual(currentMessages, nextMessages) ? currentMessages : nextMessages
-          );
+          if (cancelled || !isActiveConversation("group", selectedGroupId)) return;
+          setMessages((currentMessages) => reconcileFetchedMessages(currentMessages, nextMessages));
           return markGroupRead(selectedGroupId);
         })
         .catch(console.error)
@@ -528,7 +567,7 @@ function App() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [appInfo?.initialized, selectedGroupId]);
+  }, [appInfo?.initialized, selectedGroupId, isActiveConversation]);
 
   // Load groups (with unread + last message)
   useEffect(() => {
@@ -544,7 +583,13 @@ function App() {
     return () => clearInterval(interval);
   }, [appInfo?.initialized]);
 
-  const handleSelectPeer = useCallback(async (peer: Peer) => {
+  const handleSelectPeer = useCallback(async (peer: Peer, options?: SelectConversationOptions) => {
+    const nonce = ++selectionNonceRef.current;
+    activeConversationRef.current = { kind: "contact", id: peer.id };
+    setConversationResetKey((key) => key + 1);
+    if (!options?.preserveHistory) {
+      setHistorySearchRequest(null);
+    }
     setSelectedGroupId(null);
     setSelectedPeer(peer);
     setMessages([]);
@@ -553,6 +598,7 @@ function App() {
         getConversation(peer.id, MESSAGE_FETCH_LIMIT),
         markRead(peer.id),
       ]);
+      if (selectionNonceRef.current !== nonce) return;
       setMessages(conv);
       checkPeerOnline(peer.id, peer.ip, peer.port).then((online) => {
         if (!online) {
@@ -570,7 +616,13 @@ function App() {
     }
   }, []);
 
-  const handleSelectGroup = useCallback(async (groupId: string) => {
+  const handleSelectGroup = useCallback(async (groupId: string, options?: SelectConversationOptions) => {
+    const nonce = ++selectionNonceRef.current;
+    activeConversationRef.current = { kind: "group", id: groupId };
+    setConversationResetKey((key) => key + 1);
+    if (!options?.preserveHistory) {
+      setHistorySearchRequest(null);
+    }
     setSelectedPeer(null);
     setSelectedGroupId(groupId);
     setMessages([]);
@@ -579,6 +631,7 @@ function App() {
         getGroupMessages(groupId, MESSAGE_FETCH_LIMIT),
         markGroupRead(groupId),
       ]);
+      if (selectionNonceRef.current !== nonce) return;
       setMessages(msgs);
     } catch (err) {
       console.error("Failed to load group messages:", err);
@@ -587,14 +640,10 @@ function App() {
 
   const peersRef = useRef(peers);
   const groupsRef = useRef(groups);
-  const selectedPeerRef = useRef<Peer | null>(selectedPeer);
-  const selectedGroupIdRef = useRef<string | null>(selectedGroupId);
   const selectPeerRef = useRef(handleSelectPeer);
   const selectGroupRef = useRef(handleSelectGroup);
   useEffect(() => { peersRef.current = peers; }, [peers]);
   useEffect(() => { groupsRef.current = groups; }, [groups]);
-  useEffect(() => { selectedPeerRef.current = selectedPeer; }, [selectedPeer]);
-  useEffect(() => { selectedGroupIdRef.current = selectedGroupId; }, [selectedGroupId]);
   useEffect(() => { selectPeerRef.current = handleSelectPeer; }, [handleSelectPeer]);
   useEffect(() => { selectGroupRef.current = handleSelectGroup; }, [handleSelectGroup]);
 
@@ -609,12 +658,11 @@ function App() {
       if (payload.kind === "group") {
         listGroups().then(setGroups).catch(console.error);
         const groupId = payload.group_id;
-        if (groupId && selectedGroupIdRef.current === groupId) {
+        if (groupId && isActiveConversation("group", groupId)) {
           getGroupMessages(groupId, MESSAGE_FETCH_LIMIT)
             .then((nextMessages) => {
-              setMessages((currentMessages) =>
-                areMessageListsEqual(currentMessages, nextMessages) ? currentMessages : nextMessages
-              );
+              if (!isActiveConversation("group", groupId)) return;
+              setMessages((currentMessages) => reconcileFetchedMessages(currentMessages, nextMessages));
               return markGroupRead(groupId);
             })
             .catch(console.error);
@@ -623,12 +671,11 @@ function App() {
       }
 
       const peerId = payload.peer_id;
-      if (peerId && selectedPeerRef.current?.id === peerId) {
+      if (peerId && isActiveConversation("contact", peerId)) {
         getConversation(peerId, MESSAGE_FETCH_LIMIT)
           .then((nextMessages) => {
-            setMessages((currentMessages) =>
-              areMessageListsEqual(currentMessages, nextMessages) ? currentMessages : nextMessages
-            );
+            if (!isActiveConversation("contact", peerId)) return;
+            setMessages((currentMessages) => reconcileFetchedMessages(currentMessages, nextMessages));
             return markRead(peerId);
           })
           .catch(console.error);
@@ -638,7 +685,7 @@ function App() {
     return () => {
       unlisten?.();
     };
-  }, [appInfo?.initialized, loadPeerState]);
+  }, [appInfo?.initialized, loadPeerState, isActiveConversation]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -774,13 +821,13 @@ function App() {
     const peer = peers.find((item) => item.id === peerId);
     if (!peer) return;
     startHistorySearch("contact", peer.id, query, messageId);
-    void handleSelectPeer(peer);
+    void handleSelectPeer(peer, { preserveHistory: true });
   }, [handleSelectPeer, peers, startHistorySearch]);
 
   const handleJumpToGroupSearchHit = useCallback((groupId: string, query: string, messageId?: number) => {
     if (!groups.some((group) => group.group_id === groupId)) return;
     startHistorySearch("group", groupId, query, messageId);
-    void handleSelectGroup(groupId);
+    void handleSelectGroup(groupId, { preserveHistory: true });
   }, [groups, handleSelectGroup, startHistorySearch]);
 
   const handleLoadHistoryContext = useCallback(async (messageId: number) => {
@@ -883,6 +930,7 @@ function App() {
       <Sidebar
         peers={peers}
         selectedPeerId={selectedPeer?.id ?? null}
+        selectedPeer={selectedPeer}
         onSelectPeer={handleSelectPeer}
         onJumpToSearchHit={handleJumpToContactSearchHit}
         onJumpToGroupSearchHit={handleJumpToGroupSearchHit}
@@ -911,6 +959,7 @@ function App() {
         messages={messages}
         myId={appInfo.peer_id}
         myName={appInfo.username}
+        conversationResetKey={conversationResetKey}
         isGroup={!!selectedGroupId}
         groupId={selectedGroupId}
         groupInfo={selectedGroupId ? groups.find(g => g.group_id === selectedGroupId) ?? null : null}
