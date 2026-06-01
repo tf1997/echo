@@ -591,6 +591,9 @@ impl Database {
 
     // ── Pending group message delivery ──
 
+    // Kept for older queued-group-message migration paths; current delivery uses the
+    // generic pending notification queue below.
+    #[allow(dead_code)]
     pub async fn store_pending_group_msg(
         &self, group_id: &str, peer_id: &str,
         sender_id: &str, sender_name: &str, content: &str, msg_type: &str, timestamp: &str,
@@ -1169,6 +1172,8 @@ impl Database {
         Ok(())
     }
 
+    // Useful for startup/offline recovery flows; current startup applies a grace window instead.
+    #[allow(dead_code)]
     pub async fn mark_all_peers_offline(&self) -> Result<()> {
         sqlx::query("UPDATE peers SET is_online = 0")
             .execute(&self.pool)

@@ -10,7 +10,7 @@
       <img src="https://img.shields.io/badge/rust-1.88+-dea584?logo=rust&logoColor=white" alt="Rust" />
     </a>
     <a href="https://tauri.app/" target="_blank">
-      <img src="https://img.shields.io/badge/Tauri-2-ffc131?logo=tauri&logoColor=white" alt="Tauri 2" />
+      <img src="https://img.shields.io/badge/Tauri-1.8-ffc131?logo=tauri&logoColor=white" alt="Tauri 1.8" />
     </a>
     <a href="https://react.dev/" target="_blank">
       <img src="https://img.shields.io/badge/React-19-58c4dc?logo=react&logoColor=white" alt="React 19" />
@@ -45,7 +45,7 @@
 
 > **Have you ever been in an office, school lab, or LAN party and needed to send a message or file to a colleague — but setting up a server or logging into Slack/WeChat felt like overkill?**
 
-**Echo** is purpose-built for that moment. It discovers peers on your local network automatically via mDNS, connects directly over TCP, and requires **zero infrastructure** — no servers, no accounts, no internet connection.
+**Echo** is purpose-built for that moment. It discovers peers on your local network through LAN broadcast/multicast discovery, optional cross-subnet scanning, and manual IP lookup; messages and files move directly over TCP. It requires **zero infrastructure** — no servers, no accounts, no internet connection.
 
 ✅ **100% offline** — works entirely on your LAN  
 ✅ **Zero configuration** — launch and instantly see who's online  
@@ -59,12 +59,12 @@
 <table>
   <tr>
     <td align="center" width="50%">
-      <h3>🔍 Auto-Discovery</h3>
-      <p>mDNS service discovery finds peers on your LAN instantly — no IP guessing or manual setup.</p>
+      <h3>🔍 LAN Discovery</h3>
+      <p>UDP broadcast/multicast discovery finds nearby peers, with optional configured subnet scanning and manual IP lookup.</p>
     </td>
     <td align="center" width="50%">
       <h3>💬 P2P Chat</h3>
-      <p>Direct TCP connections for secure, low-latency messaging with send-failed retry.</p>
+      <p>Direct TCP connections for private and group chat, with pending state, retry feedback, forwarding, and local history.</p>
     </td>
   </tr>
   <tr>
@@ -84,13 +84,13 @@
     </td>
     <td align="center">
       <h3>📜 Chat History</h3>
-      <p>All messages persisted locally in SQLite. Full-text search across your conversations.</p>
+      <p>Messages are persisted locally in SQLite. Search spans private and group chats, with jump-to-context from results.</p>
     </td>
   </tr>
   <tr>
     <td align="center">
-      <h3>🔔 Unread Badges</h3>
-      <p>Unread message counts so you never miss a message, even with multiple conversations.</p>
+      <h3>🔔 Unread & Recent</h3>
+      <p>Unread badges, tray counts, recent contacts, and active group conversations keep busy chats visible.</p>
     </td>
     <td align="center">
       <h3>📝 Profile Management</h3>
@@ -114,10 +114,10 @@
 
 | Layer | Technology |
 |-------|-----------|
-| 🖥️ Desktop Framework | [Tauri 2](https://tauri.app/) |
+| 🖥️ Desktop Framework | [Tauri 1.8](https://tauri.app/) |
 | 🎨 Frontend | [React 19](https://react.dev/) + [TypeScript](https://www.typescriptlang.org/) + [Tailwind CSS 4](https://tailwindcss.com/) + [Vite](https://vitejs.dev/) |
 | ⚙️ Backend | [Rust](https://www.rust-lang.org/) (Tokio, SQLite, sqlx) |
-| 🔎 Discovery | [mDNS](https://en.wikipedia.org/wiki/Multicast_DNS) via [mdns-sd](https://crates.io/crates/mdns-sd) |
+| 🔎 Discovery | UDP broadcast/multicast + optional configured subnet scan; mDNS code is present but currently disabled |
 | 🔗 Communication | TCP Direct (JSON-line protocol) |
 | 🗄️ Storage | SQLite (local database) |
 
@@ -138,10 +138,11 @@
 git clone https://github.com/tf1997/echo.git
 cd echo
 
-# 2. Install frontend dependencies
+# 2. Install frontend dependencies and build web assets
 cd frontend && npm install
+npm run build
 
-# 3. Run the app (development mode)
+# 3. Run the Tauri shell
 cd ../src-tauri && cargo run
 ```
 
@@ -152,6 +153,8 @@ On first launch you'll be prompted to set a username and department — this is 
 Want to see how Echo works on a single machine? Run two instances with different ports:
 
 ```bash
+cd src-tauri
+
 # Terminal A — Instance 1
 ECHO_PORT=9527 ECHO_DATA_DIR=/tmp/echo-a cargo run
 
@@ -159,17 +162,17 @@ ECHO_PORT=9527 ECHO_DATA_DIR=/tmp/echo-a cargo run
 ECHO_PORT=9528 ECHO_DATA_DIR=/tmp/echo-b cargo run
 ```
 
-They'll discover each other instantly and you can test chat, file transfer, and more.
+They should discover each other through the local discovery channel. You can also use the manual IP lookup in the sidebar when broadcast traffic is filtered.
 
 ---
 
 ## 🔧 How It Works
 
 ```
-┌─────────────┐     mDNS Discovery     ┌─────────────┐
+┌─────────────┐     LAN Discovery      ┌─────────────┐
 │   Echo A    │◄──────────────────────►│   Echo B    │
 │  (9527)     │                        │  (9528)     │
-│             │◄── TCP Direct Chat ──►│             │
+│             │◄── TCP Direct Chat ───►│             │
 │  ┌───────┐  │                        │  ┌───────┐  │
 │  │SQLite │  │                        │  │SQLite │  │
 │  │ Local │  │                        │  │ Local │  │
@@ -178,23 +181,26 @@ They'll discover each other instantly and you can test chat, file transfer, and 
 ```
 
 1. **🚀 Startup** — Loads user profile from local SQLite; enters first-time setup if none exists
-2. **🔎 Discovery** — Registers own mDNS service and continuously browses for other Echo instances on the LAN
+2. **🔎 Discovery** — Starts UDP broadcast/multicast discovery; optional configured /24 scans help with cross-subnet reachability
 3. **💾 Contact Storage** — Discovered peers are automatically saved to the local `peers` table (ip, port, online status, last seen time)
-4. **❤️ Health Check** — Parallel TCP port probing every 8 seconds for reliable online detection
-5. **💬 Chat** — TCP direct connection for JSON-line messages; all messages saved to local `messages` table
-6. **📋 History** — Contact history and chat records are fully local; no central service dependency
+4. **❤️ Health Check** — Parallel TCP port probing every 8 seconds, with a short grace window for smoother online/offline transitions
+5. **💬 Chat** — TCP direct connection for JSON-line messages, files, stickers, and group notifications
+6. **📋 History** — Private and group records are fully local; no central service dependency
 
 ---
 
 ## 🗄️ Database Schema
 
-Three main tables (stored in `ECHO_DATA_DIR/echo.db` or the system app data directory):
+Core tables are stored in `ECHO_DATA_DIR/echo.db` or the system app data directory:
 
 | Table | Purpose |
 |-------|---------|
 | `user_profile` | Local user info (peer_id, username, department) |
 | `peers` | Contact history (peer_id, username, department, ip, port, is_online, first_seen_at, last_seen_at) |
-| `messages` | Chat records (sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read) |
+| `messages` | Private and group chat records (sender_id, receiver_id, group_id, content, msg_type, file_path, file metadata, timestamp, is_read) |
+| `groups` / `group_members` | Group metadata and membership |
+| `recent_contacts` | Contact ordering for the recent view |
+| `pending_notifications` / `pending_file_transfers` | Retry queues for offline delivery paths |
 
 ---
 
@@ -234,17 +240,18 @@ echo/
 │           ├── Sidebar.tsx      # Sidebar: profile, contacts, search
 │           ├── ChatWindow.tsx   # Chat: messages, input, drag-drop, paste
 │           └── MessageBubble.tsx # Messages: text, file, image preview
-├── src-tauri/               # Rust backend (Tauri 2)
+├── src-tauri/               # Rust backend (Tauri 1)
 │   └── src/
 │       ├── main.rs          # Entry point
-│       ├── lib.rs           # Tauri bootstrap, state init, health-check loop
+│       ├── lib.rs           # Tauri bootstrap, state init, tray, update hooks, health-check loop
 │       ├── commands.rs      # Tauri commands (IPC interface)
 │       ├── state.rs         # Global state (RuntimeServices, AppState)
 │       ├── chat/mod.rs      # TCP chat server
-│       ├── db/mod.rs        # SQLite database (profile, peers, messages)
+│       ├── db/mod.rs        # SQLite database (profile, peers, messages, groups, retry queues)
 │       └── discovery/
 │           ├── peer.rs      # Peer model
-│           └── service.rs   # mDNS discovery service
+│           ├── service.rs   # Discovery service wrapper
+│           └── broadcast.rs # UDP broadcast/multicast and optional subnet scan
 └── target/                  # Rust build artifacts
 ```
 

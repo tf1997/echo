@@ -3,7 +3,17 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use std::sync::Arc;
 
-use crate::chat::{send_file_in_background_with_kind, WireMessage};
+use crate::chat::{
+    cancel_outgoing_file_transfer,
+    clear_outgoing_file_transfer,
+    pause_outgoing_file_transfer,
+    register_outgoing_file_transfer,
+    resume_outgoing_file_transfer,
+    send_file_in_background_with_kind,
+    wait_for_outgoing_file_transfer,
+    WireMessage,
+    FILE_TRANSFER_CANCELLED_MESSAGE,
+};
 use crate::db::{ChatMessage, StoredPeer, UnreadCount, UserProfile};
 use crate::discovery::Peer;
 use crate::state::{AppState, RuntimeServices};
@@ -345,6 +355,33 @@ pub async fn send_sticker(
     send_file_with_kind(app_handle, state, peer_id, file_path, file_name, "sticker", client_msg_id).await
 }
 
+#[tauri::command]
+pub async fn pause_file_transfer(client_msg_id: String) -> Result<(), String> {
+    if pause_outgoing_file_transfer(client_msg_id.trim()).await {
+        Ok(())
+    } else {
+        Err("发送任务不存在或已完成".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn resume_file_transfer(client_msg_id: String) -> Result<(), String> {
+    if resume_outgoing_file_transfer(client_msg_id.trim()).await {
+        Ok(())
+    } else {
+        Err("发送任务不存在或已完成".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn cancel_file_transfer(client_msg_id: String) -> Result<(), String> {
+    if cancel_outgoing_file_transfer(client_msg_id.trim()).await {
+        Ok(())
+    } else {
+        Err("发送任务不存在或已完成".to_string())
+    }
+}
+
 async fn send_file_with_kind(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -418,7 +455,9 @@ async fn send_file_with_kind(
     let bg_kind = file_kind.to_string();
     let bg_client_msg_id = client_msg_id.clone();
     let event_client_msg_id = bg_client_msg_id.clone();
+    register_outgoing_file_transfer(event_client_msg_id.as_deref()).await;
     tauri::async_runtime::spawn(async move {
+        let clear_client_msg_id = event_client_msg_id.clone();
         match send_file_in_background_with_kind(&bg_path, &bg_name, &bg_peer, my_id, my_name, my_department, listen_port, db, peers_arc, handle, bg_client_msg_id, &bg_kind).await {
             Ok(msg) => info!("File sent: {}", msg.content),
             Err(e) => {
@@ -430,6 +469,7 @@ async fn send_file_with_kind(
                 }));
             }
         }
+        clear_outgoing_file_transfer(clear_client_msg_id.as_deref()).await;
     });
 
     let msg_kind = if file_kind == "sticker" { "sticker" } else { "file" };
@@ -1629,12 +1669,7 @@ async fn send_group_file_with_kind(
         format!("📎 {}", file_name)
     };
 
-    // Save outgoing file message to the group conversation (read=true for sender)
-    let saved = db.save_group_message(
-        &group_id, &my_id, &my_name,
-        &content, msg_kind,
-        Some(&file_path), Some(&file_name), Some(file_size), true, client_msg_id.as_deref(),
-    ).await.map_err(|e| e.to_string())?;
+    register_outgoing_file_transfer(client_msg_id.as_deref()).await;
 
     // Get online peer snapshot once
     let online_peers = {
@@ -1647,6 +1682,15 @@ async fn send_group_file_with_kind(
 
     for member in members {
         if member.peer_id == my_id { continue; }
+        if let Err(e) = wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await {
+            clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
+            let _ = app_handle.emit_all("file-error", serde_json::json!({
+                "fileName": file_name.as_str(),
+                "clientMsgId": client_msg_id.as_deref(),
+                "error": e.to_string(),
+            }));
+            return Err(e.to_string());
+        }
         let bg_path = file_path.clone();
         let bg_name = file_name.clone();
         let bg_my_id = my_id.clone();
@@ -1688,6 +1732,15 @@ async fn send_group_file_with_kind(
                 &bg_gid, &bg_kind, client_msg_id.as_deref(), &bg_handle,
             ).await {
                 Ok(_) => log::info!("Group file sent to {}", peer.id),
+                Err(e) if e == FILE_TRANSFER_CANCELLED_MESSAGE => {
+                    clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
+                    let _ = bg_error_handle.emit_all("file-error", serde_json::json!({
+                        "fileName": bg_name,
+                        "clientMsgId": client_msg_id.as_deref(),
+                        "error": e,
+                    }));
+                    return Err(e);
+                }
                 Err(e) => {
                     log::error!("Group file send failed to {}: {}", peer.id, e);
                     if let Err(queue_err) = queue_group_file_for_peer(
@@ -1722,6 +1775,28 @@ async fn send_group_file_with_kind(
         }
     }
 
+    if let Err(e) = wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await {
+        clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
+        let _ = app_handle.emit_all("file-error", serde_json::json!({
+            "fileName": file_name.as_str(),
+            "clientMsgId": client_msg_id.as_deref(),
+            "error": e.to_string(),
+        }));
+        return Err(e.to_string());
+    }
+
+    let saved = match db.save_group_message(
+        &group_id, &my_id, &my_name,
+        &content, msg_kind,
+        Some(&file_path), Some(&file_name), Some(file_size), true, client_msg_id.as_deref(),
+    ).await {
+        Ok(saved) => saved,
+        Err(error) => {
+            clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
+            return Err(error.to_string());
+        }
+    };
+
     let _ = app_handle.emit_all("file-progress", serde_json::json!({
         "fileName": file_name,
         "clientMsgId": client_msg_id.as_deref(),
@@ -1729,6 +1804,7 @@ async fn send_group_file_with_kind(
         "total": file_size,
         "speed": 0,
     }));
+    clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
 
     Ok(ChatMessage {
         id: saved.id,
@@ -1782,10 +1858,8 @@ async fn send_group_file_to_peer_with_progress(
         "speed": 0,
     }));
 
-    send_group_file_payloads_over_tcp(&peer.address(), &transfer)
-        .await
-        .then_some(())
-        .ok_or_else(|| format!("Failed to send file to {}", peer.address()))?;
+    send_group_file_payloads_over_tcp_controlled(&peer.address(), &transfer, client_msg_id)
+        .await?;
 
     let _ = app_handle.emit_all("file-progress", serde_json::json!({
         "fileName": file_name,
@@ -2006,29 +2080,45 @@ async fn send_group_file_payloads_over_tcp(
     addr: &str,
     transfer: &crate::db::PendingFileTransfer,
 ) -> bool {
+    send_group_file_payloads_over_tcp_controlled(addr, transfer, None).await.is_ok()
+}
+
+async fn send_group_file_payloads_over_tcp_controlled(
+    addr: &str,
+    transfer: &crate::db::PendingFileTransfer,
+    client_msg_id: Option<&str>,
+) -> Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const CHUNK_SIZE: usize = 48 * 1024;
 
+    wait_for_outgoing_file_transfer(client_msg_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
     let mut file = match tokio::fs::File::open(&transfer.file_path).await {
         Ok(file) => file,
-        Err(_) => return false,
+        Err(error) => return Err(error.to_string()),
     };
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         tokio::net::TcpStream::connect(addr),
     ).await;
     let Ok(Ok(mut stream)) = stream else {
-        return false;
+        return Err(format!("Failed to connect to {}", addr));
     };
 
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut chunk_index: usize = 0;
     loop {
+        wait_for_outgoing_file_transfer(client_msg_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
         let n = match file.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => n,
-            Err(_) => return false,
+            Err(error) => return Err(error.to_string()),
         };
         let is_last = n < CHUNK_SIZE
             || (transfer.file_size as usize) <= ((chunk_index + 1) * CHUNK_SIZE);
@@ -2050,17 +2140,17 @@ async fn send_group_file_payloads_over_tcp(
             group_id: Some(transfer.group_id.clone()),
         };
         let Ok(json) = serde_json::to_string(&msg) else {
-            return false;
+            return Err("Failed to serialize group file chunk".to_string());
         };
         if stream.write_all(json.as_bytes()).await.is_err()
             || stream.write_all(b"\n").await.is_err()
         {
-            return false;
+            return Err(format!("Failed to write to {}", addr));
         }
         chunk_index += 1;
     }
 
-    stream.flush().await.is_ok()
+    stream.flush().await.map_err(|e| e.to_string())
 }
 
 fn emoji_dir() -> std::path::PathBuf {

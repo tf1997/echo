@@ -674,7 +674,7 @@ function App() {
       return await sendGroupFile(selectedGroupId, filePath, clientMsgId);
     }
     if (!selectedPeer) throw new Error("未选择联系人");
-    sendFile(selectedPeer.id, filePath, clientMsgId).catch(console.error);
+    return await sendFile(selectedPeer.id, filePath, clientMsgId);
   }, [selectedPeer, selectedGroupId]);
 
   const handleSendSticker = useCallback(async (filePath: string, clientMsgId?: string) => {

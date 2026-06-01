@@ -156,6 +156,8 @@ impl DiscoveryService {
         }
     }
 
+    // Accessor retained for older discovery integrations; chat server owns the active call sites.
+    #[allow(dead_code)]
     pub fn my_id(&self) -> &str {
         &self.config.peer_id
     }

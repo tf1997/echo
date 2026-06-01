@@ -63,6 +63,8 @@ impl Peer {
         }
     }
 
+    // Compatibility constructor for callers that do not yet provide profile metadata.
+    #[allow(dead_code)]
     pub fn with_online(id: String, username: String, department: String, ip: IpAddr, port: u16, online: bool, last_seen: i64) -> Self {
         Self::with_online_details(id, username, department, String::new(), String::new(), ip, port, online, last_seen)
     }

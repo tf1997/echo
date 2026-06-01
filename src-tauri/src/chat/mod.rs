@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::{Arc, OnceLock}};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::contact_sync;
 use crate::db::Database;
@@ -12,6 +12,100 @@ use crate::discovery::{Peer, PeerEntry};
 use tauri::{AppHandle, Manager};
 
 const EVENT_CONVERSATION_UPDATED: &str = "conversation-updated";
+pub const FILE_TRANSFER_CANCELLED_MESSAGE: &str = "发送已取消";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileTransferControlState {
+    Running,
+    Paused,
+    Cancelled,
+}
+
+static FILE_TRANSFER_CONTROLS: OnceLock<Mutex<HashMap<String, FileTransferControlState>>> = OnceLock::new();
+
+fn file_transfer_controls() -> &'static Mutex<HashMap<String, FileTransferControlState>> {
+    FILE_TRANSFER_CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalized_client_msg_id(client_msg_id: Option<&str>) -> Option<String> {
+    client_msg_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+pub async fn register_outgoing_file_transfer(client_msg_id: Option<&str>) {
+    let Some(client_msg_id) = normalized_client_msg_id(client_msg_id) else {
+        return;
+    };
+    file_transfer_controls()
+        .lock()
+        .await
+        .insert(client_msg_id, FileTransferControlState::Running);
+}
+
+pub async fn pause_outgoing_file_transfer(client_msg_id: &str) -> bool {
+    let mut controls = file_transfer_controls().lock().await;
+    if let Some(state) = controls.get_mut(client_msg_id) {
+        if *state != FileTransferControlState::Cancelled {
+            *state = FileTransferControlState::Paused;
+        }
+        return true;
+    }
+    false
+}
+
+pub async fn resume_outgoing_file_transfer(client_msg_id: &str) -> bool {
+    let mut controls = file_transfer_controls().lock().await;
+    if let Some(state) = controls.get_mut(client_msg_id) {
+        if *state != FileTransferControlState::Cancelled {
+            *state = FileTransferControlState::Running;
+        }
+        return true;
+    }
+    false
+}
+
+pub async fn cancel_outgoing_file_transfer(client_msg_id: &str) -> bool {
+    let mut controls = file_transfer_controls().lock().await;
+    if let Some(state) = controls.get_mut(client_msg_id) {
+        *state = FileTransferControlState::Cancelled;
+        return true;
+    }
+    false
+}
+
+pub async fn clear_outgoing_file_transfer(client_msg_id: Option<&str>) {
+    let Some(client_msg_id) = normalized_client_msg_id(client_msg_id) else {
+        return;
+    };
+    file_transfer_controls().lock().await.remove(&client_msg_id);
+}
+
+pub async fn wait_for_outgoing_file_transfer(client_msg_id: Option<&str>) -> Result<()> {
+    let Some(client_msg_id) = normalized_client_msg_id(client_msg_id) else {
+        return Ok(());
+    };
+
+    loop {
+        let state = {
+            file_transfer_controls()
+                .lock()
+                .await
+                .get(&client_msg_id)
+                .copied()
+        };
+        match state {
+            Some(FileTransferControlState::Paused) => {
+                tokio::time::sleep(std::time::Duration::from_millis(160)).await;
+            }
+            Some(FileTransferControlState::Cancelled) => {
+                return Err(anyhow::anyhow!(FILE_TRANSFER_CANCELLED_MESSAGE));
+            }
+            _ => return Ok(()),
+        }
+    }
+}
 
 /// Wire protocol message sent between peers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -528,7 +622,8 @@ impl ChatServer {
         Ok(())
     }
 
-    /// Send a text message to a peer.
+    /// Compatibility wrapper for callers that only need plain text.
+    #[allow(dead_code)]
     pub async fn send_message(&self, peer: &Peer, content: &str) -> Result<crate::db::ChatMessage> {
         self.send_message_typed(peer, content, "text", None).await
     }
@@ -589,7 +684,8 @@ impl ChatServer {
         Ok(saved)
     }
 
-    /// Send a file to a peer (streams the file, emits progress events).
+    /// Legacy streaming sender kept as a reference path for the newer background sender.
+    #[allow(dead_code)]
     pub async fn send_file(&self, peer: &Peer, file_path: &str, file_name: &str, app_handle: tauri::AppHandle) -> Result<crate::db::ChatMessage> {
         use tokio::fs::File;
         use tokio::io::AsyncReadExt;
@@ -816,7 +912,8 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
         .with_context(|| "Failed to decode base64")
 }
 
-/// Send a file in a background task (doesn't hold any long-lived locks).
+/// Compatibility wrapper for default file transfers; commands use the typed variant directly.
+#[allow(dead_code)]
 pub async fn send_file_in_background(
     file_path: &str,
     file_name: &str,
@@ -856,8 +953,8 @@ pub async fn send_file_in_background_with_kind(
     ).await
 }
 
-/// Like `send_file_in_background` but tags each chunk with a group_id and skips per-peer DB save
-/// (the caller persists a single outgoing message before the fanout).
+/// Compatibility wrapper for grouped file transfers using the default `file` kind.
+#[allow(dead_code)]
 pub async fn send_file_in_background_grouped(
     file_path: &str,
     file_name: &str,
@@ -905,6 +1002,8 @@ async fn send_file_in_background_inner(
     let mut file = File::open(file_path).await
         .with_context(|| format!("Failed to open file: {}", file_path))?;
 
+    wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await?;
+
     let mut stream = TcpStream::connect(peer.address()).await
         .with_context(|| format!("Failed to connect to peer {}", peer.address()))?;
 
@@ -929,6 +1028,8 @@ async fn send_file_in_background_inner(
     let start_time = std::time::Instant::now();
 
     loop {
+        wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await?;
+
         let n = file.read(&mut buf).await
             .with_context(|| format!("Failed to read file chunk {}", i))?;
         if n == 0 { break; }

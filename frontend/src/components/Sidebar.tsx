@@ -233,8 +233,17 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
     unreadMap.set(uc.peer_id, uc.count);
   }
   const peerById = new Map(peers.map((peer) => [peer.id, peer]));
+  const recentGroups = groups
+    .filter((group) => !!group.last_message_at || (group.unread_count || 0) > 0)
+    .sort((a, b) => {
+      const aTime = a.last_message_at ? new Date(a.last_message_at).getTime() : 0;
+      const bTime = b.last_message_at ? new Date(b.last_message_at).getTime() : 0;
+      return bTime - aTime;
+    });
 
-  const recentTotalUnread = recentContacts.reduce((sum, contact) => sum + (unreadMap.get(contact.peer_id) ?? 0), 0);
+  const recentTotalUnread =
+    recentContacts.reduce((sum, contact) => sum + (unreadMap.get(contact.peer_id) ?? 0), 0) +
+    recentGroups.reduce((sum, group) => sum + (group.unread_count || 0), 0);
   const groupsTotalUnread = groups.reduce((sum, g) => sum + (g.unread_count || 0), 0);
   const currentTheme = THEMES.find((theme) => theme.id === themeId) ?? THEMES[0];
 
@@ -576,11 +585,11 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
         <div className="flex-1 overflow-y-auto">
           <p className="px-4 py-2 text-xs text-gray-400 font-medium uppercase tracking-wider">搜索结果</p>
           {searching ? (
-            <p className="px-4 py-3 text-xs text-gray-500">搜索中...</p>
+            <SidebarEmptyState title="正在搜索" detail="正在匹配联系人、群聊和聊天记录。" />
           ) : searchError ? (
-            <p className="px-4 py-3 text-xs text-red-400">{searchError}</p>
+            <SidebarEmptyState title="搜索失败" detail={searchError} tone="error" />
           ) : searchResults.length === 0 && groupSearchResults.length === 0 ? (
-            <p className="px-4 py-3 text-xs text-gray-500">无匹配结果</p>
+            <SidebarEmptyState title="没有匹配结果" detail={`未找到与“${searchQuery.trim()}”相关的聊天记录。`} />
           ) : (
             <>
               {searchResults.map((result) => (
@@ -656,29 +665,54 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
           {/* Tab content */}
           <div className="flex-1 overflow-y-auto">
             {tab === "recent" ? (
-              recentContacts.length === 0 ? (
-                <p className="px-4 py-8 text-xs text-gray-500 text-center">暂无最近联系人</p>
+              recentContacts.length === 0 && recentGroups.length === 0 ? (
+                <SidebarEmptyState
+                  title="暂无最近会话"
+                  detail="联系人或群聊产生消息后会显示在这里。"
+                  actionLabel={peers.length > 0 ? "查看联系人" : groups.length > 0 ? "查看群组" : undefined}
+                  onAction={peers.length > 0 ? () => setTab("contacts") : groups.length > 0 ? () => setTab("groups") : undefined}
+                />
               ) : (
-                recentContacts.map(r => {
-                  const livePeer = peerById.get(r.peer_id);
-                  const peer: Peer = livePeer ?? {
-                    id: r.peer_id,
-                    username: r.username,
-                    department: r.department,
-                    software_version: r.software_version ?? "",
-                    mac_address: r.mac_address ?? "",
-                    ip: r.ip,
-                    port: r.port,
-                    online: r.is_online,
-                    last_seen: r.last_seen_at ? new Date(r.last_seen_at).getTime() / 1000 : undefined,
-                  };
-                  return (
-                    <div key={r.peer_id} className="group relative">
-                      <PeerItem peer={peer} isSelected={selectedPeerId === r.peer_id} unread={unreadMap.get(r.peer_id) ?? 0} onClick={() => onSelectPeer(peer)} onAvatarClick={() => setProfilePeer(peer)} />
-                      <button onClick={(e) => { e.stopPropagation(); handleRemoveRecent(r.peer_id); }} className="absolute right-2 top-3 hidden group-hover:flex w-5 h-5 rounded-full bg-gray-600 hover:bg-red-600 items-center justify-center text-[10px]" title="移除">×</button>
+                <>
+                  {recentGroups.length > 0 ? (
+                    <div className="pb-1">
+                      <p className="px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">最近群聊</p>
+                      {recentGroups.map((group) => (
+                        <GroupItem
+                          key={group.group_id}
+                          group={group}
+                          isSelected={selectedGroupId === group.group_id}
+                          onSelect={() => onSelectGroup(group.group_id)}
+                        />
+                      ))}
                     </div>
-                  );
-                })
+                  ) : null}
+                  {recentContacts.length > 0 ? (
+                    <div className="pb-1">
+                      <p className="px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">最近联系人</p>
+                      {recentContacts.map(r => {
+                        const livePeer = peerById.get(r.peer_id);
+                        const peer: Peer = livePeer ?? {
+                          id: r.peer_id,
+                          username: r.username,
+                          department: r.department,
+                          software_version: r.software_version ?? "",
+                          mac_address: r.mac_address ?? "",
+                          ip: r.ip,
+                          port: r.port,
+                          online: r.is_online,
+                          last_seen: r.last_seen_at ? new Date(r.last_seen_at).getTime() / 1000 : undefined,
+                        };
+                        return (
+                          <div key={r.peer_id} className="group relative">
+                            <PeerItem peer={peer} isSelected={selectedPeerId === r.peer_id} unread={unreadMap.get(r.peer_id) ?? 0} onClick={() => onSelectPeer(peer)} onAvatarClick={() => setProfilePeer(peer)} />
+                            <button onClick={(e) => { e.stopPropagation(); handleRemoveRecent(r.peer_id); }} className="absolute right-2 top-3 hidden group-hover:flex w-5 h-5 rounded-full bg-gray-600 hover:bg-red-600 items-center justify-center text-[10px]" title="移除">×</button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                </>
               )
             ) : tab === "groups" ? (
               <>
@@ -686,7 +720,12 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                   <button onClick={() => setShowCreateGroup(true)} className="w-full py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500">+ 创建群组</button>
                 </div>
                 {groups.length === 0 ? (
-                  <p className="px-4 py-8 text-xs text-gray-500 text-center">暂未加入群组</p>
+                  <SidebarEmptyState
+                    title="暂未加入群组"
+                    detail="创建一个群组，把常联系的人放在一起。"
+                    actionLabel="创建群组"
+                    onAction={() => setShowCreateGroup(true)}
+                  />
                 ) : (
                   groups.map((g) => (
                     <GroupItem
@@ -752,8 +791,12 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
                     </div>
                   );
                 })}
-                {peers.length === 0 && <p className="px-4 py-8 text-xs text-gray-500 text-center">暂无联系人</p>}
-                {peers.length > 0 && visiblePeers.length === 0 && <p className="px-4 py-8 text-xs text-gray-500 text-center">无匹配联系人</p>}
+                {peers.length === 0 && (
+                  <SidebarEmptyState title="暂无联系人" detail="同一局域网内的 Echo 用户会显示在这里。" />
+                )}
+                {peers.length > 0 && visiblePeers.length === 0 && (
+                  <SidebarEmptyState title="没有匹配联系人" detail={`未找到与“${contactQuery.trim()}”匹配的联系人。`} />
+                )}
               </>
             )}
           </div>
@@ -918,6 +961,50 @@ export function Sidebar({ peers, selectedPeerId, onSelectPeer, myId, myName, myD
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function SidebarEmptyState({
+  title,
+  detail,
+  tone = "muted",
+  actionLabel,
+  onAction,
+}: {
+  title: string;
+  detail: string;
+  tone?: "muted" | "error";
+  actionLabel?: string;
+  onAction?: () => void;
+}) {
+  const titleClass = tone === "error" ? "text-red-300" : "text-gray-300";
+  const iconClass = tone === "error" ? "text-red-400 bg-red-500/10 border-red-500/30" : "text-gray-500 bg-gray-800/70 border-gray-700";
+
+  return (
+    <div className="px-5 py-10 text-center">
+      <div className={`mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg border ${iconClass}`}>
+        {tone === "error" ? (
+          <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+          </svg>
+        ) : (
+          <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h8M8 14h5M7 20l-4 2V5a3 3 0 013-3h12a3 3 0 013 3v10a3 3 0 01-3 3H7v2z" />
+          </svg>
+        )}
+      </div>
+      <p className={`text-sm font-medium ${titleClass}`}>{title}</p>
+      <p className="mt-1 text-xs leading-relaxed text-gray-500">{detail}</p>
+      {actionLabel && onAction ? (
+        <button
+          type="button"
+          onClick={onAction}
+          className="mt-4 rounded-lg bg-gray-700 px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-600"
+        >
+          {actionLabel}
+        </button>
+      ) : null}
     </div>
   );
 }

@@ -41,6 +41,18 @@ export async function sendSticker(peerId: string, filePath: string, clientMsgId?
   return await invoke("send_sticker", { peerId, filePath, clientMsgId, fileName });
 }
 
+export async function pauseFileTransfer(clientMsgId: string): Promise<void> {
+  await invoke("pause_file_transfer", { clientMsgId });
+}
+
+export async function resumeFileTransfer(clientMsgId: string): Promise<void> {
+  await invoke("resume_file_transfer", { clientMsgId });
+}
+
+export async function cancelFileTransfer(clientMsgId: string): Promise<void> {
+  await invoke("cancel_file_transfer", { clientMsgId });
+}
+
 export async function getConversation(peerId: string, limit?: number): Promise<ChatMessage[]> {
   const args = limit === undefined ? { peerId } : { peerId, limit };
   return await invoke("get_conversation", args);

@@ -4,7 +4,7 @@ import type { GroupInfo } from "../api";
 import { MessageBubble, DateDivider } from "./MessageBubble";
 import { HistorySearchView } from "./HistorySearchView";
 import { formatDateLabel, makeSearchHitId } from "./messageUtils";
-import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, sendMessage, sendMessageTyped, sendFile, sendSticker, sendGroupMessage, sendGroupMessageTyped, sendGroupFile, sendGroupSticker, renameGroup, leaveGroup, dissolveGroup, inviteToGroup, readFileBase64 } from "../api";
+import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, sendMessage, sendMessageTyped, sendFile, sendSticker, sendGroupMessage, sendGroupMessageTyped, sendGroupFile, sendGroupSticker, renameGroup, leaveGroup, dissolveGroup, inviteToGroup, readFileBase64, pauseFileTransfer, resumeFileTransfer, cancelFileTransfer } from "../api";
 import type { ForwardCardData } from "./MessageBubble";
 import { ask, message as showDialogMessage, open } from "@tauri-apps/api/dialog";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
@@ -17,7 +17,7 @@ export interface PendingMessage {
   file_name?: string;
   file_path?: string;
   file_size?: number;
-  status: "sending" | "failed" | "sent";
+  status: "sending" | "paused" | "failed" | "sent";
   error?: string;
   progress?: number; // 0-100
   speed?: number; // bytes/sec
@@ -109,6 +109,9 @@ function formatSpeed(bytesPerSec: number | undefined): string {
 }
 
 function getPendingStatusText(message: PendingMessage): string {
+  if (message.status === "paused") {
+    return message.progress !== undefined ? `已暂停 · ${message.progress}%` : "已暂停";
+  }
   if (message.status === "failed") {
     return message.error ? `发送失败：${message.error}` : "发送失败";
   }
@@ -589,6 +592,44 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
     }
   }, [onSendFile]);
 
+  const handlePauseFileTransfer = useCallback(async (pending: PendingMessage) => {
+    if (pending.msg_type !== "file" || pending.status !== "sending") return;
+    try {
+      await pauseFileTransfer(pending.clientMsgId);
+      setPendingMessages((prev) => prev.map((p) =>
+        p.id === pending.id ? { ...p, status: "paused", speed: 0 } : p
+      ));
+    } catch (error) {
+      setPendingMessages((prev) => prev.map((p) =>
+        p.id === pending.id ? { ...p, status: "failed", error: String(error) } : p
+      ));
+    }
+  }, []);
+
+  const handleResumeFileTransfer = useCallback(async (pending: PendingMessage) => {
+    if (pending.msg_type !== "file" || pending.status !== "paused") return;
+    try {
+      await resumeFileTransfer(pending.clientMsgId);
+      setPendingMessages((prev) => prev.map((p) =>
+        p.id === pending.id ? { ...p, status: "sending" } : p
+      ));
+    } catch (error) {
+      setPendingMessages((prev) => prev.map((p) =>
+        p.id === pending.id ? { ...p, status: "failed", error: String(error) } : p
+      ));
+    }
+  }, []);
+
+  const handleCancelFileTransfer = useCallback(async (pending: PendingMessage) => {
+    if (pending.msg_type !== "file" || (pending.status !== "sending" && pending.status !== "paused")) return;
+    setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
+    try {
+      await cancelFileTransfer(pending.clientMsgId);
+    } catch {
+      // The background task may have completed between the click and command dispatch.
+    }
+  }, []);
+
   const retrySticker = useCallback(async (pending: PendingMessage) => {
     if (!pending.file_path) return;
     const name = pending.file_name || pending.file_path.replace(/\\/g, "/").split("/").pop() || "sticker";
@@ -786,7 +827,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
           const tempId = ++pendingId;
           const clientMsgId = generateClientMsgId();
           setPendingMessages((prev) => [...prev, {
-            id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, status: "sending",
+            id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, file_path: filePath, status: "sending",
           }]);
           onSendFile(filePath, clientMsgId).catch((e) => {
             setPendingMessages((prev) => prev.map((p) =>
@@ -814,7 +855,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       const tempId = ++pendingId;
       const clientMsgId = generateClientMsgId();
       setPendingMessages((prev) => [...prev, {
-        id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, status: "sending",
+        id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, file_path: filePath, status: "sending",
       }]);
       onSendFile(filePath, clientMsgId).catch((e) => {
         setPendingMessages((prev) => prev.map((p) =>
@@ -1131,8 +1172,14 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
       <div ref={messagesContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto py-4">
         {allItems.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-gray-500">
-            <p className="text-sm">暂无消息</p>
-            <p className="text-xs mt-1">向 {peer.username} 发送第一条消息吧</p>
+            <p className="text-sm">{isGroup ? "暂无群消息" : "暂无消息"}</p>
+            <p className="text-xs mt-1">
+              {isGroup
+                ? "和群成员开始讨论吧"
+                : peer.online
+                  ? `向 ${peer.username} 发送第一条消息吧`
+                  : `${peer.username} 当前离线，文本消息会在对方上线后继续尝试发送`}
+            </p>
           </div>
         ) : (() => {
           const highlightedId = currentSearchHit?.messageId;
@@ -1172,15 +1219,33 @@ export function ChatWindow({ peer, messages, myId, myName = "", isGroup = false,
                         <p className="message-text">{item.content}</p>
                       )}
                     </div>
-                    {item.msg_type === "file" && item.status === "sending" && item.progress !== undefined && (
+                    {item.msg_type === "file" && (item.status === "sending" || item.status === "paused") && item.progress !== undefined && (
                       <div className="w-full bg-gray-700 rounded-full h-1.5 mt-1.5">
-                        <div className="bg-indigo-400 h-1.5 rounded-full transition-all" style={{ width: `${item.progress}%` }} />
+                        <div className={`${item.status === "paused" ? "bg-yellow-400" : "bg-indigo-400"} h-1.5 rounded-full transition-all`} style={{ width: `${item.progress}%` }} />
                       </div>
                     )}
                     <div className="flex items-center gap-2 mt-1">
                       <span className="message-meta max-w-[22rem] truncate" title={item.error || pendingStatusText}>
                         {pendingStatusText}
                       </span>
+                      {item.msg_type === "file" && item.status === "sending" && (
+                        <button
+                          onClick={() => handlePauseFileTransfer(item)}
+                          className="text-[10px] text-yellow-300 hover:text-yellow-200"
+                        >暂停</button>
+                      )}
+                      {item.msg_type === "file" && item.status === "paused" && (
+                        <button
+                          onClick={() => handleResumeFileTransfer(item)}
+                          className="text-[10px] text-indigo-300 hover:text-indigo-200"
+                        >继续</button>
+                      )}
+                      {item.msg_type === "file" && (item.status === "sending" || item.status === "paused") && (
+                        <button
+                          onClick={() => handleCancelFileTransfer(item)}
+                          className="text-[10px] text-red-300 hover:text-red-200"
+                        >取消</button>
+                      )}
                       {item.status === "failed" && (
                         <button
                           onClick={() => { if (item.msg_type === "file") retryFile(item); else if (item.msg_type === "sticker") retrySticker(item); else retryText(item); }}
