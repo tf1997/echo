@@ -12,6 +12,7 @@ use crate::chat::{
     send_file_in_background_with_kind,
     wait_for_outgoing_file_transfer,
     WireMessage,
+    FILE_CHUNK_SIZE,
     FILE_TRANSFER_CANCELLED_MESSAGE,
 };
 use crate::db::{ChatMessage, StoredPeer, UnreadCount, UserProfile};
@@ -407,7 +408,10 @@ async fn send_file_with_kind(
         .await
         .map_err(|e| e.to_string())?
     {
-        Peer::new_with_profile(
+        let last_seen = chrono::DateTime::parse_from_rfc3339(&stored_peer.last_seen_at)
+            .map(|dt| dt.timestamp())
+            .unwrap_or_default();
+        Peer::with_online_details(
             stored_peer.peer_id,
             stored_peer.username,
             stored_peer.department,
@@ -415,11 +419,17 @@ async fn send_file_with_kind(
             stored_peer.mac_address,
             stored_peer.ip.parse().map_err(|_| "无效的联系人 IP 地址".to_string())?,
             stored_peer.port,
+            stored_peer.is_online,
+            last_seen,
         )
     } else {
         return Err(format!("Peer {} not found", peer_id));
     };
     drop(discovery);
+
+    if !peer.online {
+        return Err("对方当前离线，文件未发送。请等待对方上线后重试。".to_string());
+    }
 
     // Clone what we need and release the chat lock immediately
     let (my_id, my_name, my_department, listen_port, db, peers_arc) = {
@@ -2093,8 +2103,6 @@ async fn send_group_file_payloads_over_tcp_controlled(
 ) -> Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    const CHUNK_SIZE: usize = 48 * 1024;
-
     wait_for_outgoing_file_transfer(client_msg_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -2111,7 +2119,7 @@ async fn send_group_file_payloads_over_tcp_controlled(
         return Err(format!("Failed to connect to {}", addr));
     };
 
-    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut buf = vec![0u8; FILE_CHUNK_SIZE];
     let mut chunk_index: usize = 0;
     loop {
         wait_for_outgoing_file_transfer(client_msg_id)
@@ -2123,8 +2131,8 @@ async fn send_group_file_payloads_over_tcp_controlled(
             Ok(n) => n,
             Err(error) => return Err(error.to_string()),
         };
-        let is_last = n < CHUNK_SIZE
-            || (transfer.file_size as usize) <= ((chunk_index + 1) * CHUNK_SIZE);
+        let is_last = n < FILE_CHUNK_SIZE
+            || (transfer.file_size as usize) <= ((chunk_index + 1) * FILE_CHUNK_SIZE);
         let msg = crate::chat::WireMessage {
             sender_id: transfer.sender_id.clone(),
             sender_name: transfer.sender_name.clone(),

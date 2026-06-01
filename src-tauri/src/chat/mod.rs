@@ -11,6 +11,8 @@ use crate::db::Database;
 use crate::discovery::{Peer, PeerEntry};
 use tauri::{AppHandle, Manager};
 
+pub const FILE_CHUNK_SIZE: usize = 256 * 1024;
+const FILE_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 const EVENT_CONVERSATION_UPDATED: &str = "conversation-updated";
 pub const FILE_TRANSFER_CANCELLED_MESSAGE: &str = "发送已取消";
 
@@ -130,6 +132,63 @@ pub struct WireMessage {
     pub known_peers: Vec<PeerEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
+}
+
+struct IncomingFileState {
+    file: tokio::fs::File,
+    path: String,
+    file_name: String,
+    sender_id: String,
+    sender_name: String,
+    group_id: Option<String>,
+    kind: String,
+}
+
+async fn create_received_file(filename: &str) -> Result<(tokio::fs::File, String)> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    let files_dir = std::path::PathBuf::from(home).join("Echo").join("files");
+    tokio::fs::create_dir_all(&files_dir).await?;
+
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let file_path = files_dir.join(format!("{}_{}", timestamp, filename));
+    let file = tokio::fs::File::create(&file_path).await?;
+    Ok((file, file_path.to_string_lossy().to_string()))
+}
+
+async fn start_incoming_file(msg: &WireMessage) -> Result<IncomingFileState> {
+    let file_name = msg.file_name.clone().unwrap_or_else(|| "unknown".to_string());
+    let (file, path) = create_received_file(&file_name).await?;
+    Ok(IncomingFileState {
+        file,
+        path,
+        file_name,
+        sender_id: msg.sender_id.clone(),
+        sender_name: msg.sender_name.clone(),
+        group_id: msg.group_id.clone(),
+        kind: msg.file_kind.as_deref().unwrap_or("file").to_string(),
+    })
+}
+
+fn file_send_connection_error(error: std::io::Error, peer: &Peer) -> anyhow::Error {
+    use std::io::ErrorKind;
+
+    match error.kind() {
+        ErrorKind::BrokenPipe
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::NotConnected => anyhow::anyhow!(
+            "对方当前离线或连接已断开，文件未发送。请等待对方上线后重试。"
+        ),
+        _ => anyhow::anyhow!("发送文件到 {} 失败: {}", peer.address(), error),
+    }
+}
+
+fn emit_file_progress(app_handle: &AppHandle, file_name: &str, client_msg_id: Option<&str>, sent: u64, total: u64, speed: u64) {
+    let _ = app_handle.emit_all("file-progress", serde_json::json!({
+        "fileName": file_name, "clientMsgId": client_msg_id, "sent": sent, "total": total, "speed": speed,
+    }));
 }
 
 /// Events forwarded to the frontend.
@@ -272,11 +331,7 @@ impl ChatServer {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
-        let mut file_buffer: Vec<u8> = Vec::new();
-        let mut file_sender_id: Option<String> = None;
-        let mut file_sender_name: Option<String> = None;
-        let mut file_group_id: Option<String> = None;
-        let mut file_kind: String = "file".to_string();
+        let mut incoming_file: Option<IncomingFileState> = None;
 
         while let Some(line) = lines.next_line().await? {
             match serde_json::from_str::<WireMessage>(&line) {
@@ -494,39 +549,41 @@ impl ChatServer {
 
                     match msg_type {
                         "file_chunk" => {
-                            if file_buffer.is_empty() {
-                                file_sender_id = Some(msg.sender_id.clone());
-                                file_sender_name = Some(msg.sender_name.clone());
-                                file_group_id = msg.group_id.clone();
-                                file_kind = msg.file_kind.as_deref().unwrap_or("file").to_string();
+                            if incoming_file.is_none() {
+                                incoming_file = Some(start_incoming_file(&msg).await?);
                             }
+                            let file_state = incoming_file.as_mut().expect("incoming_file just initialized");
+                            file_state.kind = msg.file_kind.as_deref().unwrap_or(&file_state.kind).to_string();
                             let decoded = base64_decode(&msg.content)
                                 .unwrap_or_default();
-                            file_buffer.extend_from_slice(&decoded);
+                            file_state.file.write_all(&decoded).await
+                                .with_context(|| format!("Failed to write incoming file chunk: {}", file_state.file_name))?;
                         }
                         "file_end" => {
-                            if file_sender_id.is_none() {
-                                file_sender_id = Some(msg.sender_id.clone());
-                                file_sender_name = Some(msg.sender_name.clone());
-                                file_group_id = msg.group_id.clone();
+                            if incoming_file.is_none() {
+                                incoming_file = Some(start_incoming_file(&msg).await?);
                             }
-                            file_kind = msg.file_kind.as_deref().unwrap_or(&file_kind).to_string();
+                            let mut file_state = incoming_file.take().expect("incoming_file just initialized");
+                            file_state.kind = msg.file_kind.as_deref().unwrap_or(&file_state.kind).to_string();
                             let decoded = base64_decode(&msg.content)
                                 .unwrap_or_default();
-                            file_buffer.extend_from_slice(&decoded);
+                            file_state.file.write_all(&decoded).await
+                                .with_context(|| format!("Failed to write incoming file end: {}", file_state.file_name))?;
+                            file_state.file.flush().await
+                                .with_context(|| format!("Failed to flush incoming file: {}", file_state.file_name))?;
 
-                            let file_name_display = msg.file_name.as_deref().unwrap_or("unknown");
-                            let saved_path = save_received_file(&file_buffer, file_name_display)?;
+                            let file_name_display = msg.file_name.as_deref().unwrap_or(&file_state.file_name);
+                            let saved_path = file_state.path.clone();
 
-                            let sender_id = file_sender_id.as_deref().unwrap_or(&msg.sender_id);
-                            let sender_name = file_sender_name.as_deref().unwrap_or(&msg.sender_name);
-                            let msg_kind = if file_kind == "sticker" { "sticker" } else { "file" };
+                            let sender_id = file_state.sender_id.as_str();
+                            let sender_name = file_state.sender_name.as_str();
+                            let msg_kind = if file_state.kind == "sticker" { "sticker" } else { "file" };
                             let display_content = if msg_kind == "sticker" {
                                 "[表情]".to_string()
                             } else {
                                 format!("📎 {}", file_name_display)
                             };
-                            if let Some(ref gid) = file_group_id {
+                            if let Some(ref gid) = file_state.group_id {
                                 // Group file message — is_read=false so unread fires
                                 if let Err(e) = db.save_group_message(
                                     gid, sender_id, sender_name, &display_content, msg_kind,
@@ -566,12 +623,6 @@ impl ChatServer {
                                 file_size: msg.file_size,
                                 timestamp: chrono::Utc::now().to_rfc3339(),
                             });
-
-                            file_buffer.clear();
-                            file_sender_id = None;
-                            file_sender_name = None;
-                            file_group_id = None;
-                            file_kind = "file".to_string();
                         }
                         "group_created" | "group_dissolved" | "group_member_left" | "profile_updated" => {
                             // System notifications — already handled above, don't save as message
@@ -616,6 +667,14 @@ impl ChatServer {
                 Err(e) => {
                     warn!("Failed to parse incoming message: {}", e);
                 }
+            }
+        }
+
+        if let Some(file_state) = incoming_file.take() {
+            let path = file_state.path.clone();
+            drop(file_state);
+            if let Err(error) = tokio::fs::remove_file(&path).await {
+                warn!("Failed to remove incomplete incoming file {}: {}", path, error);
             }
         }
 
@@ -697,9 +756,6 @@ impl ChatServer {
 
         let file_name = file_name.to_string();
 
-        // 48KB raw → 64KB base64 → fits in ~66KB JSON line (safe for BufReader)
-        const CHUNK_SIZE: usize = 48 * 1024;
-
         let mut file = File::open(file_path)
             .await
             .with_context(|| format!("Failed to open file: {}", file_path))?;
@@ -709,8 +765,10 @@ impl ChatServer {
             .with_context(|| format!("Failed to connect to peer {}", peer.address()))?;
 
         let peers_list = self.build_known_peers();
-        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut buf = vec![0u8; FILE_CHUNK_SIZE];
         let mut i: u64 = 0;
+        let start_time = std::time::Instant::now();
+        let mut last_progress_emit = start_time;
 
         loop {
             let n = file.read(&mut buf).await
@@ -718,7 +776,7 @@ impl ChatServer {
             if n == 0 {
                 break;
             }
-            let is_last = n < CHUNK_SIZE || (file_size as usize) <= ((i as usize + 1) * CHUNK_SIZE);
+            let is_last = n < FILE_CHUNK_SIZE || (file_size as usize) <= ((i as usize + 1) * FILE_CHUNK_SIZE);
 
             let msg = WireMessage {
                 sender_id: self.my_id.clone(),
@@ -744,22 +802,19 @@ impl ChatServer {
             stream.write_all(b"\n").await?;
             i += 1;
 
-            // Emit progress
-            let sent = std::cmp::min((i as usize) * CHUNK_SIZE, file_size as usize) as u64;
-            let _ = app_handle.emit_all("file-progress", serde_json::json!({
-                "fileName": file_name,
-                "sent": sent,
-                "total": file_size,
-            }));
+            let sent = std::cmp::min((i as usize) * FILE_CHUNK_SIZE, file_size as usize) as u64;
+            if last_progress_emit.elapsed() >= FILE_PROGRESS_INTERVAL {
+                let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
+                let speed = (sent as f64 / elapsed) as u64;
+                emit_file_progress(&app_handle, &file_name, None, sent, file_size, speed);
+                last_progress_emit = std::time::Instant::now();
+            }
         }
         stream.flush().await?;
 
-        // Emit complete
-        let _ = app_handle.emit_all("file-progress", serde_json::json!({
-            "fileName": file_name,
-            "sent": file_size,
-            "total": file_size,
-        }));
+        let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
+        let speed = (file_size as f64 / elapsed) as u64;
+        emit_file_progress(&app_handle, &file_name, None, file_size, file_size, speed);
 
         info!("File send complete: {} ({} bytes, {} chunks)", file_name, file_size, i);
 
@@ -997,8 +1052,6 @@ async fn send_file_in_background_inner(
         .with_context(|| format!("Failed to read metadata: {}", file_path))?;
     let file_size = metadata.len();
 
-    const CHUNK_SIZE: usize = 48 * 1024;
-
     let mut file = File::open(file_path).await
         .with_context(|| format!("Failed to open file: {}", file_path))?;
 
@@ -1019,13 +1072,12 @@ async fn send_file_in_background_inner(
     } else { Vec::new() };
 
     // Emit start event immediately so UI shows progress bar
-    let _ = app_handle.emit_all("file-progress", serde_json::json!({
-        "fileName": file_name, "clientMsgId": client_msg_id.as_deref(), "sent": 0, "total": file_size, "speed": 0,
-    }));
+    emit_file_progress(&app_handle, file_name, client_msg_id.as_deref(), 0, file_size, 0);
 
-    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut buf = vec![0u8; FILE_CHUNK_SIZE];
     let mut i: u64 = 0;
     let start_time = std::time::Instant::now();
+    let mut last_progress_emit = start_time;
 
     loop {
         wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await?;
@@ -1034,7 +1086,7 @@ async fn send_file_in_background_inner(
             .with_context(|| format!("Failed to read file chunk {}", i))?;
         if n == 0 { break; }
 
-        let is_last = n < CHUNK_SIZE || (file_size as usize) <= ((i as usize + 1) * CHUNK_SIZE);
+        let is_last = n < FILE_CHUNK_SIZE || (file_size as usize) <= ((i as usize + 1) * FILE_CHUNK_SIZE);
         let msg = WireMessage {
             sender_id: my_id.clone(), sender_name: my_name.clone(),
             sender_department: my_department.clone(),
@@ -1052,24 +1104,26 @@ async fn send_file_in_background_inner(
         };
 
         let json = serde_json::to_string(&msg).context("Failed to serialize message")?;
-        stream.write_all(json.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
+        stream.write_all(json.as_bytes()).await
+            .map_err(|error| file_send_connection_error(error, peer))?;
+        stream.write_all(b"\n").await
+            .map_err(|error| file_send_connection_error(error, peer))?;
         i += 1;
 
-        let sent = std::cmp::min((i as usize) * CHUNK_SIZE, file_size as usize) as u64;
-        let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
-        let speed = (sent as f64 / elapsed) as u64; // bytes/sec
-        let _ = app_handle.emit_all("file-progress", serde_json::json!({
-            "fileName": file_name, "clientMsgId": client_msg_id.as_deref(), "sent": sent, "total": file_size, "speed": speed,
-        }));
+        let sent = std::cmp::min((i as usize) * FILE_CHUNK_SIZE, file_size as usize) as u64;
+        if last_progress_emit.elapsed() >= FILE_PROGRESS_INTERVAL {
+            let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
+            let speed = (sent as f64 / elapsed) as u64;
+            emit_file_progress(&app_handle, file_name, client_msg_id.as_deref(), sent, file_size, speed);
+            last_progress_emit = std::time::Instant::now();
+        }
     }
-    stream.flush().await?;
+    stream.flush().await
+        .map_err(|error| file_send_connection_error(error, peer))?;
 
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
     let speed = (file_size as f64 / elapsed) as u64;
-    let _ = app_handle.emit_all("file-progress", serde_json::json!({
-        "fileName": file_name, "clientMsgId": client_msg_id.as_deref(), "sent": file_size, "total": file_size, "speed": speed,
-    }));
+    emit_file_progress(&app_handle, file_name, client_msg_id.as_deref(), file_size, file_size, speed);
 
     info!("File send complete: {} ({} bytes, {} chunks)", file_name, file_size, i);
 
@@ -1126,18 +1180,4 @@ async fn send_file_in_background_inner(
             client_msg_id,
         })
     }
-}
-
-fn save_received_file(data: &[u8], filename: &str) -> Result<String> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/tmp".to_string());
-    let files_dir = std::path::PathBuf::from(home).join("Echo").join("files");
-    std::fs::create_dir_all(&files_dir)?;
-
-    let timestamp = chrono::Utc::now().timestamp_millis();
-    let file_path = files_dir.join(format!("{}_{}", timestamp, filename));
-
-    std::fs::write(&file_path, data)?;
-    Ok(file_path.to_string_lossy().to_string())
 }
