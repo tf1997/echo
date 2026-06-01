@@ -53,6 +53,8 @@ interface ChatWindowProps {
 }
 
 let pendingId = Date.now();
+const EMPTY_PENDING_MESSAGES: PendingMessage[] = [];
+type PendingMessagesUpdate = PendingMessage[] | ((prev: PendingMessage[]) => PendingMessage[]);
 
 interface TextSearchHit {
   id: string;
@@ -277,9 +279,74 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
 
 export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, historySearchRequest = null }: ChatWindowProps) {
   const peerId = peer?.id ?? null;
+  const pendingConversationKey = isGroup
+    ? groupId ? `group:${groupId}` : peerId ? `group:${peerId}` : ""
+    : peer ? `contact:${peer.ip && peer.port ? `${peer.ip}:${peer.port}` : peer.id}` : "";
+  const pendingConversationKeyRef = useRef(pendingConversationKey);
+  pendingConversationKeyRef.current = pendingConversationKey;
   const [inputText, setInputText] = useState("");
   const [isDragging, setIsDragging] = useState(false);
-  const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
+  const [pendingByConversation, setPendingByConversation] = useState<Map<string, PendingMessage[]>>(() => new Map());
+  const pendingMessages = pendingConversationKey ? pendingByConversation.get(pendingConversationKey) ?? EMPTY_PENDING_MESSAGES : EMPTY_PENDING_MESSAGES;
+  const updatePendingMessagesForKey = useCallback((conversationKey: string, update: PendingMessagesUpdate) => {
+    if (!conversationKey) return;
+    setPendingByConversation((prev) => {
+      const current = prev.get(conversationKey) ?? EMPTY_PENDING_MESSAGES;
+      const next = typeof update === "function" ? update(current) : update;
+      if (next === current) return prev;
+      const nextMap = new Map(prev);
+      if (next.length === 0) {
+        nextMap.delete(conversationKey);
+      } else {
+        nextMap.set(conversationKey, next);
+      }
+      return nextMap;
+    });
+  }, []);
+  const setPendingMessages = useCallback((update: PendingMessagesUpdate) => {
+    updatePendingMessagesForKey(pendingConversationKeyRef.current, update);
+  }, [updatePendingMessagesForKey]);
+  const updatePendingMessagesEverywhere = useCallback((
+    matches: (message: PendingMessage) => boolean,
+    update: (message: PendingMessage) => PendingMessage,
+  ) => {
+    setPendingByConversation((prev) => {
+      let changed = false;
+      const nextMap = new Map(prev);
+      for (const [conversationKey, list] of prev) {
+        let listChanged = false;
+        const nextList = list.map((message) => {
+          if (!matches(message)) return message;
+          const nextMessage = update(message);
+          if (nextMessage !== message) listChanged = true;
+          return nextMessage;
+        });
+        if (listChanged) {
+          changed = true;
+          nextMap.set(conversationKey, nextList);
+        }
+      }
+      return changed ? nextMap : prev;
+    });
+  }, []);
+  const removePendingMessagesEverywhere = useCallback((matches: (message: PendingMessage) => boolean) => {
+    setPendingByConversation((prev) => {
+      let changed = false;
+      const nextMap = new Map(prev);
+      for (const [conversationKey, list] of prev) {
+        const nextList = list.filter((message) => !matches(message));
+        if (nextList.length !== list.length) {
+          changed = true;
+          if (nextList.length === 0) {
+            nextMap.delete(conversationKey);
+          } else {
+            nextMap.set(conversationKey, nextList);
+          }
+        }
+      }
+      return changed ? nextMap : prev;
+    });
+  }, []);
   const [showEmoji, setShowEmoji] = useState(false);
   const [emojiTab, setEmojiTab] = useState<"default" | "custom">("default");
   const [customEmojis, setCustomEmojis] = useState<string[]>([]);
@@ -400,36 +467,30 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       listen<{ fileName: string; clientMsgId?: string | null; sent: number; total: number; speed: number }>("file-progress", (event) => {
         const { fileName, clientMsgId, sent, total, speed } = event.payload;
         const pct = total > 0 ? Math.round((sent / total) * 100) : 0;
-        setPendingMessages((prev) =>
-          prev.map((p) =>
-            (clientMsgId ? p.clientMsgId === clientMsgId : p.file_name === fileName && p.msg_type === "file")
-              ? { ...p, progress: pct, speed, status: pct >= 100 ? "sent" as const : p.status }
-              : p
-          )
+        const matchesFile = (message: PendingMessage) =>
+          clientMsgId ? message.clientMsgId === clientMsgId : message.file_name === fileName && message.msg_type === "file";
+        updatePendingMessagesEverywhere(
+          matchesFile,
+          (message) => ({ ...message, progress: pct, speed, status: pct >= 100 ? "sent" as const : message.status })
         );
         // Remove pending after 2s (real message will be in DB by then)
         if (pct >= 100) {
           setTimeout(() => {
-            setPendingMessages((prev) => prev.filter((p) =>
-              clientMsgId ? p.clientMsgId !== clientMsgId : p.file_name !== fileName || p.msg_type !== "file"
-            ));
+            removePendingMessagesEverywhere(matchesFile);
           }, 2000);
         }
       }).then((fn) => { unlisten = fn; });
 
       listen<{ fileName: string; clientMsgId?: string | null; error: string }>("file-error", (event) => {
         const { fileName, clientMsgId, error } = event.payload;
-        setPendingMessages((prev) =>
-          prev.map((p) =>
-            (clientMsgId ? p.clientMsgId === clientMsgId : p.file_name === fileName)
-              ? { ...p, status: "failed", error }
-              : p
-          )
+        updatePendingMessagesEverywhere(
+          (message) => clientMsgId ? message.clientMsgId === clientMsgId : message.file_name === fileName,
+          (message) => ({ ...message, status: "failed", error })
         );
       }).then((fn) => { unlistenError = fn; });
     });
     return () => { unlisten?.(); unlistenError?.(); };
-  }, []);
+  }, [removePendingMessagesEverywhere, updatePendingMessagesEverywhere]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -497,7 +558,6 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   // Background peer refreshes can change peer.id for the same endpoint and should not
   // close the history view.
   useEffect(() => {
-    setPendingMessages([]);
     if (!historySearchRequest?.query.trim()) {
       setShowHistory(false);
     }
@@ -563,12 +623,13 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   }, [showEmoji]);
 
   const retryText = useCallback(async (pending: PendingMessage) => {
-    setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
+    const conversationKey = pendingConversationKeyRef.current;
+    updatePendingMessagesForKey(conversationKey, (prev) => prev.filter((p) => p.id !== pending.id));
     const newClientMsgId = generateClientMsgId();
     try {
       await onSendMessage(pending.content, newClientMsgId);
     } catch {
-      setPendingMessages((prev) => [...prev, {
+      updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
         ...pending,
         id: ++pendingId,
         clientMsgId: newClientMsgId,
@@ -576,16 +637,17 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         error: "重试失败",
       }]);
     }
-  }, [onSendMessage]);
+  }, [onSendMessage, updatePendingMessagesForKey]);
 
   const retryFile = useCallback(async (pending: PendingMessage) => {
     if (!pending.file_path) return;
-    setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
+    const conversationKey = pendingConversationKeyRef.current;
+    updatePendingMessagesForKey(conversationKey, (prev) => prev.filter((p) => p.id !== pending.id));
     const newClientMsgId = generateClientMsgId();
     try {
       await onSendFile(pending.file_path, newClientMsgId);
     } catch {
-      setPendingMessages((prev) => [...prev, {
+      updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
         ...pending,
         id: ++pendingId,
         clientMsgId: newClientMsgId,
@@ -593,53 +655,57 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         error: "重试失败",
       }]);
     }
-  }, [onSendFile]);
+  }, [onSendFile, updatePendingMessagesForKey]);
 
   const handlePauseFileTransfer = useCallback(async (pending: PendingMessage) => {
     if (pending.msg_type !== "file" || pending.status !== "sending") return;
+    const conversationKey = pendingConversationKeyRef.current;
     try {
       await pauseFileTransfer(pending.clientMsgId);
-      setPendingMessages((prev) => prev.map((p) =>
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
         p.id === pending.id ? { ...p, status: "paused", speed: 0 } : p
       ));
     } catch (error) {
-      setPendingMessages((prev) => prev.map((p) =>
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
         p.id === pending.id ? { ...p, status: "failed", error: String(error) } : p
       ));
     }
-  }, []);
+  }, [updatePendingMessagesForKey]);
 
   const handleResumeFileTransfer = useCallback(async (pending: PendingMessage) => {
     if (pending.msg_type !== "file" || pending.status !== "paused") return;
+    const conversationKey = pendingConversationKeyRef.current;
     try {
       await resumeFileTransfer(pending.clientMsgId);
-      setPendingMessages((prev) => prev.map((p) =>
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
         p.id === pending.id ? { ...p, status: "sending" } : p
       ));
     } catch (error) {
-      setPendingMessages((prev) => prev.map((p) =>
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
         p.id === pending.id ? { ...p, status: "failed", error: String(error) } : p
       ));
     }
-  }, []);
+  }, [updatePendingMessagesForKey]);
 
   const handleCancelFileTransfer = useCallback(async (pending: PendingMessage) => {
     if (pending.msg_type !== "file" || (pending.status !== "sending" && pending.status !== "paused")) return;
-    setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
+    const conversationKey = pendingConversationKeyRef.current;
+    updatePendingMessagesForKey(conversationKey, (prev) => prev.filter((p) => p.id !== pending.id));
     try {
       await cancelFileTransfer(pending.clientMsgId);
     } catch {
       // The background task may have completed between the click and command dispatch.
     }
-  }, []);
+  }, [updatePendingMessagesForKey]);
 
   const retrySticker = useCallback(async (pending: PendingMessage) => {
     if (!pending.file_path) return;
+    const conversationKey = pendingConversationKeyRef.current;
     const name = pending.file_name || pending.file_path.replace(/\\/g, "/").split("/").pop() || "sticker";
-    setPendingMessages((prev) => prev.filter((p) => p.id !== pending.id));
+    updatePendingMessagesForKey(conversationKey, (prev) => prev.filter((p) => p.id !== pending.id));
     const tempId = ++pendingId;
     const newClientMsgId = generateClientMsgId();
-    setPendingMessages((prev) => [...prev, {
+    updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
       ...pending,
       id: tempId,
       clientMsgId: newClientMsgId,
@@ -649,7 +715,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       error: undefined,
     }]);
     if (!isGroup && !peer?.online) {
-      setPendingMessages((prev) => prev.map((p) =>
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
         p.id === tempId ? { ...p, status: "failed", error: "对方离线" } : p
       ));
       return;
@@ -657,21 +723,22 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     try {
       await onSendSticker(pending.file_path, newClientMsgId);
     } catch (e) {
-      setPendingMessages((prev) => prev.map((p) =>
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
         p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
       ));
     }
-  }, [isGroup, peer?.online, onSendSticker]);
+  }, [isGroup, peer?.online, onSendSticker, updatePendingMessagesForKey]);
 
   const sendSticker = useCallback(async (filePath: string) => {
     if (!peer) return;
     setShowEmoji(false);
     nearBottomRef.current = true;
+    const conversationKey = pendingConversationKeyRef.current;
     const name = filePath.replace(/\\/g, "/").split("/").pop() || "sticker";
     const tempId = ++pendingId;
     const clientMsgId = generateClientMsgId();
 
-    setPendingMessages((prev) => [...prev, {
+    updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
       id: tempId,
       clientMsgId,
       content: "[表情]",
@@ -682,7 +749,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       status: "sending",
     }]);
     if (!isGroup && !peer.online) {
-      setPendingMessages((prev) => prev.map((p) =>
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
         p.id === tempId ? { ...p, status: "failed", error: "对方离线" } : p
       ));
       return;
@@ -690,11 +757,11 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     try {
       await onSendSticker(filePath, clientMsgId);
     } catch (e) {
-      setPendingMessages((prev) => prev.map((p) =>
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
         p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
       ));
     }
-  }, [peer, isGroup, onSendSticker]);
+  }, [peer, isGroup, onSendSticker, updatePendingMessagesForKey]);
 
   const sendText = useCallback(async () => {
     const trimmed = inputText.trim();
@@ -704,6 +771,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     if (inputRef.current) {
       inputRef.current.style.height = "auto";
     }
+    const conversationKey = pendingConversationKeyRef.current;
 
     const tempId = ++pendingId;
     const clientMsgId = generateClientMsgId();
@@ -715,17 +783,17 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       msg_type: "text",
       status: "sending"
     };
-    setPendingMessages((prev) => [...prev, temp]);
+    updatePendingMessagesForKey(conversationKey, (prev) => [...prev, temp]);
 
     try {
       await onSendMessage(trimmed, clientMsgId);
       // 不需要手动清理，useEffect 会自动处理
     } catch (e) {
-      setPendingMessages((prev) => prev.map((p) =>
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
         p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
       ));
     }
-  }, [inputText, peer, onSendMessage]);
+  }, [inputText, peer, onSendMessage, updatePendingMessagesForKey]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -744,6 +812,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const sendFileToPeer = useCallback(async (file: File) => {
     if (!peer) return;
     nearBottomRef.current = true;
+    const conversationKey = pendingConversationKeyRef.current;
 
     const tempId = ++pendingId;
     const clientMsgId = generateClientMsgId();
@@ -756,16 +825,16 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       file_name: file.name,
       status: "sending",
     };
-    setPendingMessages((prev) => [...prev, temp]);
+    updatePendingMessagesForKey(conversationKey, (prev) => [...prev, temp]);
 
     try {
       // @ts-expect-error Tauri adds path property on drag events
       const filePath: string = file.path;
       if (filePath) {
         // attach the real path so retries can use it and so pending matches final message
-        setPendingMessages((prev) => prev.map((p) => p.id === tempId ? { ...p, file_path: filePath } : p));
+        updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) => p.id === tempId ? { ...p, file_path: filePath } : p));
         onSendFile(filePath, clientMsgId).catch((e) => {
-          setPendingMessages((prev) => prev.map((p) =>
+          updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
             p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
           ));
         });
@@ -779,18 +848,18 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       const savedPath = await readFileAndSave(file);
       // Update pending entry to use the saved temp filename (it has a timestamp prefix)
       const savedName = savedPath.replace(/\\/g, "/").split("/").pop() || file.name;
-      setPendingMessages((prev) => prev.map((p) => p.id === tempId ? { ...p, file_name: savedName, file_path: savedPath, file_size: file.size } : p));
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) => p.id === tempId ? { ...p, file_name: savedName, file_path: savedPath, file_size: file.size } : p));
       onSendFile(savedPath, clientMsgId).catch((e) => {
-        setPendingMessages((prev) => prev.map((p) =>
+        updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
           p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
         ));
       });
     } catch (e) {
-      setPendingMessages((prev) => prev.map((p) =>
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
         p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
       ));
     }
-  }, [peer, onSendFile]);
+  }, [peer, onSendFile, updatePendingMessagesForKey]);
 
   const handlePaste = useCallback(async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = e.clipboardData.items;
@@ -827,13 +896,14 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         for (const filePath of paths) {
           const name = filePath.replace(/\\/g, "/").split("/").pop() || "file";
           nearBottomRef.current = true;
+          const conversationKey = pendingConversationKeyRef.current;
           const tempId = ++pendingId;
           const clientMsgId = generateClientMsgId();
-          setPendingMessages((prev) => [...prev, {
+          updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
             id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, file_path: filePath, status: "sending",
           }]);
           onSendFile(filePath, clientMsgId).catch((e) => {
-            setPendingMessages((prev) => prev.map((p) =>
+            updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
               p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
             ));
           });
@@ -846,7 +916,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       unlistenDrop?.();
       unlistenCancelled?.();
     };
-  }, [peerId, onSendFile]);
+  }, [peerId, onSendFile, updatePendingMessagesForKey]);
 
   const handlePickFile = async () => {
     const selected = await open({ multiple: true });
@@ -855,13 +925,14 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     for (const filePath of paths) {
       const name = filePath.replace(/\\/g, "/").split("/").pop() || "file";
       nearBottomRef.current = true;
+      const conversationKey = pendingConversationKeyRef.current;
       const tempId = ++pendingId;
       const clientMsgId = generateClientMsgId();
-      setPendingMessages((prev) => [...prev, {
+      updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
         id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, file_path: filePath, status: "sending",
       }]);
       onSendFile(filePath, clientMsgId).catch((e) => {
-        setPendingMessages((prev) => prev.map((p) =>
+        updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
           p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
         ));
       });
