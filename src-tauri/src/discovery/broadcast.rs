@@ -19,6 +19,10 @@ const SCAN_INTERVAL_SECS: u64 = 300; // 5 minutes — avoids IDS triggering
 const PROBE_DELAY_MS_MIN: u64 = 3;
 const PROBE_DELAY_MS_MAX: u64 = 15;
 
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
 /// Wire format for LAN discovery packets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AnnouncePacket {
@@ -29,6 +33,10 @@ struct AnnouncePacket {
     software_version: String,
     #[serde(default)]
     mac_address: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    avatar_hash: String,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    avatar_updated_at: i64,
     ip: String,
     port: u16,
     /// Optional: list of peers this node knows about (for peer relay / 网桥)
@@ -43,6 +51,8 @@ pub struct LanDiscoveryConfig {
     pub department: String,
     pub software_version: String,
     pub mac_address: String,
+    pub avatar_hash: String,
+    pub avatar_updated_at: i64,
     pub listen_port: u16,
     pub local_ip: IpAddr,
     pub scan_subnets: Vec<String>,
@@ -110,6 +120,8 @@ impl LanDiscovery {
             department: config.department.clone(),
             software_version: config.software_version.clone(),
             mac_address: config.mac_address.clone(),
+            avatar_hash: config.avatar_hash.clone(),
+            avatar_updated_at: config.avatar_updated_at,
             ip: config.local_ip.to_string(),
             port: config.listen_port,
             known_peers: Vec::new(),
@@ -266,6 +278,8 @@ impl LanDiscovery {
                     department: p.department.clone(),
                     software_version: p.software_version.clone(),
                     mac_address: p.mac_address.clone(),
+                    avatar_hash: p.avatar_hash.clone(),
+                    avatar_updated_at: p.avatar_updated_at,
                     ip: p.ip.to_string(), port: p.port,
                 })
                 .collect();
@@ -323,6 +337,8 @@ impl LanDiscovery {
                 department: String::new(),
                 software_version: String::new(),
                 mac_address: String::new(),
+                avatar_hash: String::new(),
+                avatar_updated_at: 0,
                 ip: String::new(),
                 port: 0,
                 known_peers: Vec::new(),
@@ -415,12 +431,15 @@ impl LanDiscovery {
                     };
 
                     // Register the announcing peer
-                    let peer = Peer::new_with_profile(
+                    let peer = Peer::new_with_avatar(
                         packet.id.clone(),
                         packet.username.clone(),
                         packet.department.clone(),
                         packet.software_version.clone(),
                         packet.mac_address.clone(),
+                        String::new(),
+                        packet.avatar_hash.clone(),
+                        packet.avatar_updated_at,
                         remote_ip,
                         packet.port,
                     );
@@ -441,6 +460,9 @@ impl LanDiscovery {
                             department: peer.department.clone(),
                             software_version: peer.software_version.clone(),
                             mac_address: peer.mac_address.clone(),
+                            avatar_path: String::new(),
+                            avatar_hash: peer.avatar_hash.clone(),
+                            avatar_updated_at: peer.avatar_updated_at,
                             ip: remote_ip,
                             port: packet.port,
                             online: true,
@@ -455,12 +477,15 @@ impl LanDiscovery {
                             if let Ok(ip) = entry.ip.parse::<IpAddr>() {
                                 peers_map.insert(
                                     entry.id.clone(),
-                                    Peer::with_online_details(
+                                    Peer::with_online_avatar(
                                         entry.id.clone(),
                                         entry.username.clone(),
                                         entry.department.clone(),
                                         entry.software_version.clone(),
                                         entry.mac_address.clone(),
+                                        String::new(),
+                                        entry.avatar_hash.clone(),
+                                        entry.avatar_updated_at,
                                         ip,
                                         entry.port,
                                         false,
@@ -506,6 +531,8 @@ impl LanDiscovery {
                             department: my_info.department.clone(),
                             software_version: my_info.software_version.clone(),
                             mac_address: my_info.mac_address.clone(),
+                            avatar_hash: my_info.avatar_hash.clone(),
+                            avatar_updated_at: my_info.avatar_updated_at,
                             ip: my_info.ip.clone(),
                             port: my_info.port,
                             known_peers: vec![PeerEntry {
@@ -514,6 +541,8 @@ impl LanDiscovery {
                                 department: peer.department.clone(),
                                 software_version: peer.software_version.clone(),
                                 mac_address: peer.mac_address.clone(),
+                                avatar_hash: peer.avatar_hash.clone(),
+                                avatar_updated_at: peer.avatar_updated_at,
                                 ip: remote_ip.to_string(),
                                 port: packet.port,
                             }],

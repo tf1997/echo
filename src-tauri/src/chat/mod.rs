@@ -21,6 +21,7 @@ pub const FILE_SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 const FILE_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 const EVENT_CONVERSATION_UPDATED: &str = "conversation-updated";
 pub const FILE_TRANSFER_CANCELLED_MESSAGE: &str = "发送已取消";
+const AVATAR_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileTransferControlState {
@@ -552,15 +553,27 @@ impl ChatServer {
                     }
 
                     if msg_type == "identity_probe" {
+                        let profile = db.get_user_profile().await.ok().flatten();
+                        let avatar_content = serde_json::json!({
+                            "avatar_hash": profile.as_ref().map(|p| p.avatar_hash.as_str()).unwrap_or(""),
+                            "avatar_updated_at": profile.as_ref().map(|p| p.avatar_updated_at).unwrap_or_default(),
+                        })
+                        .to_string();
                         let response = WireMessage {
                             sender_id: my_id.clone(),
-                            sender_name: my_name.clone(),
-                            sender_department: my_department.clone(),
+                            sender_name: profile
+                                .as_ref()
+                                .map(|p| p.username.clone())
+                                .unwrap_or_else(|| my_name.clone()),
+                            sender_department: profile
+                                .as_ref()
+                                .map(|p| p.department.clone())
+                                .unwrap_or_else(|| my_department.clone()),
                             sender_software_version: my_software_version.clone(),
                             sender_mac_address: my_mac_address.clone(),
                             sender_port: my_port,
                             receiver_id: msg.sender_id.clone(),
-                            content: String::new(),
+                            content: avatar_content,
                             msg_type: "identity_response".to_string(),
                             file_name: None,
                             file_size: None,
@@ -571,6 +584,87 @@ impl ChatServer {
                         };
                         let json = serde_json::to_string(&response)
                             .context("Failed to serialize identity response")?;
+                        writer.write_all(json.as_bytes()).await?;
+                        writer.write_all(b"\n").await?;
+                        writer.flush().await?;
+                        continue;
+                    }
+
+                    if msg_type == "avatar_request" {
+                        let requested_hash = msg.content.trim();
+                        let profile = db.get_user_profile().await.ok().flatten();
+                        let mut response_payload = serde_json::json!({
+                            "avatar_hash": "",
+                            "avatar_updated_at": 0,
+                            "file_name": "",
+                            "data": "",
+                        });
+
+                        if let Some(profile) = profile.as_ref() {
+                            if !requested_hash.is_empty()
+                                && requested_hash == profile.avatar_hash
+                                && !profile.avatar_path.is_empty()
+                            {
+                                match tokio::fs::metadata(&profile.avatar_path).await {
+                                    Ok(metadata) if metadata.len() <= AVATAR_MAX_BYTES => {
+                                        match tokio::fs::read(&profile.avatar_path).await {
+                                            Ok(bytes) => {
+                                                let mut encoded = String::with_capacity(
+                                                    base64_encoded_capacity(bytes.len()),
+                                                );
+                                                base64_encode_into(&bytes, &mut encoded);
+                                                let file_name = std::path::Path::new(&profile.avatar_path)
+                                                    .file_name()
+                                                    .and_then(|name| name.to_str())
+                                                    .unwrap_or("avatar")
+                                                    .to_string();
+                                                response_payload = serde_json::json!({
+                                                    "avatar_hash": profile.avatar_hash,
+                                                    "avatar_updated_at": profile.avatar_updated_at,
+                                                    "file_name": file_name,
+                                                    "data": encoded,
+                                                });
+                                            }
+                                            Err(error) => {
+                                                warn!("Failed to read avatar for request: {}", error);
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => {
+                                        warn!("Avatar too large to send");
+                                    }
+                                    Err(error) => {
+                                        warn!("Avatar request metadata failed: {}", error);
+                                    }
+                                }
+                            }
+                        }
+
+                        let response = WireMessage {
+                            sender_id: my_id.clone(),
+                            sender_name: profile
+                                .as_ref()
+                                .map(|p| p.username.clone())
+                                .unwrap_or_else(|| my_name.clone()),
+                            sender_department: profile
+                                .as_ref()
+                                .map(|p| p.department.clone())
+                                .unwrap_or_else(|| my_department.clone()),
+                            sender_software_version: my_software_version.clone(),
+                            sender_mac_address: my_mac_address.clone(),
+                            sender_port: my_port,
+                            receiver_id: msg.sender_id.clone(),
+                            content: response_payload.to_string(),
+                            msg_type: "avatar_response".to_string(),
+                            file_name: None,
+                            file_size: None,
+                            file_data: None,
+                            file_kind: None,
+                            known_peers: Vec::new(),
+                            group_id: None,
+                        };
+                        let json = serde_json::to_string(&response)
+                            .context("Failed to serialize avatar response")?;
                         writer.write_all(json.as_bytes()).await?;
                         writer.write_all(b"\n").await?;
                         writer.flush().await?;
@@ -588,12 +682,15 @@ impl ChatServer {
                             continue;
                         }
                         let _ = db
-                            .upsert_peer_with_profile(
+                            .upsert_peer_with_avatar(
                                 &entry.id,
                                 &entry.username,
                                 &entry.department,
                                 &entry.software_version,
                                 &entry.mac_address,
+                                "",
+                                &entry.avatar_hash,
+                                entry.avatar_updated_at,
                                 &entry.ip,
                                 entry.port,
                                 false,
@@ -664,14 +761,33 @@ impl ChatServer {
                         );
                     }
 
+                    let mut sender_avatar_hash = String::new();
+                    let mut sender_avatar_updated_at = 0i64;
+                    if msg.msg_type == "profile_updated" {
+                        if let Ok(profile_payload) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+                            sender_avatar_hash = profile_payload
+                                .get("avatar_hash")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            sender_avatar_updated_at = profile_payload
+                                .get("avatar_updated_at")
+                                .and_then(|value| value.as_i64())
+                                .unwrap_or_default();
+                        }
+                    }
+
                     // Register the sender as a peer in DB
                     if let Err(e) = db
-                        .upsert_peer_with_profile(
+                        .upsert_peer_with_avatar(
                             &msg.sender_id,
                             &msg.sender_name,
                             &msg.sender_department,
                             &msg.sender_software_version,
                             &msg.sender_mac_address,
+                            "",
+                            &sender_avatar_hash,
+                            sender_avatar_updated_at,
                             &peer_addr.ip().to_string(),
                             msg.sender_port,
                             true,
@@ -688,12 +804,15 @@ impl ChatServer {
                             std::net::IpAddr::V6(ip) => std::net::IpAddr::V6(ip),
                         };
                         let pid = format!("{}:{}", peer_addr.ip(), msg.sender_port);
-                        let new_peer = Peer::new_with_profile(
+                        let new_peer = Peer::new_with_avatar(
                             pid.clone(),
                             msg.sender_name.clone(),
                             msg.sender_department.clone(),
                             msg.sender_software_version.clone(),
                             msg.sender_mac_address.clone(),
+                            String::new(),
+                            sender_avatar_hash.clone(),
+                            sender_avatar_updated_at,
                             remote_ip,
                             msg.sender_port,
                         );
@@ -719,6 +838,16 @@ impl ChatServer {
                                     if !msg.sender_mac_address.is_empty() {
                                         existing.mac_address = msg.sender_mac_address.clone();
                                     }
+                                    if sender_avatar_updated_at > existing.avatar_updated_at {
+                                        existing.avatar_path.clear();
+                                        existing.avatar_hash = sender_avatar_hash.clone();
+                                        existing.avatar_updated_at = sender_avatar_updated_at;
+                                    } else if existing.avatar_hash.is_empty()
+                                        && !sender_avatar_hash.is_empty()
+                                    {
+                                        existing.avatar_hash = sender_avatar_hash.clone();
+                                        existing.avatar_updated_at = sender_avatar_updated_at;
+                                    }
                                     existing.online = true;
                                 }
                             }
@@ -727,12 +856,15 @@ impl ChatServer {
                             for entry in &msg.known_peers {
                                 if entry.id != my_id && !map.contains_key(&entry.id) {
                                     if let Ok(entry_ip) = entry.ip.parse::<std::net::IpAddr>() {
-                                        let relay = Peer::with_online_details(
+                                        let relay = Peer::with_online_avatar(
                                             entry.id.clone(),
                                             entry.username.clone(),
                                             entry.department.clone(),
                                             entry.software_version.clone(),
                                             entry.mac_address.clone(),
+                                            String::new(),
+                                            entry.avatar_hash.clone(),
+                                            entry.avatar_updated_at,
                                             entry_ip,
                                             entry.port,
                                             false,
@@ -758,12 +890,15 @@ impl ChatServer {
                                 continue;
                             }
                             let _ = db
-                                .upsert_peer_with_profile(
+                                .upsert_peer_with_avatar(
                                     &entry.id,
                                     &entry.username,
                                     &entry.department,
                                     &entry.software_version,
                                     &entry.mac_address,
+                                    "",
+                                    &entry.avatar_hash,
+                                    entry.avatar_updated_at,
                                     &entry.ip,
                                     entry.port,
                                     false,
@@ -1045,12 +1180,15 @@ impl ChatServer {
         if !delivered {
             let _ = self
                 .db
-                .upsert_peer_with_profile(
+                .upsert_peer_with_avatar(
                     &peer.id,
                     &peer.username,
                     &peer.department,
                     &peer.software_version,
                     &peer.mac_address,
+                    &peer.avatar_path,
+                    &peer.avatar_hash,
+                    peer.avatar_updated_at,
                     &peer.ip.to_string(),
                     peer.port,
                     false,
@@ -1216,6 +1354,8 @@ impl ChatServer {
                     department: p.department.clone(),
                     software_version: p.software_version.clone(),
                     mac_address: p.mac_address.clone(),
+                    avatar_hash: p.avatar_hash.clone(),
+                    avatar_updated_at: p.avatar_updated_at,
                     ip: p.ip.to_string(),
                     port: p.port,
                 })
@@ -1457,6 +1597,8 @@ async fn send_file_in_background_inner(
                 department: p.department.clone(),
                 software_version: p.software_version.clone(),
                 mac_address: p.mac_address.clone(),
+                avatar_hash: p.avatar_hash.clone(),
+                avatar_updated_at: p.avatar_updated_at,
                 ip: p.ip.to_string(),
                 port: p.port,
             })

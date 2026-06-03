@@ -21,6 +21,10 @@ pub struct ContactSummaryEntry {
     pub software_version: String,
     #[serde(default)]
     pub mac_address: String,
+    #[serde(default)]
+    pub avatar_hash: String,
+    #[serde(default)]
+    pub avatar_updated_at: i64,
     pub ip: String,
     pub port: u16,
     /// `last_seen_at` unix timestamp — used as version for delta comparison.
@@ -50,6 +54,7 @@ pub async fn build_summaries(
     my_ip: &str,
 ) -> Vec<ContactSummaryEntry> {
     let stored = db.list_stored_peers().await.unwrap_or_default();
+    let my_profile = db.get_user_profile().await.ok().flatten();
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
 
@@ -61,6 +66,14 @@ pub async fn build_summaries(
         department: my_department.to_string(),
         software_version: my_software_version.to_string(),
         mac_address: my_mac_address.to_string(),
+        avatar_hash: my_profile
+            .as_ref()
+            .map(|profile| profile.avatar_hash.clone())
+            .unwrap_or_default(),
+        avatar_updated_at: my_profile
+            .as_ref()
+            .map(|profile| profile.avatar_updated_at)
+            .unwrap_or_default(),
         ip: my_ip.to_string(),
         port: my_port,
         version: 0,
@@ -75,6 +88,8 @@ pub async fn build_summaries(
                 department: sp.department.clone(),
                 software_version: sp.software_version.clone(),
                 mac_address: sp.mac_address.clone(),
+                avatar_hash: sp.avatar_hash.clone(),
+                avatar_updated_at: sp.avatar_updated_at,
                 ip: sp.ip.clone(),
                 port: sp.port,
                 version: sp.last_seen_at.parse::<i64>().unwrap_or(0),
@@ -92,6 +107,8 @@ pub async fn build_summaries(
                     department: p.department.clone(),
                     software_version: p.software_version.clone(),
                     mac_address: p.mac_address.clone(),
+                    avatar_hash: p.avatar_hash.clone(),
+                    avatar_updated_at: p.avatar_updated_at,
                     ip: p.ip.to_string(),
                     port: p.port,
                     version: p.last_seen,
@@ -157,6 +174,14 @@ fn merge_into_memory(
                 if !entry.mac_address.is_empty() {
                     existing.mac_address = entry.mac_address.clone();
                 }
+                if entry.avatar_updated_at > existing.avatar_updated_at {
+                    existing.avatar_path.clear();
+                    existing.avatar_hash = entry.avatar_hash.clone();
+                    existing.avatar_updated_at = entry.avatar_updated_at;
+                } else if existing.avatar_hash.is_empty() && !entry.avatar_hash.is_empty() {
+                    existing.avatar_hash = entry.avatar_hash.clone();
+                    existing.avatar_updated_at = entry.avatar_updated_at;
+                }
                 existing.ip = ip;
                 existing.port = entry.port;
                 if entry.version > 0 {
@@ -165,12 +190,15 @@ fn merge_into_memory(
             } else {
                 map.insert(
                     entry.peer_id.clone(),
-                    Peer::with_online_details(
+                    Peer::with_online_avatar(
                         entry.peer_id.clone(),
                         entry.username.clone(),
                         entry.department.clone(),
                         entry.software_version.clone(),
                         entry.mac_address.clone(),
+                        String::new(),
+                        entry.avatar_hash.clone(),
+                        entry.avatar_updated_at,
                         ip,
                         entry.port,
                         false,
@@ -226,7 +254,7 @@ pub async fn handle_contact_summary(
     let mut new_count = 0u32;
 
     for entry in &entries {
-        if entry.peer_id == my_id || our_ids.contains(&entry.peer_id) {
+        if entry.peer_id == my_id {
             continue;
         }
         if entry.ip.is_empty() || entry.port == 0 {
@@ -237,12 +265,15 @@ pub async fn handle_contact_summary(
         }
         // Persist
         let _ = db
-            .upsert_peer_with_profile(
+            .upsert_peer_with_avatar(
                 &entry.peer_id,
                 &entry.username,
                 &entry.department,
                 &entry.software_version,
                 &entry.mac_address,
+                "",
+                &entry.avatar_hash,
+                entry.avatar_updated_at,
                 &entry.ip,
                 entry.port,
                 false,
@@ -250,7 +281,9 @@ pub async fn handle_contact_summary(
             .await;
         let _ = db.add_recent_contact(&entry.peer_id).await;
         merge_into_memory(entry, my_id, peers_map);
-        new_count += 1;
+        if !our_ids.contains(&entry.peer_id) {
+            new_count += 1;
+        }
     }
     if new_count > 0 {
         info!("contact_sync: added {} new peer(s) from summary", new_count);
@@ -346,12 +379,15 @@ pub async fn handle_contact_sync_res(
         }
         let _ = db.add_recent_contact(&entry.peer_id).await;
         let _ = db
-            .upsert_peer_with_profile(
+            .upsert_peer_with_avatar(
                 &entry.peer_id,
                 &entry.username,
                 &entry.department,
                 &entry.software_version,
                 &entry.mac_address,
+                "",
+                &entry.avatar_hash,
+                entry.avatar_updated_at,
                 &entry.ip,
                 entry.port,
                 false,
@@ -374,12 +410,15 @@ pub async fn handle_contact_sync_res(
         }
         let _ = db.add_recent_contact(&entry.peer_id).await;
         let _ = db
-            .upsert_peer_with_profile(
+            .upsert_peer_with_avatar(
                 &entry.peer_id,
                 &entry.username,
                 &entry.department,
                 &entry.software_version,
                 &entry.mac_address,
+                "",
+                &entry.avatar_hash,
+                entry.avatar_updated_at,
                 &entry.ip,
                 entry.port,
                 false,

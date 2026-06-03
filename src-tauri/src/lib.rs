@@ -298,12 +298,15 @@ pub fn run() {
                             continue;
                         }
                         let _ = processor_db
-                            .upsert_peer_with_profile(
+                            .upsert_peer_with_avatar(
                                 &entry.id,
                                 &entry.username,
                                 &entry.department,
                                 &entry.software_version,
                                 &entry.mac_address,
+                                "",
+                                &entry.avatar_hash,
+                                entry.avatar_updated_at,
                                 &entry.ip,
                                 entry.port,
                                 false,
@@ -369,12 +372,12 @@ pub fn run() {
                             .as_secs() as i64;
 
                         // Snapshot peers, then release all locks
-                        let snapshot: Vec<(String, String, String, String, String, IpAddr, u16)> = {
+                        let snapshot: Vec<(String, String, String, String, String, String, i64, IpAddr, u16)> = {
                             let runtime_opt = { state.runtime.read().await.clone() };
                             if let Some(runtime) = runtime_opt.as_ref() {
                                 runtime.discovery.read().await.get_peers()
                                     .into_iter()
-                                    .map(|p| (p.id, p.username, p.department, p.software_version, p.mac_address, p.ip, p.port))
+                                    .map(|p| (p.id, p.username, p.department, p.software_version, p.mac_address, p.avatar_hash, p.avatar_updated_at, p.ip, p.port))
                                     .collect()
                             } else {
                                 vec![]
@@ -388,7 +391,7 @@ pub fn run() {
                         // Concurrent TCP detection using JoinSet to prevent blocking
                         let mut tasks = tokio::task::JoinSet::new();
 
-                        for (id, username, department, software_version, mac_address, ip, port) in snapshot {
+                        for (id, username, department, software_version, mac_address, avatar_hash, avatar_updated_at, ip, port) in snapshot {
                             tasks.spawn(async move {
                                 // Support both IPv4 and IPv6 with SocketAddr
                                 let addr = SocketAddr::new(ip, port);
@@ -400,19 +403,19 @@ pub fn run() {
                                 .map(|r| r.is_ok())
                                 .unwrap_or(false);
 
-                                (id, username, department, software_version, mac_address, ip, port, tcp_ok)
+                                (id, username, department, software_version, mac_address, avatar_hash, avatar_updated_at, ip, port, tcp_ok)
                             });
                         }
 
                         // Process concurrent check results
                         while let Some(res) = tasks.join_next().await {
-                            if let Ok((id, username, department, software_version, mac_address, ip, port, tcp_ok)) = res {
+                            if let Ok((id, username, department, software_version, mac_address, avatar_hash, avatar_updated_at, ip, port, tcp_ok)) = res {
                                 if tcp_ok {
                                     // TCP success → peer is alive, refresh last_seen
                                     if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
                                         runtime.discovery.write().await.touch_peer(&id);
                                     }
-                                    let _ = state.db.upsert_peer_with_profile(&id, &username, &department, &software_version, &mac_address, &ip.to_string(), port, true).await;
+                                    let _ = state.db.upsert_peer_with_avatar(&id, &username, &department, &software_version, &mac_address, "", &avatar_hash, avatar_updated_at, &ip.to_string(), port, true).await;
                                     let db = state.db.clone();
                                     let pid = id.clone();
                                     tauri::async_runtime::spawn(async move {
@@ -451,13 +454,16 @@ pub fn run() {
                                         if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
                                             runtime.discovery.write().await.set_online(&id, false);
                                         }
-                                        let _ = state.db.upsert_peer_with_profile(&id, &username, &department, &software_version, &mac_address, &ip.to_string(), port, false).await;
-                                        let updated = Peer::with_online_details(
+                                        let _ = state.db.upsert_peer_with_avatar(&id, &username, &department, &software_version, &mac_address, "", &avatar_hash, avatar_updated_at, &ip.to_string(), port, false).await;
+                                        let updated = Peer::with_online_avatar(
                                             id.clone(),
                                             username.clone(),
                                             department.clone(),
                                             software_version.clone(),
                                             mac_address.clone(),
+                                            String::new(),
+                                            avatar_hash.clone(),
+                                            avatar_updated_at,
                                             ip,
                                             port,
                                             false,
@@ -592,6 +598,9 @@ pub fn run() {
             commands::get_app_info,
             commands::get_departments,
             commands::save_profile,
+            commands::set_profile_avatar,
+            commands::clear_profile_avatar,
+            commands::request_peer_avatar,
             commands::list_stored_peers,
             commands::refresh_peer_profile,
             commands::get_peers,

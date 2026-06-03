@@ -51,6 +51,8 @@ impl RuntimeServices {
             &profile.department,
             listen_port,
             scan_subnets,
+            &profile.avatar_hash,
+            profile.avatar_updated_at,
         );
         config.relay_tx = relay_tx;
         let discovery = DiscoveryService::new(config)?;

@@ -4,6 +4,9 @@ export interface Peer {
   department: string;
   software_version?: string;
   mac_address?: string;
+  avatar_path?: string;
+  avatar_hash?: string;
+  avatar_updated_at?: number;
   ip: string;
   port: number;
   online: boolean;
@@ -16,6 +19,9 @@ export interface StoredPeer {
   department: string;
   software_version?: string;
   mac_address?: string;
+  avatar_path?: string;
+  avatar_hash?: string;
+  avatar_updated_at?: number;
   ip: string;
   port: number;
   is_online: boolean;
@@ -45,6 +51,9 @@ export interface AppInfo {
   department: string;
   software_version: string;
   mac_address: string;
+  avatar_path: string;
+  avatar_hash: string;
+  avatar_updated_at: number;
   listen_port: number;
   my_ip: string;
 }
@@ -52,6 +61,12 @@ export interface AppInfo {
 export interface SaveProfilePayload {
   username: string;
   department: string;
+}
+
+export interface AvatarInfo {
+  avatar_path: string;
+  avatar_hash: string;
+  avatar_updated_at: number;
 }
 
 export interface UnreadCount {

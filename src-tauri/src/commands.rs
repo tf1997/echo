@@ -1,6 +1,7 @@
 use log::{error, info};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
+use std::{path::Path, sync::Arc};
 use tauri::{AppHandle, Manager, State};
 
 use crate::chat::{
@@ -22,6 +23,9 @@ pub struct AppInfo {
     pub department: String,
     pub software_version: String,
     pub mac_address: String,
+    pub avatar_path: String,
+    pub avatar_hash: String,
+    pub avatar_updated_at: i64,
     pub listen_port: u16,
     pub my_ip: String,
 }
@@ -31,6 +35,15 @@ pub struct SaveProfilePayload {
     pub username: String,
     pub department: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AvatarInfo {
+    pub avatar_path: String,
+    pub avatar_hash: String,
+    pub avatar_updated_at: i64,
+}
+
+const AVATAR_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 #[tauri::command]
 pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String> {
@@ -49,6 +62,9 @@ pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String>
             department: profile.department,
             software_version: crate::profile_metadata::software_version(),
             mac_address: crate::profile_metadata::mac_address(),
+            avatar_path: profile.avatar_path,
+            avatar_hash: profile.avatar_hash,
+            avatar_updated_at: profile.avatar_updated_at,
             listen_port: runtime.listen_port,
             my_ip,
         })
@@ -60,6 +76,9 @@ pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String>
             department: String::new(),
             software_version: crate::profile_metadata::software_version(),
             mac_address: crate::profile_metadata::mac_address(),
+            avatar_path: String::new(),
+            avatar_hash: String::new(),
+            avatar_updated_at: 0,
             listen_port: std::env::var("ECHO_PORT")
                 .ok()
                 .and_then(|value| value.parse::<u16>().ok())
@@ -116,6 +135,19 @@ pub async fn save_profile(
         .map(|profile| profile.peer_id.clone())
         .filter(|peer_id| !peer_id.is_empty())
         .unwrap_or_default(); // will be set to IP:port by RuntimeServices::start()
+    let existing_avatar = state
+        .profile
+        .lock()
+        .await
+        .as_ref()
+        .map(|profile| {
+            (
+                profile.avatar_path.clone(),
+                profile.avatar_hash.clone(),
+                profile.avatar_updated_at,
+            )
+        })
+        .unwrap_or_default();
 
     state
         .db
@@ -135,6 +167,9 @@ pub async fn save_profile(
         department: department.to_string(),
         software_version: crate::profile_metadata::software_version(),
         mac_address: crate::profile_metadata::mac_address(),
+        avatar_path: existing_avatar.0,
+        avatar_hash: existing_avatar.1,
+        avatar_updated_at: existing_avatar.2,
     };
 
     *state.profile.lock().await = Some(profile.clone());
@@ -169,6 +204,8 @@ pub async fn save_profile(
             "department": department,
             "software_version": profile.software_version,
             "mac_address": profile.mac_address,
+            "avatar_hash": profile.avatar_hash,
+            "avatar_updated_at": profile.avatar_updated_at,
         })
         .to_string();
 
@@ -209,6 +246,379 @@ pub async fn save_profile(
     }
 
     Ok(())
+}
+
+fn now_millis() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn echo_home_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home).join("Echo")
+}
+
+fn avatar_root_dir() -> std::path::PathBuf {
+    echo_home_dir().join("avatars")
+}
+
+fn sanitize_peer_id(peer_id: &str) -> String {
+    peer_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn avatar_extension(path: &str) -> Result<String, String> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" => Ok(ext),
+        _ => Err("请选择 png、jpg、jpeg、gif 或 webp 图片".to_string()),
+    }
+}
+
+fn image_bytes_match_extension(ext: &str, bytes: &[u8]) -> bool {
+    match ext {
+        "png" => bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+        "jpg" | "jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
+fn hash_avatar_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex::encode(digest)
+}
+
+fn validate_avatar_bytes(ext: &str, bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Err("头像文件为空".to_string());
+    }
+    if bytes.len() as u64 > AVATAR_MAX_BYTES {
+        return Err("头像不能超过 5MB".to_string());
+    }
+    if !image_bytes_match_extension(ext, bytes) {
+        return Err("头像文件内容与扩展名不匹配".to_string());
+    }
+    Ok(())
+}
+
+fn write_avatar_file(
+    owner_dir: std::path::PathBuf,
+    avatar_hash: &str,
+    ext: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    std::fs::create_dir_all(&owner_dir).map_err(|e| e.to_string())?;
+    let dest = owner_dir.join(format!("{}.{}", avatar_hash, ext));
+    std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
+    Ok(dest.to_string_lossy().to_string())
+}
+
+async fn notify_profile_updated_to_peers(state: &AppState, profile: &UserProfile) {
+    let runtime_opt = { state.runtime.read().await.clone() };
+    let Some(runtime) = runtime_opt.as_ref() else {
+        return;
+    };
+
+    let listen_port = runtime.listen_port;
+    let my_id = runtime.my_id.clone();
+    let online_peers = runtime.discovery.read().await.get_peers();
+    let stored = state.db.list_stored_peers().await.unwrap_or_default();
+    let mut targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in &online_peers {
+        targets.insert(p.id.clone());
+    }
+    for sp in &stored {
+        targets.insert(sp.peer_id.clone());
+    }
+    targets.remove(&my_id);
+    let target_ids: Vec<String> = targets.into_iter().collect();
+
+    let payload = serde_json::json!({
+        "username": profile.username,
+        "department": profile.department,
+        "software_version": profile.software_version,
+        "mac_address": profile.mac_address,
+        "avatar_hash": profile.avatar_hash,
+        "avatar_updated_at": profile.avatar_updated_at,
+    })
+    .to_string();
+
+    let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
+    send_or_queue_notification(
+        &state.db,
+        &online_peers,
+        &target_ids,
+        &my_id,
+        &profile.username,
+        &profile.department,
+        listen_port,
+        &payload,
+        "profile_updated",
+        None,
+        None,
+        &empty_dir,
+    )
+    .await;
+}
+
+#[tauri::command]
+pub async fn set_profile_avatar(
+    state: State<'_, AppState>,
+    source_path: String,
+) -> Result<AvatarInfo, String> {
+    let ext = avatar_extension(&source_path)?;
+    let metadata = std::fs::metadata(&source_path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("请选择头像图片文件".to_string());
+    }
+    if metadata.len() > AVATAR_MAX_BYTES {
+        return Err("头像不能超过 5MB".to_string());
+    }
+    let bytes = std::fs::read(&source_path).map_err(|e| e.to_string())?;
+    validate_avatar_bytes(&ext, &bytes)?;
+
+    let avatar_hash = hash_avatar_bytes(&bytes);
+    let avatar_path = write_avatar_file(avatar_root_dir().join("self"), &avatar_hash, &ext, &bytes)?;
+    let avatar_updated_at = now_millis();
+
+    state
+        .db
+        .update_user_avatar(&avatar_path, &avatar_hash, avatar_updated_at)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let updated_profile = {
+        let mut guard = state.profile.lock().await;
+        let Some(profile) = guard.as_mut() else {
+            return Err("应用尚未初始化用户信息".to_string());
+        };
+        profile.avatar_path = avatar_path.clone();
+        profile.avatar_hash = avatar_hash.clone();
+        profile.avatar_updated_at = avatar_updated_at;
+        profile.clone()
+    };
+
+    notify_profile_updated_to_peers(&state, &updated_profile).await;
+
+    Ok(AvatarInfo {
+        avatar_path,
+        avatar_hash,
+        avatar_updated_at,
+    })
+}
+
+#[tauri::command]
+pub async fn clear_profile_avatar(state: State<'_, AppState>) -> Result<AvatarInfo, String> {
+    let avatar_updated_at = now_millis();
+    state
+        .db
+        .update_user_avatar("", "", avatar_updated_at)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let updated_profile = {
+        let mut guard = state.profile.lock().await;
+        let Some(profile) = guard.as_mut() else {
+            return Err("应用尚未初始化用户信息".to_string());
+        };
+        profile.avatar_path.clear();
+        profile.avatar_hash.clear();
+        profile.avatar_updated_at = avatar_updated_at;
+        profile.clone()
+    };
+
+    notify_profile_updated_to_peers(&state, &updated_profile).await;
+
+    Ok(AvatarInfo {
+        avatar_path: String::new(),
+        avatar_hash: String::new(),
+        avatar_updated_at,
+    })
+}
+
+#[derive(Deserialize)]
+struct AvatarResponsePayload {
+    #[serde(default)]
+    avatar_hash: String,
+    #[serde(default)]
+    avatar_updated_at: i64,
+    #[serde(default)]
+    file_name: String,
+    #[serde(default)]
+    data: String,
+}
+
+fn decode_avatar_response_data(data: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| "头像数据解码失败".to_string())
+}
+
+#[tauri::command]
+pub async fn request_peer_avatar(
+    state: State<'_, AppState>,
+    peer_id: String,
+) -> Result<Option<StoredPeer>, String> {
+    let runtime = { state.runtime.read().await.clone() }
+        .ok_or_else(|| "应用尚未初始化".to_string())?;
+
+    let online_peer = runtime.discovery.read().await.get_peer(&peer_id);
+    let stored_peer = state
+        .db
+        .get_stored_peer(&peer_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let peer = if let Some(peer) = online_peer {
+        peer
+    } else if let Some(stored) = stored_peer.clone() {
+        Peer::new_with_avatar(
+            stored.peer_id.clone(),
+            stored.username.clone(),
+            stored.department.clone(),
+            stored.software_version.clone(),
+            stored.mac_address.clone(),
+            stored.avatar_path.clone(),
+            stored.avatar_hash.clone(),
+            stored.avatar_updated_at,
+            stored
+                .ip
+                .parse()
+                .map_err(|_| "无效的联系人 IP 地址".to_string())?,
+            stored.port,
+        )
+    } else {
+        return Ok(None);
+    };
+
+    if peer.avatar_hash.is_empty() {
+        return Ok(stored_peer);
+    }
+
+    let profile = state
+        .profile
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "应用尚未初始化用户信息".to_string())?;
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect(peer.address()),
+    )
+    .await
+    .map_err(|_| "请求头像超时".to_string())?
+    .map_err(|e| e.to_string())?;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let request = WireMessage {
+        sender_id: runtime.my_id.clone(),
+        sender_name: profile.username.clone(),
+        sender_department: profile.department.clone(),
+        sender_software_version: crate::profile_metadata::software_version(),
+        sender_mac_address: crate::profile_metadata::mac_address(),
+        sender_port: runtime.listen_port,
+        receiver_id: peer.id.clone(),
+        content: peer.avatar_hash.clone(),
+        msg_type: "avatar_request".to_string(),
+        file_name: None,
+        file_size: None,
+        file_data: None,
+        file_kind: None,
+        known_peers: Vec::new(),
+        group_id: None,
+    };
+    let json = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+    writer.write_all(json.as_bytes()).await.map_err(|e| e.to_string())?;
+    writer.write_all(b"\n").await.map_err(|e| e.to_string())?;
+    writer.flush().await.map_err(|e| e.to_string())?;
+
+    let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+        .await
+        .map_err(|_| "请求头像超时".to_string())?
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "对方未返回头像".to_string())?;
+    let msg: WireMessage = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+    if msg.msg_type != "avatar_response" {
+        return Err("对方返回了无效头像响应".to_string());
+    }
+    let payload: AvatarResponsePayload =
+        serde_json::from_str(&msg.content).map_err(|_| "头像响应格式错误".to_string())?;
+    if payload.avatar_hash != peer.avatar_hash || payload.data.is_empty() {
+        return Ok(stored_peer);
+    }
+
+    let bytes = decode_avatar_response_data(&payload.data)?;
+    let calculated_hash = hash_avatar_bytes(&bytes);
+    if calculated_hash != payload.avatar_hash {
+        return Err("头像校验失败".to_string());
+    }
+    let ext = avatar_extension(&payload.file_name)?;
+    validate_avatar_bytes(&ext, &bytes)?;
+
+    let avatar_path = write_avatar_file(
+        avatar_root_dir()
+            .join("peers")
+            .join(sanitize_peer_id(&peer.id)),
+        &payload.avatar_hash,
+        &ext,
+        &bytes,
+    )?;
+
+    state
+        .db
+        .upsert_peer_with_avatar(
+            &peer.id,
+            &peer.username,
+            &peer.department,
+            &peer.software_version,
+            &peer.mac_address,
+            &avatar_path,
+            &payload.avatar_hash,
+            payload.avatar_updated_at,
+            &peer.ip.to_string(),
+            peer.port,
+            true,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    runtime.discovery.read().await.register_peer(Peer::new_with_avatar(
+        peer.id.clone(),
+        peer.username,
+        peer.department,
+        peer.software_version,
+        peer.mac_address,
+        avatar_path,
+        payload.avatar_hash,
+        payload.avatar_updated_at,
+        peer.ip,
+        peer.port,
+    ));
+
+    state
+        .db
+        .get_stored_peer(&peer.id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -270,12 +680,15 @@ pub async fn refresh_peer_profile(
 
     state
         .db
-        .upsert_peer_with_profile(
+        .upsert_peer_with_avatar(
             &identity.peer_id,
             &identity.username,
             &identity.department,
             &identity.software_version,
             &identity.mac_address,
+            "",
+            &identity.avatar_hash,
+            identity.avatar_updated_at,
             &remote_ip,
             remote_port,
             true,
@@ -284,12 +697,15 @@ pub async fn refresh_peer_profile(
         .map_err(|e| e.to_string())?;
 
     if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
-        let peer = crate::discovery::Peer::new_with_profile(
+        let peer = crate::discovery::Peer::new_with_avatar(
             identity.peer_id.clone(),
             identity.username,
             identity.department,
             identity.software_version,
             identity.mac_address,
+            String::new(),
+            identity.avatar_hash,
+            identity.avatar_updated_at,
             parsed_ip,
             remote_port,
         );
@@ -609,6 +1025,8 @@ struct RemoteIdentity {
     department: String,
     software_version: String,
     mac_address: String,
+    avatar_hash: String,
+    avatar_updated_at: i64,
     ip: String,
     port: u16,
 }
@@ -665,12 +1083,26 @@ async fn probe_identity(
         return None;
     }
 
+    let avatar_payload: serde_json::Value =
+        serde_json::from_str(&msg.content).unwrap_or_else(|_| serde_json::Value::Null);
+    let avatar_hash = avatar_payload
+        .get("avatar_hash")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let avatar_updated_at = avatar_payload
+        .get("avatar_updated_at")
+        .and_then(|value| value.as_i64())
+        .unwrap_or_default();
+
     Some(RemoteIdentity {
         peer_id: msg.sender_id,
         username: msg.sender_name,
         department: msg.sender_department,
         software_version: msg.sender_software_version,
         mac_address: msg.sender_mac_address,
+        avatar_hash,
+        avatar_updated_at,
         ip: peer_addr
             .map(|addr| addr.ip().to_string())
             .unwrap_or_else(|| {
@@ -733,6 +1165,8 @@ pub async fn discover_by_ip(
                         "id": p.id, "username": p.username, "department": p.department,
                         "software_version": p.software_version,
                         "mac_address": p.mac_address,
+                        "avatar_hash": p.avatar_hash,
+                        "avatar_updated_at": p.avatar_updated_at,
                         "ip": p.ip.to_string(), "port": p.port,
                     })
                 })
@@ -748,6 +1182,8 @@ pub async fn discover_by_ip(
         "department": my_profile.as_ref().map(|p| p.department.as_str()).unwrap_or(""),
         "software_version": crate::profile_metadata::software_version(),
         "mac_address": crate::profile_metadata::mac_address(),
+        "avatar_hash": my_profile.as_ref().map(|p| p.avatar_hash.as_str()).unwrap_or(""),
+        "avatar_updated_at": my_profile.as_ref().map(|p| p.avatar_updated_at).unwrap_or_default(),
         "ip": "",
         "port": my_port,
         "known_peers": our_known,
@@ -781,12 +1217,15 @@ pub async fn discover_by_ip(
             identity.ip.clone()
         };
         let remote_parsed_ip = remote_ip.parse::<std::net::IpAddr>().unwrap_or(parsed_ip);
-        let peer = crate::discovery::Peer::new_with_profile(
+        let peer = crate::discovery::Peer::new_with_avatar(
             identity.peer_id.clone(),
             identity.username.clone(),
             identity.department.clone(),
             identity.software_version.clone(),
             identity.mac_address.clone(),
+            String::new(),
+            identity.avatar_hash.clone(),
+            identity.avatar_updated_at,
             remote_parsed_ip,
             remote_port,
         );
@@ -801,12 +1240,15 @@ pub async fn discover_by_ip(
 
         state
             .db
-            .upsert_peer_with_profile(
+            .upsert_peer_with_avatar(
                 &identity.peer_id,
                 &identity.username,
                 &identity.department,
                 &identity.software_version,
                 &identity.mac_address,
+                "",
+                &identity.avatar_hash,
+                identity.avatar_updated_at,
                 &remote_ip,
                 remote_port,
                 true,
@@ -2932,6 +3374,7 @@ async fn build_member_directory(
     let my_ip = local_ip_address::local_ip()
         .map(|ip| ip.to_string())
         .unwrap_or_default();
+    let self_avatar = db.get_user_profile().await.ok().flatten();
     let mut out = Vec::with_capacity(member_ids.len());
     for id in member_ids {
         if id == self_id {
@@ -2941,6 +3384,14 @@ async fn build_member_directory(
                 department: self_department.to_string(),
                 software_version: crate::profile_metadata::software_version(),
                 mac_address: crate::profile_metadata::mac_address(),
+                avatar_hash: self_avatar
+                    .as_ref()
+                    .map(|profile| profile.avatar_hash.clone())
+                    .unwrap_or_default(),
+                avatar_updated_at: self_avatar
+                    .as_ref()
+                    .map(|profile| profile.avatar_updated_at)
+                    .unwrap_or_default(),
                 ip: my_ip.clone(),
                 port: self_port,
             });
@@ -2953,6 +3404,8 @@ async fn build_member_directory(
                 department: p.department.clone(),
                 software_version: p.software_version.clone(),
                 mac_address: p.mac_address.clone(),
+                avatar_hash: p.avatar_hash.clone(),
+                avatar_updated_at: p.avatar_updated_at,
                 ip: p.ip.to_string(),
                 port: p.port,
             });
@@ -2965,6 +3418,8 @@ async fn build_member_directory(
                 department: sp.department,
                 software_version: sp.software_version,
                 mac_address: sp.mac_address,
+                avatar_hash: sp.avatar_hash,
+                avatar_updated_at: sp.avatar_updated_at,
                 ip: sp.ip,
                 port: sp.port,
             });
@@ -2976,6 +3431,8 @@ async fn build_member_directory(
                 department: String::new(),
                 software_version: String::new(),
                 mac_address: String::new(),
+                avatar_hash: String::new(),
+                avatar_updated_at: 0,
                 ip: String::new(),
                 port: 0,
             });

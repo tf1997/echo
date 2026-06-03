@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import type { Peer, ChatMessage, AppInfo, StoredPeer, UnreadCount, UpdateCheckResult } from "./types";
-import { ask, message } from "@tauri-apps/api/dialog";
+import { ask, message, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
+import { Avatar } from "./components/Avatar";
 import { applyTheme, getInitialTheme } from "./theme";
 import type { ThemeId } from "./theme";
 import {
@@ -20,6 +21,9 @@ import {
   checkPeerOnline,
   getDepartments,
   saveProfile,
+  setProfileAvatar,
+  clearProfileAvatar,
+  requestPeerAvatar,
   listStoredPeers,
   getUnreadCounts,
   getScanSubnets,
@@ -125,6 +129,9 @@ function App() {
   const [savingProfile, setSavingProfile] = useState(false);
   const [profileError, setProfileError] = useState("");
   const [editingProfile, setEditingProfile] = useState(false);
+  const [profileAvatarPath, setProfileAvatarPath] = useState("");
+  const [profileAvatarSourcePath, setProfileAvatarSourcePath] = useState<string | null>(null);
+  const [profileAvatarClearRequested, setProfileAvatarClearRequested] = useState(false);
   const [scanSubnets, setScanSubnetsState] = useState<string[]>([]);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [groups, setGroups] = useState<GroupInfo[]>([]);
@@ -147,6 +154,8 @@ function App() {
   const loadPeerStateInFlightRef = useRef(false);
   const activeConversationRef = useRef<ActiveConversation | null>(null);
   const selectionNonceRef = useRef(0);
+  const avatarRequestsRef = useRef(new Set<string>());
+  const avatarRequestAttemptsRef = useRef(new Set<string>());
 
   // Silent WAV (1 sample) — used only to unlock autoplay policy on first click
   const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
@@ -384,6 +393,9 @@ function App() {
         department: item.department,
         software_version: item.software_version ?? "",
         mac_address: item.mac_address ?? "",
+        avatar_path: item.avatar_path ?? "",
+        avatar_hash: item.avatar_hash ?? "",
+        avatar_updated_at: item.avatar_updated_at ?? 0,
         ip: item.ip,
         port: item.port,
         online: item.is_online || graceKey > now,
@@ -406,6 +418,12 @@ function App() {
       // Keep the stored conversation id stable for a known endpoint. Discovery can
       // report endpoint-shaped ids before DB identity migration catches up.
       const displayId = existingId ?? peer.id;
+      const nextAvatarHash = peer.avatar_hash || cachedPeer?.avatar_hash || "";
+      const nextAvatarUpdatedAt = peer.avatar_updated_at || cachedPeer?.avatar_updated_at || 0;
+      const cachedAvatarPath =
+        cachedPeer?.avatar_hash && cachedPeer.avatar_hash === nextAvatarHash
+          ? cachedPeer.avatar_path || ""
+          : "";
       endpointToId.set(endpointKey, displayId);
       if (peer.online) {
         onlineGraceUntilRef.current.set(displayId, now + onlineGraceMs);
@@ -416,6 +434,9 @@ function App() {
         department: peer.department || cachedPeer?.department || "",
         software_version: peer.software_version || cachedPeer?.software_version || "",
         mac_address: peer.mac_address || cachedPeer?.mac_address || "",
+        avatar_path: peer.avatar_path || cachedAvatarPath,
+        avatar_hash: nextAvatarHash,
+        avatar_updated_at: nextAvatarUpdatedAt,
         ip: peer.ip,
         port: peer.port,
         last_seen: peer.last_seen ?? cachedPeer?.last_seen,
@@ -498,6 +519,33 @@ function App() {
       clearInterval(interval);
     };
   }, [appInfo?.initialized, loadPeerState]);
+
+  useEffect(() => {
+    if (!appInfo?.initialized) return;
+
+    for (const peer of peers) {
+      const avatarHash = peer.avatar_hash?.trim();
+      if (!peer.online || !avatarHash || peer.avatar_path) continue;
+      const requestKey = `${peer.id}:${avatarHash}`;
+      if (avatarRequestsRef.current.has(requestKey) || avatarRequestAttemptsRef.current.has(requestKey)) {
+        continue;
+      }
+
+      avatarRequestsRef.current.add(requestKey);
+      avatarRequestAttemptsRef.current.add(requestKey);
+      requestPeerAvatar(peer.id)
+        .then((updated) => {
+          if (!updated) return;
+          return loadPeerState();
+        })
+        .catch((err) => {
+          console.debug("Avatar request failed:", err);
+        })
+        .finally(() => {
+          avatarRequestsRef.current.delete(requestKey);
+        });
+    }
+  }, [appInfo?.initialized, peers, loadPeerState]);
 
   const selectedPeerId = selectedPeer?.id ?? null;
 
@@ -734,6 +782,25 @@ function App() {
     return await sendSticker(selectedPeer.id, filePath, clientMsgId);
   }, [selectedPeer, selectedGroupId]);
 
+  const handlePickProfileAvatar = useCallback(async () => {
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp"] }],
+    });
+    if (typeof selected !== "string") return;
+    setProfileAvatarSourcePath(selected);
+    setProfileAvatarPath(selected);
+    setProfileAvatarClearRequested(false);
+    setProfileError("");
+  }, []);
+
+  const handleClearProfileAvatar = useCallback(() => {
+    setProfileAvatarSourcePath(null);
+    setProfileAvatarPath("");
+    setProfileAvatarClearRequested(true);
+    setProfileError("");
+  }, []);
+
   const handleSaveProfile = useCallback(async () => {
     const trimmedUser = username.trim();
     const trimmedDepartment = department.trim();
@@ -746,6 +813,11 @@ function App() {
     setProfileError("");
     try {
       await saveProfile({ username: trimmedUser, department: trimmedDepartment });
+      if (profileAvatarSourcePath) {
+        await setProfileAvatar(profileAvatarSourcePath);
+      } else if (profileAvatarClearRequested) {
+        await clearProfileAvatar();
+      }
       await loadMainData();
       setEditingProfile(false);
     } catch (err) {
@@ -754,12 +826,15 @@ function App() {
     } finally {
       setSavingProfile(false);
     }
-  }, [username, department, loadMainData]);
+  }, [username, department, profileAvatarSourcePath, profileAvatarClearRequested, loadMainData]);
 
   const openEditProfile = useCallback(() => {
     if (!appInfo) return;
     setUsername(appInfo.username);
     setDepartment(appInfo.department);
+    setProfileAvatarPath(appInfo.avatar_path || "");
+    setProfileAvatarSourcePath(null);
+    setProfileAvatarClearRequested(false);
     setProfileError("");
     setEditingProfile(true);
   }, [appInfo]);
@@ -860,6 +935,32 @@ function App() {
         <div className="w-full max-w-md bg-gray-800 border border-gray-700 rounded-2xl p-6 space-y-4">
           <h1 className="text-xl font-semibold">{appInfo?.initialized ? "编辑个人信息" : "首次启动设置"}</h1>
           <p className="text-sm text-gray-400">请填写用户名和部门，部门可使用已保存候选项。</p>
+          <div className="flex items-center gap-4">
+            <Avatar
+              name={username || "我"}
+              src={profileAvatarPath}
+              size="xl"
+              fallbackClassName="bg-indigo-500"
+            />
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <button
+                type="button"
+                onClick={handlePickProfileAvatar}
+                className="rounded-lg bg-gray-700 px-3 py-1.5 text-sm hover:bg-gray-600"
+              >
+                选择头像
+              </button>
+              {(profileAvatarPath || appInfo?.avatar_path) ? (
+                <button
+                  type="button"
+                  onClick={handleClearProfileAvatar}
+                  className="rounded-lg bg-gray-700 px-3 py-1.5 text-sm text-gray-300 hover:bg-gray-600"
+                >
+                  移除
+                </button>
+              ) : null}
+            </div>
+          </div>
           <div className="space-y-2">
             <label className="text-sm text-gray-300">用户名</label>
             <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="例如：张三" className="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-indigo-500" />
@@ -939,6 +1040,7 @@ function App() {
         myDepartment={appInfo.department}
         mySoftwareVersion={appInfo.software_version}
         myMacAddress={appInfo.mac_address}
+        myAvatarPath={appInfo.avatar_path}
         myIp={appInfo.my_ip}
         myPort={appInfo.listen_port}
         onEditProfile={openEditProfile}

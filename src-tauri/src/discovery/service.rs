@@ -18,6 +18,8 @@ pub struct DiscoveryConfig {
     pub department: String,
     pub software_version: String,
     pub mac_address: String,
+    pub avatar_hash: String,
+    pub avatar_updated_at: i64,
     pub listen_port: u16,
     pub scan_subnets: Vec<String>,
     /// Channel to forward UDP-relayed peers to async DB layer.
@@ -31,6 +33,8 @@ impl DiscoveryConfig {
         department: impl Into<String>,
         listen_port: u16,
         scan_subnets: Vec<String>,
+        avatar_hash: impl Into<String>,
+        avatar_updated_at: i64,
     ) -> Self {
         Self {
             peer_id: peer_id.into(),
@@ -38,6 +42,8 @@ impl DiscoveryConfig {
             department: department.into(),
             software_version: crate::profile_metadata::software_version(),
             mac_address: crate::profile_metadata::mac_address(),
+            avatar_hash: avatar_hash.into(),
+            avatar_updated_at,
             listen_port,
             scan_subnets,
             relay_tx: None,
@@ -109,6 +115,14 @@ impl DiscoveryService {
                 if !peer.mac_address.is_empty() {
                     existing.mac_address = peer.mac_address;
                 }
+                if peer.avatar_updated_at > existing.avatar_updated_at {
+                    existing.avatar_path = peer.avatar_path;
+                    existing.avatar_hash = peer.avatar_hash;
+                    existing.avatar_updated_at = peer.avatar_updated_at;
+                } else if existing.avatar_hash.is_empty() && !peer.avatar_hash.is_empty() {
+                    existing.avatar_hash = peer.avatar_hash;
+                    existing.avatar_updated_at = peer.avatar_updated_at;
+                }
             }
         } else {
             map.insert(
@@ -119,6 +133,9 @@ impl DiscoveryService {
                     department: peer.department,
                     software_version: peer.software_version,
                     mac_address: peer.mac_address,
+                    avatar_path: peer.avatar_path,
+                    avatar_hash: peer.avatar_hash,
+                    avatar_updated_at: peer.avatar_updated_at,
                     ip: peer.ip,
                     port: peer.port,
                     online: peer.online,
@@ -175,12 +192,15 @@ impl DiscoveryService {
         if false {
             let instance_name = format!("echo-{}", &self.config.peer_id.get(..8).unwrap_or("00000000"));
             let port_str = self.config.listen_port.to_string();
+            let avatar_updated_at_str = self.config.avatar_updated_at.to_string();
             let properties = vec![
                 ("id", self.config.peer_id.as_str()),
                 ("username", self.config.username.as_str()),
                 ("department", self.config.department.as_str()),
                 ("software_version", self.config.software_version.as_str()),
                 ("mac_address", self.config.mac_address.as_str()),
+                ("avatar_hash", self.config.avatar_hash.as_str()),
+                ("avatar_updated_at", avatar_updated_at_str.as_str()),
                 ("port", port_str.as_str()),
             ];
 
@@ -219,6 +239,8 @@ impl DiscoveryService {
             department: self.config.department.clone(),
             software_version: self.config.software_version.clone(),
             mac_address: self.config.mac_address.clone(),
+            avatar_hash: self.config.avatar_hash.clone(),
+            avatar_updated_at: self.config.avatar_updated_at,
             listen_port: self.config.listen_port,
             local_ip,
             scan_subnets: self.config.scan_subnets.clone(),
@@ -263,12 +285,15 @@ impl DiscoveryService {
 
         let instance_name = format!("echo-{}", &self.config.peer_id.get(..8).unwrap_or("00000000"));
         let port_str = self.config.listen_port.to_string();
+        let avatar_updated_at_str = self.config.avatar_updated_at.to_string();
         let properties = vec![
             ("id", self.config.peer_id.as_str()),
             ("username", username),
             ("department", department),
             ("software_version", self.config.software_version.as_str()),
             ("mac_address", self.config.mac_address.as_str()),
+            ("avatar_hash", self.config.avatar_hash.as_str()),
+            ("avatar_updated_at", avatar_updated_at_str.as_str()),
             ("port", port_str.as_str()),
         ];
 
@@ -361,6 +386,16 @@ impl DiscoveryService {
             .map(|v| v.val_str().to_string())
             .unwrap_or_default();
 
+        let avatar_hash = properties
+            .get("avatar_hash")
+            .map(|v| v.val_str().to_string())
+            .unwrap_or_default();
+
+        let avatar_updated_at = properties
+            .get("avatar_updated_at")
+            .and_then(|v| v.val_str().parse::<i64>().ok())
+            .unwrap_or_default();
+
         let port: u16 = properties
             .get("port")
             .and_then(|v| v.val_str().parse().ok())
@@ -374,12 +409,15 @@ impl DiscoveryService {
             }
         };
 
-        let peer = Peer::new_with_profile(
+        let peer = Peer::new_with_avatar(
             peer_id.clone(),
             username.clone(),
             department,
             software_version,
             mac_address,
+            String::new(),
+            avatar_hash,
+            avatar_updated_at,
             ip,
             port,
         );
@@ -397,6 +435,8 @@ impl DiscoveryService {
                     || existing.department != peer.department
                     || existing.software_version != peer.software_version
                     || existing.mac_address != peer.mac_address
+                    || existing.avatar_hash != peer.avatar_hash
+                    || existing.avatar_updated_at != peer.avatar_updated_at
                     || existing.ip != peer.ip
                     || existing.port != peer.port
                     || !existing.online
@@ -411,6 +451,9 @@ impl DiscoveryService {
                 department: peer.department.clone(),
                 software_version: peer.software_version.clone(),
                 mac_address: peer.mac_address.clone(),
+                avatar_path: String::new(),
+                avatar_hash: peer.avatar_hash.clone(),
+                avatar_updated_at: peer.avatar_updated_at,
                 ip: peer.ip,
                 port: peer.port,
                 online: true,

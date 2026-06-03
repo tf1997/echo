@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/tauri";
-import type { Peer, ChatMessage, AppInfo, SaveProfilePayload, StoredPeer, UnreadCount, UpdateCheckResult, DownloadUpdateResult } from "./types";
+import type { Peer, ChatMessage, AppInfo, SaveProfilePayload, StoredPeer, UnreadCount, UpdateCheckResult, DownloadUpdateResult, AvatarInfo } from "./types";
 
 export async function getAppInfo(): Promise<AppInfo> {
   return await invoke("get_app_info");
@@ -11,6 +11,18 @@ export async function getDepartments(): Promise<string[]> {
 
 export async function saveProfile(payload: SaveProfilePayload): Promise<void> {
   await invoke("save_profile", { payload });
+}
+
+export async function setProfileAvatar(sourcePath: string): Promise<AvatarInfo> {
+  return await invoke("set_profile_avatar", { sourcePath });
+}
+
+export async function clearProfileAvatar(): Promise<AvatarInfo> {
+  return await invoke("clear_profile_avatar");
+}
+
+export async function requestPeerAvatar(peerId: string): Promise<StoredPeer | null> {
+  return await invoke("request_peer_avatar", { peerId });
 }
 
 export async function listStoredPeers(): Promise<StoredPeer[]> {

@@ -3,6 +3,7 @@ import type { ChatMessage, Peer } from "../types";
 import type { GroupInfo } from "../api";
 import { MessageBubble, DateDivider } from "./MessageBubble";
 import { HistorySearchView } from "./HistorySearchView";
+import { Avatar } from "./Avatar";
 import { formatDateLabel, makeSearchHitId } from "./messageUtils";
 import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, sendMessage, sendMessageTyped, sendFile, sendSticker, sendGroupMessage, sendGroupMessageTyped, sendGroupFile, sendGroupSticker, renameGroup, leaveGroup, dissolveGroup, inviteToGroup, readFileBase64, pauseFileTransfer, resumeFileTransfer, cancelFileTransfer } from "../api";
 import type { ForwardCardData } from "./MessageBubble";
@@ -257,9 +258,7 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
           {filteredPeers.map((p) => (
             <button key={p.id} onClick={() => forward(p.id, false)} disabled={!!sending}
               className="w-full flex items-center gap-3 px-4 py-2 hover:bg-gray-700 text-left disabled:opacity-60">
-              <div className="w-8 h-8 rounded-full bg-gray-600 flex items-center justify-center text-sm font-medium text-white flex-shrink-0">
-                {p.username.charAt(0).toUpperCase()}
-              </div>
+              <Avatar name={p.username} src={p.avatar_path} size="sm" online={p.online} />
               <div className="flex-1 min-w-0">
                 <p className="text-sm text-gray-200 truncate">{p.username}</p>
                 {!p.online && <p className="text-[10px] text-gray-500">离线</p>}
@@ -1138,14 +1137,13 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       )}
 
       <div className="chat-header flex items-center gap-3 px-5 py-3 bg-gray-900/80 border-b border-gray-700 backdrop-blur">
-        <div className="relative">
-          <div className={`w-9 h-9 rounded-full flex items-center justify-center text-sm font-medium text-white ${isGroup ? "bg-indigo-700 text-base" : "bg-gray-600"}`}>
-            {isGroup ? "👥" : peer.username.charAt(0).toUpperCase()}
+        {isGroup ? (
+          <div className="relative flex-shrink-0">
+            <div className="w-9 h-9 rounded-full flex items-center justify-center text-base text-white bg-indigo-700">👥</div>
           </div>
-          {!isGroup && (
-            <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-gray-900 ${peer.online ? "bg-green-400" : "bg-gray-500"}`} />
-          )}
-        </div>
+        ) : (
+          <Avatar name={peer.username} src={peer.avatar_path} size="md" online={peer.online} />
+        )}
         <div className="flex-1 min-w-0">
           <p className="text-white text-sm font-semibold truncate">{peer.username}</p>
           <p className="text-xs text-gray-400">{isGroup ? "群聊" : (peer.online ? `${peer.ip}:${peer.port}` : "离线")}</p>
@@ -1570,16 +1568,13 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                 const displayName = m.peer_id === myId ? (myName || m.username || "我") : (m.username || m.peer_id);
                 return (
                   <div key={m.peer_id} className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-gray-800/70">
-                    <div className="w-7 h-7 rounded-full bg-gray-600 flex items-center justify-center text-xs font-medium text-white flex-shrink-0">
-                      {displayName.charAt(0).toUpperCase()}
-                    </div>
+                    <Avatar name={displayName} src={m.avatar_path} size="xs" online={m.peer_id === myId || m.is_online} />
                     <div className="flex-1 min-w-0">
                       <p className="text-xs text-gray-200 truncate" title={displayName}>{displayName}{m.peer_id === myId ? " (我)" : ""}</p>
                       <p className="text-[10px] text-gray-500 truncate">
                         {groupInfo.creator_id === m.peer_id ? "群主" : (m.department || "成员")}
                       </p>
                     </div>
-                    <span className={`w-2 h-2 rounded-full flex-shrink-0 ${m.peer_id === myId ? "bg-green-400" : m.is_online ? "bg-green-400" : "bg-gray-600"}`} title={m.peer_id === myId || m.is_online ? "在线" : "离线"} />
                   </div>
                 );
               })}
@@ -1617,14 +1612,11 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                   disabled={!!groupActionBusy}
                   className="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-gray-800 disabled:opacity-50"
                 >
-                  <div className="w-7 h-7 rounded-full bg-gray-700 flex items-center justify-center text-xs font-medium text-white flex-shrink-0">
-                    {candidate.username.charAt(0).toUpperCase()}
-                  </div>
+                  <Avatar name={candidate.username} src={candidate.avatar_path} size="xs" online={candidate.online} />
                   <div className="flex-1 min-w-0">
                     <p className="text-xs text-gray-200 truncate" title={candidate.username}>{candidate.username}</p>
                     <p className="text-[10px] text-gray-500 truncate">{candidate.department || `${candidate.ip}:${candidate.port}`}</p>
                   </div>
-                  <span className={`w-2 h-2 rounded-full flex-shrink-0 ${candidate.online ? "bg-green-400" : "bg-gray-600"}`} title={candidate.online ? "在线" : "离线"} />
                   <span className="text-[10px] text-indigo-300 flex-shrink-0">{groupActionBusy === "invite" ? "邀请中" : "邀请"}</span>
                 </button>
               ))}

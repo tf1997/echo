@@ -12,6 +12,10 @@ pub struct PeerEntry {
     pub software_version: String,
     #[serde(default)]
     pub mac_address: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub avatar_hash: String,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub avatar_updated_at: i64,
     pub ip: String,
     pub port: u16,
 }
@@ -26,6 +30,12 @@ pub struct Peer {
     pub software_version: String,
     #[serde(default)]
     pub mac_address: String,
+    #[serde(default)]
+    pub avatar_path: String,
+    #[serde(default)]
+    pub avatar_hash: String,
+    #[serde(default)]
+    pub avatar_updated_at: i64,
     pub ip: IpAddr,
     pub port: u16,
     pub online: bool,
@@ -46,6 +56,32 @@ impl Peer {
         ip: IpAddr,
         port: u16,
     ) -> Self {
+        Self::new_with_avatar(
+            id,
+            username,
+            department,
+            software_version,
+            mac_address,
+            String::new(),
+            String::new(),
+            0,
+            ip,
+            port,
+        )
+    }
+
+    pub fn new_with_avatar(
+        id: String,
+        username: String,
+        department: String,
+        software_version: String,
+        mac_address: String,
+        avatar_path: String,
+        avatar_hash: String,
+        avatar_updated_at: i64,
+        ip: IpAddr,
+        port: u16,
+    ) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -56,6 +92,9 @@ impl Peer {
             department,
             software_version,
             mac_address,
+            avatar_path,
+            avatar_hash,
+            avatar_updated_at,
             ip,
             port,
             online: true,
@@ -80,12 +119,59 @@ impl Peer {
         online: bool,
         last_seen: i64,
     ) -> Self {
-        Self { id, username, department, software_version, mac_address, ip, port, online, last_seen }
+        Self::with_online_avatar(
+            id,
+            username,
+            department,
+            software_version,
+            mac_address,
+            String::new(),
+            String::new(),
+            0,
+            ip,
+            port,
+            online,
+            last_seen,
+        )
+    }
+
+    pub fn with_online_avatar(
+        id: String,
+        username: String,
+        department: String,
+        software_version: String,
+        mac_address: String,
+        avatar_path: String,
+        avatar_hash: String,
+        avatar_updated_at: i64,
+        ip: IpAddr,
+        port: u16,
+        online: bool,
+        last_seen: i64,
+    ) -> Self {
+        Self {
+            id,
+            username,
+            department,
+            software_version,
+            mac_address,
+            avatar_path,
+            avatar_hash,
+            avatar_updated_at,
+            ip,
+            port,
+            online,
+            last_seen,
+        }
     }
 
     pub fn address(&self) -> String {
         format!("{}:{}", self.ip, self.port)
     }
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
 }
 
 impl fmt::Display for Peer {

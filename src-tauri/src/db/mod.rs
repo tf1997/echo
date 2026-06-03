@@ -11,6 +11,12 @@ pub struct UserProfile {
     pub department: String,
     pub software_version: String,
     pub mac_address: String,
+    #[serde(default)]
+    pub avatar_path: String,
+    #[serde(default)]
+    pub avatar_hash: String,
+    #[serde(default)]
+    pub avatar_updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +76,12 @@ pub struct StoredPeer {
     pub department: String,
     pub software_version: String,
     pub mac_address: String,
+    #[serde(default)]
+    pub avatar_path: String,
+    #[serde(default)]
+    pub avatar_hash: String,
+    #[serde(default)]
+    pub avatar_updated_at: i64,
     pub ip: String,
     pub port: u16,
     pub is_online: bool,
@@ -176,7 +188,10 @@ impl Database {
                 username TEXT NOT NULL,
                 department TEXT NOT NULL,
                 software_version TEXT NOT NULL DEFAULT '',
-                mac_address TEXT NOT NULL DEFAULT ''
+                mac_address TEXT NOT NULL DEFAULT '',
+                avatar_path TEXT NOT NULL DEFAULT '',
+                avatar_hash TEXT NOT NULL DEFAULT '',
+                avatar_updated_at INTEGER NOT NULL DEFAULT 0
             )",
         )
         .execute(&self.pool)
@@ -226,6 +241,39 @@ impl Database {
             }
         }
 
+        if let Err(error) =
+            sqlx::query("ALTER TABLE user_profile ADD COLUMN avatar_path TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add avatar_path column to user_profile");
+            }
+        }
+
+        if let Err(error) =
+            sqlx::query("ALTER TABLE user_profile ADD COLUMN avatar_hash TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add avatar_hash column to user_profile");
+            }
+        }
+
+        if let Err(error) =
+            sqlx::query("ALTER TABLE user_profile ADD COLUMN avatar_updated_at INTEGER NOT NULL DEFAULT 0")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add avatar_updated_at column to user_profile");
+            }
+        }
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS peers (
                 peer_id TEXT PRIMARY KEY,
@@ -233,6 +281,9 @@ impl Database {
                 department TEXT NOT NULL,
                 software_version TEXT NOT NULL DEFAULT '',
                 mac_address TEXT NOT NULL DEFAULT '',
+                avatar_path TEXT NOT NULL DEFAULT '',
+                avatar_hash TEXT NOT NULL DEFAULT '',
+                avatar_updated_at INTEGER NOT NULL DEFAULT 0,
                 ip TEXT NOT NULL,
                 port INTEGER NOT NULL,
                 is_online INTEGER NOT NULL DEFAULT 1,
@@ -263,6 +314,39 @@ impl Database {
             let message = error.to_string();
             if !message.contains("duplicate column name") {
                 return Err(error).context("Failed to add mac_address column to peers");
+            }
+        }
+
+        if let Err(error) =
+            sqlx::query("ALTER TABLE peers ADD COLUMN avatar_path TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add avatar_path column to peers");
+            }
+        }
+
+        if let Err(error) =
+            sqlx::query("ALTER TABLE peers ADD COLUMN avatar_hash TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add avatar_hash column to peers");
+            }
+        }
+
+        if let Err(error) =
+            sqlx::query("ALTER TABLE peers ADD COLUMN avatar_updated_at INTEGER NOT NULL DEFAULT 0")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add avatar_updated_at column to peers");
             }
         }
 
@@ -474,6 +558,9 @@ impl Database {
                     COALESCE(p.department, '') as department,
                     COALESCE(p.software_version, '') as software_version,
                     COALESCE(p.mac_address, '') as mac_address,
+                    COALESCE(p.avatar_path, '') as avatar_path,
+                    COALESCE(p.avatar_hash, '') as avatar_hash,
+                    COALESCE(p.avatar_updated_at, 0) as avatar_updated_at,
                     COALESCE(p.ip, '') as ip, COALESCE(p.port, 0) as port,
                     COALESCE(p.is_online, 0) as is_online,
                     COALESCE(p.first_seen_at, '') as first_seen_at,
@@ -501,6 +588,9 @@ impl Database {
             department: r.get("department"),
             software_version: r.get("software_version"),
             mac_address: r.get("mac_address"),
+            avatar_path: r.get("avatar_path"),
+            avatar_hash: r.get("avatar_hash"),
+            avatar_updated_at: r.get("avatar_updated_at"),
             ip: r.get("ip"),
             port: r.get::<i64, _>("port") as u16,
             is_online: r.get::<bool, _>("is_online"),
@@ -519,7 +609,7 @@ impl Database {
 
 
     pub async fn get_user_profile(&self) -> Result<Option<UserProfile>> {
-        let row = sqlx::query("SELECT peer_id, username, department, software_version, mac_address FROM user_profile WHERE id = 1")
+        let row = sqlx::query("SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at FROM user_profile WHERE id = 1")
             .fetch_optional(&self.pool)
             .await
             .context("Failed to load user profile")?;
@@ -530,6 +620,9 @@ impl Database {
             department: row.get("department"),
             software_version: row.try_get("software_version").unwrap_or_default(),
             mac_address: row.try_get("mac_address").unwrap_or_default(),
+            avatar_path: row.try_get("avatar_path").unwrap_or_default(),
+            avatar_hash: row.try_get("avatar_hash").unwrap_or_default(),
+            avatar_updated_at: row.try_get("avatar_updated_at").unwrap_or_default(),
         }))
     }
 
@@ -560,6 +653,26 @@ impl Database {
         .await
         .context("Failed to save user profile")?;
 
+        Ok(())
+    }
+
+    pub async fn update_user_avatar(
+        &self,
+        avatar_path: &str,
+        avatar_hash: &str,
+        avatar_updated_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE user_profile
+             SET avatar_path = ?, avatar_hash = ?, avatar_updated_at = ?
+             WHERE id = 1",
+        )
+        .bind(avatar_path)
+        .bind(avatar_hash)
+        .bind(avatar_updated_at)
+        .execute(&self.pool)
+        .await
+        .context("Failed to update user avatar")?;
         Ok(())
     }
 
@@ -823,6 +936,9 @@ impl Database {
                     COALESCE(NULLIF(p.department, ''), up.department, '') AS department,
                     COALESCE(NULLIF(p.software_version, ''), up.software_version, '') AS software_version,
                     COALESCE(NULLIF(p.mac_address, ''), up.mac_address, '') AS mac_address,
+                    COALESCE(NULLIF(p.avatar_path, ''), up.avatar_path, '') AS avatar_path,
+                    COALESCE(NULLIF(p.avatar_hash, ''), up.avatar_hash, '') AS avatar_hash,
+                    COALESCE(NULLIF(p.avatar_updated_at, 0), up.avatar_updated_at, 0) AS avatar_updated_at,
                     COALESCE(p.ip, '') AS ip,
                     COALESCE(p.port, 0) AS port,
                     COALESCE(p.is_online, 0) AS is_online,
@@ -842,6 +958,9 @@ impl Database {
                 department: r.try_get("department").unwrap_or_default(),
                 software_version: r.try_get("software_version").unwrap_or_default(),
                 mac_address: r.try_get("mac_address").unwrap_or_default(),
+                avatar_path: r.try_get("avatar_path").unwrap_or_default(),
+                avatar_hash: r.try_get("avatar_hash").unwrap_or_default(),
+                avatar_updated_at: r.try_get("avatar_updated_at").unwrap_or_default(),
                 ip: r.try_get("ip").unwrap_or_default(),
                 port: r.try_get::<i64, _>("port").unwrap_or(0) as u16,
                 // Treat self as always online — UI uses this to render the green dot.
@@ -1010,6 +1129,36 @@ impl Database {
         port: u16,
         is_online: bool,
     ) -> Result<()> {
+        self.upsert_peer_with_avatar(
+            peer_id,
+            username,
+            department,
+            software_version,
+            mac_address,
+            "",
+            "",
+            0,
+            ip,
+            port,
+            is_online,
+        )
+        .await
+    }
+
+    pub async fn upsert_peer_with_avatar(
+        &self,
+        peer_id: &str,
+        username: &str,
+        department: &str,
+        software_version: &str,
+        mac_address: &str,
+        avatar_path: &str,
+        avatar_hash: &str,
+        avatar_updated_at: i64,
+        ip: &str,
+        port: u16,
+        is_online: bool,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
 
         let endpoint_duplicates = sqlx::query("SELECT peer_id FROM peers WHERE ip = ? AND port = ? AND peer_id <> ?")
@@ -1061,13 +1210,28 @@ impl Database {
         // empty values — system messages (group_created, group_dissolved, group_member_left)
         // historically carried empty sender_name and would otherwise wipe good peer data.
         sqlx::query(
-            "INSERT INTO peers (peer_id, username, department, software_version, mac_address, ip, port, is_online, first_seen_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO peers (peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(peer_id) DO UPDATE SET
                 username = CASE WHEN excluded.username = '' THEN peers.username ELSE excluded.username END,
                 department = CASE WHEN excluded.department = '' THEN peers.department ELSE excluded.department END,
                 software_version = CASE WHEN excluded.software_version = '' THEN peers.software_version ELSE excluded.software_version END,
                 mac_address = CASE WHEN excluded.mac_address = '' THEN peers.mac_address ELSE excluded.mac_address END,
+                avatar_path = CASE
+                    WHEN excluded.avatar_path <> '' THEN excluded.avatar_path
+                    WHEN excluded.avatar_updated_at > peers.avatar_updated_at THEN excluded.avatar_path
+                    ELSE peers.avatar_path
+                END,
+                avatar_hash = CASE
+                    WHEN excluded.avatar_updated_at > peers.avatar_updated_at THEN excluded.avatar_hash
+                    WHEN peers.avatar_hash = '' AND excluded.avatar_hash <> '' THEN excluded.avatar_hash
+                    ELSE peers.avatar_hash
+                END,
+                avatar_updated_at = CASE
+                    WHEN excluded.avatar_updated_at > peers.avatar_updated_at THEN excluded.avatar_updated_at
+                    WHEN peers.avatar_hash = '' AND excluded.avatar_hash <> '' THEN excluded.avatar_updated_at
+                    ELSE peers.avatar_updated_at
+                END,
                 ip = excluded.ip,
                 port = excluded.port,
                 is_online = excluded.is_online,
@@ -1078,6 +1242,9 @@ impl Database {
         .bind(department)
         .bind(software_version)
         .bind(mac_address)
+        .bind(avatar_path)
+        .bind(avatar_hash)
+        .bind(avatar_updated_at)
         .bind(ip)
         .bind(port as i64)
         .bind(if is_online { 1 } else { 0 })
@@ -1184,7 +1351,7 @@ impl Database {
 
     pub async fn list_stored_peers(&self) -> Result<Vec<StoredPeer>> {
         let rows = sqlx::query(
-            "SELECT peer_id, username, department, software_version, mac_address, ip, port, is_online, first_seen_at, last_seen_at
+            "SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at
              FROM peers
              ORDER BY is_online DESC, last_seen_at DESC",
         )
@@ -1200,6 +1367,9 @@ impl Database {
                 department: row.get("department"),
                 software_version: row.get("software_version"),
                 mac_address: row.get("mac_address"),
+                avatar_path: row.get("avatar_path"),
+                avatar_hash: row.get("avatar_hash"),
+                avatar_updated_at: row.get("avatar_updated_at"),
                 ip: row.get("ip"),
                 port: row.get::<i64, _>("port") as u16,
                 is_online: row.get::<bool, _>("is_online"),
@@ -1211,7 +1381,7 @@ impl Database {
 
     pub async fn get_stored_peer(&self, peer_id: &str) -> Result<Option<StoredPeer>> {
         let row = sqlx::query(
-            "SELECT peer_id, username, department, software_version, mac_address, ip, port, is_online, first_seen_at, last_seen_at
+            "SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at
              FROM peers
              WHERE peer_id = ?",
         )
@@ -1226,6 +1396,9 @@ impl Database {
             department: row.get("department"),
             software_version: row.get("software_version"),
             mac_address: row.get("mac_address"),
+            avatar_path: row.get("avatar_path"),
+            avatar_hash: row.get("avatar_hash"),
+            avatar_updated_at: row.get("avatar_updated_at"),
             ip: row.get("ip"),
             port: row.get::<i64, _>("port") as u16,
             is_online: row.get::<bool, _>("is_online"),
@@ -1236,7 +1409,7 @@ impl Database {
 
     pub async fn find_peer_by_identity(&self, username: &str, department: &str) -> Result<Option<StoredPeer>> {
         let row = sqlx::query(
-            "SELECT peer_id, username, department, software_version, mac_address, ip, port, is_online, first_seen_at, last_seen_at
+            "SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at
              FROM peers
              WHERE username = ? AND department = ?
              ORDER BY is_online DESC, last_seen_at DESC
@@ -1254,6 +1427,9 @@ impl Database {
             department: row.get("department"),
             software_version: row.get("software_version"),
             mac_address: row.get("mac_address"),
+            avatar_path: row.get("avatar_path"),
+            avatar_hash: row.get("avatar_hash"),
+            avatar_updated_at: row.get("avatar_updated_at"),
             ip: row.get("ip"),
             port: row.get::<i64, _>("port") as u16,
             is_online: row.get::<bool, _>("is_online"),
