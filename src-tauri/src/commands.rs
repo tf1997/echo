@@ -1,19 +1,14 @@
 use log::{error, info};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
 use std::sync::Arc;
+use tauri::{AppHandle, Manager, State};
 
 use crate::chat::{
-    cancel_outgoing_file_transfer,
-    clear_outgoing_file_transfer,
-    pause_outgoing_file_transfer,
-    register_outgoing_file_transfer,
-    resume_outgoing_file_transfer,
-    send_file_in_background_with_kind,
-    wait_for_outgoing_file_transfer,
-    WireMessage,
-    FILE_CHUNK_SIZE,
-    FILE_TRANSFER_CANCELLED_MESSAGE,
+    base64_encode_into, base64_encoded_capacity, cancel_outgoing_file_transfer,
+    clear_outgoing_file_transfer, pause_outgoing_file_transfer, register_outgoing_file_transfer,
+    resume_outgoing_file_transfer, send_file_in_background_with_kind,
+    serialize_file_wire_message_line, wait_for_outgoing_file_transfer, FileWireMessageLine,
+    WireMessage, FILE_CHUNK_SIZE, FILE_SOCKET_BUFFER_SIZE, FILE_TRANSFER_CANCELLED_MESSAGE,
 };
 use crate::db::{ChatMessage, StoredPeer, UnreadCount, UserProfile};
 use crate::discovery::Peer;
@@ -76,7 +71,11 @@ pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String>
 
 #[tauri::command]
 pub async fn get_departments(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let mut departments = state.db.get_departments().await.map_err(|e| e.to_string())?;
+    let mut departments = state
+        .db
+        .get_departments()
+        .await
+        .map_err(|e| e.to_string())?;
 
     if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
         let peers = runtime.discovery.read().await.get_peers();
@@ -156,8 +155,12 @@ pub async fn save_profile(
 
         let stored = state.db.list_stored_peers().await.unwrap_or_default();
         let mut targets: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for p in &online_peers { targets.insert(p.id.clone()); }
-        for sp in &stored { targets.insert(sp.peer_id.clone()); }
+        for p in &online_peers {
+            targets.insert(p.id.clone());
+        }
+        for sp in &stored {
+            targets.insert(sp.peer_id.clone());
+        }
         targets.remove(&my_id);
         let target_ids: Vec<String> = targets.into_iter().collect();
 
@@ -166,14 +169,25 @@ pub async fn save_profile(
             "department": department,
             "software_version": profile.software_version,
             "mac_address": profile.mac_address,
-        }).to_string();
+        })
+        .to_string();
 
         let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
         send_or_queue_notification(
-            &state.db, &online_peers, &target_ids,
-            &my_id, username, department, listen_port,
-            &payload, "profile_updated", None, None, &empty_dir,
-        ).await;
+            &state.db,
+            &online_peers,
+            &target_ids,
+            &my_id,
+            username,
+            department,
+            listen_port,
+            &payload,
+            "profile_updated",
+            None,
+            None,
+            &empty_dir,
+        )
+        .await;
     } else {
         let listen_port = std::env::var("ECHO_PORT")
             .ok()
@@ -182,9 +196,15 @@ pub async fn save_profile(
 
         let profile = state.profile.lock().await.clone().unwrap();
         let relay_tx = state.relay_tx.clone();
-        let runtime = RuntimeServices::start(app_handle, state.db.clone(), &profile, listen_port, relay_tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        let runtime = RuntimeServices::start(
+            app_handle,
+            state.db.clone(),
+            &profile,
+            listen_port,
+            relay_tx,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         *state.runtime.write().await = Some(Arc::new(runtime));
     }
 
@@ -193,7 +213,11 @@ pub async fn save_profile(
 
 #[tauri::command]
 pub async fn list_stored_peers(state: State<'_, AppState>) -> Result<Vec<StoredPeer>, String> {
-    state.db.list_stored_peers().await.map_err(|e| e.to_string())
+    state
+        .db
+        .list_stored_peers()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -221,7 +245,8 @@ pub async fn refresh_peer_profile(
         .unwrap_or("");
 
     let addr = format!("{}:{}", ip, port);
-    let Some(identity) = probe_identity(&addr, &my_id, my_name, my_department, my_port).await else {
+    let Some(identity) = probe_identity(&addr, &my_id, my_name, my_department, my_port).await
+    else {
         return state
             .db
             .get_stored_peer(&peer_id)
@@ -229,8 +254,16 @@ pub async fn refresh_peer_profile(
             .map_err(|e| e.to_string());
     };
 
-    let remote_port = if identity.port == 0 { port } else { identity.port };
-    let remote_ip = if identity.ip.is_empty() { ip } else { identity.ip };
+    let remote_port = if identity.port == 0 {
+        port
+    } else {
+        identity.port
+    };
+    let remote_ip = if identity.ip.is_empty() {
+        ip
+    } else {
+        identity.ip
+    };
     let parsed_ip = remote_ip
         .parse::<std::net::IpAddr>()
         .map_err(|_| "无效的联系人 IP 地址".to_string())?;
@@ -318,7 +351,10 @@ pub async fn send_message_typed(
             stored_peer.department,
             stored_peer.software_version,
             stored_peer.mac_address,
-            stored_peer.ip.parse().map_err(|_| "无效的联系人 IP 地址".to_string())?,
+            stored_peer
+                .ip
+                .parse()
+                .map_err(|_| "无效的联系人 IP 地址".to_string())?,
             stored_peer.port,
         )
     } else {
@@ -341,7 +377,16 @@ pub async fn send_file(
     file_name: Option<String>,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_file_with_kind(app_handle, state, peer_id, file_path, file_name, "file", client_msg_id).await
+    send_file_with_kind(
+        app_handle,
+        state,
+        peer_id,
+        file_path,
+        file_name,
+        "file",
+        client_msg_id,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -353,7 +398,16 @@ pub async fn send_sticker(
     file_name: Option<String>,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_file_with_kind(app_handle, state, peer_id, file_path, file_name, "sticker", client_msg_id).await
+    send_file_with_kind(
+        app_handle,
+        state,
+        peer_id,
+        file_path,
+        file_name,
+        "sticker",
+        client_msg_id,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -417,7 +471,10 @@ async fn send_file_with_kind(
             stored_peer.department,
             stored_peer.software_version,
             stored_peer.mac_address,
-            stored_peer.ip.parse().map_err(|_| "无效的联系人 IP 地址".to_string())?,
+            stored_peer
+                .ip
+                .parse()
+                .map_err(|_| "无效的联系人 IP 地址".to_string())?,
             stored_peer.port,
             stored_peer.is_online,
             last_seen,
@@ -434,7 +491,14 @@ async fn send_file_with_kind(
     // Clone what we need and release the chat lock immediately
     let (my_id, my_name, my_department, listen_port, db, peers_arc) = {
         let chat = runtime.chat.lock().await;
-        (chat.my_id().to_string(), chat.my_name().to_string(), chat.my_department().to_string(), chat.listen_port(), chat.db().clone(), chat.peers().clone())
+        (
+            chat.my_id().to_string(),
+            chat.my_name().to_string(),
+            chat.my_department().to_string(),
+            chat.listen_port(),
+            chat.db().clone(),
+            chat.peers().clone(),
+        )
     };
     let _ = runtime;
 
@@ -468,28 +532,53 @@ async fn send_file_with_kind(
     register_outgoing_file_transfer(event_client_msg_id.as_deref()).await;
     tauri::async_runtime::spawn(async move {
         let clear_client_msg_id = event_client_msg_id.clone();
-        match send_file_in_background_with_kind(&bg_path, &bg_name, &bg_peer, my_id, my_name, my_department, listen_port, db, peers_arc, handle, bg_client_msg_id, &bg_kind).await {
+        match send_file_in_background_with_kind(
+            &bg_path,
+            &bg_name,
+            &bg_peer,
+            my_id,
+            my_name,
+            my_department,
+            listen_port,
+            db,
+            peers_arc,
+            handle,
+            bg_client_msg_id,
+            &bg_kind,
+        )
+        .await
+        {
             Ok(msg) => info!("File sent: {}", msg.content),
             Err(e) => {
                 error!("File send failed: {}", e);
-                let _ = error_handle.emit_all("file-error", serde_json::json!({
-                    "fileName": bg_name,
-                    "clientMsgId": event_client_msg_id.as_deref(),
-                    "error": e.to_string(),
-                }));
+                let _ = error_handle.emit_all(
+                    "file-error",
+                    serde_json::json!({
+                        "fileName": bg_name,
+                        "clientMsgId": event_client_msg_id.as_deref(),
+                        "error": e.to_string(),
+                    }),
+                );
             }
         }
         clear_outgoing_file_transfer(clear_client_msg_id.as_deref()).await;
     });
 
-    let msg_kind = if file_kind == "sticker" { "sticker" } else { "file" };
+    let msg_kind = if file_kind == "sticker" {
+        "sticker"
+    } else {
+        "file"
+    };
     let content = if msg_kind == "sticker" {
         "[表情]".to_string()
     } else {
         format!("📎 {}", file_name)
     };
 
-    info!("send_file: returning placeholder ({:?} total)", t0.elapsed());
+    info!(
+        "send_file: returning placeholder ({:?} total)",
+        t0.elapsed()
+    );
     use chrono::Utc;
     Ok(ChatMessage {
         id: 0,
@@ -584,7 +673,11 @@ async fn probe_identity(
         mac_address: msg.sender_mac_address,
         ip: peer_addr
             .map(|addr| addr.ip().to_string())
-            .unwrap_or_else(|| addr.rsplit_once(':').map(|(ip, _)| ip.to_string()).unwrap_or_default()),
+            .unwrap_or_else(|| {
+                addr.rsplit_once(':')
+                    .map(|(ip, _)| ip.to_string())
+                    .unwrap_or_default()
+            }),
         port: msg.sender_port,
     })
 }
@@ -628,16 +721,25 @@ pub async fn discover_by_ip(
     let our_known: Vec<serde_json::Value> = {
         let runtime_opt = { state.runtime.read().await.clone() };
         if let Some(runtime) = runtime_opt.as_ref() {
-            runtime.discovery.read().await.get_peers().into_iter()
+            runtime
+                .discovery
+                .read()
+                .await
+                .get_peers()
+                .into_iter()
                 .filter(|p| p.online)
-                .map(|p| serde_json::json!({
-                    "id": p.id, "username": p.username, "department": p.department,
-                    "software_version": p.software_version,
-                    "mac_address": p.mac_address,
-                    "ip": p.ip.to_string(), "port": p.port,
-                }))
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id, "username": p.username, "department": p.department,
+                        "software_version": p.software_version,
+                        "mac_address": p.mac_address,
+                        "ip": p.ip.to_string(), "port": p.port,
+                    })
+                })
                 .collect()
-        } else { vec![] }
+        } else {
+            vec![]
+        }
     };
 
     let probe = serde_json::json!({
@@ -668,15 +770,17 @@ pub async fn discover_by_ip(
         .unwrap_or("");
 
     if let Some(identity) = probe_identity(&addr, &my_id, my_name, my_department, my_port).await {
-        let remote_port = if identity.port == 0 { port } else { identity.port };
+        let remote_port = if identity.port == 0 {
+            port
+        } else {
+            identity.port
+        };
         let remote_ip = if identity.ip.is_empty() {
             ip.clone()
         } else {
             identity.ip.clone()
         };
-        let remote_parsed_ip = remote_ip
-            .parse::<std::net::IpAddr>()
-            .unwrap_or(parsed_ip);
+        let remote_parsed_ip = remote_ip.parse::<std::net::IpAddr>().unwrap_or(parsed_ip);
         let peer = crate::discovery::Peer::new_with_profile(
             identity.peer_id.clone(),
             identity.username.clone(),
@@ -717,7 +821,8 @@ pub async fn discover_by_ip(
             let found_id = identity.peer_id.clone();
             tauri::async_runtime::spawn(async move {
                 let chat = runtime.chat.lock().await;
-                chat.exchange_contacts(&found_ip, remote_port, &found_id).await;
+                chat.exchange_contacts(&found_ip, remote_port, &found_id)
+                    .await;
             });
         }
 
@@ -742,17 +847,28 @@ pub async fn discover_by_ip(
         let found = {
             let runtime_opt = { state.runtime.read().await.clone() };
             if let Some(runtime) = runtime_opt.as_ref() {
-                runtime.discovery.read().await
-                    .get_peers().into_iter()
+                runtime
+                    .discovery
+                    .read()
+                    .await
+                    .get_peers()
+                    .into_iter()
                     .find(|p| p.ip == parsed_ip && p.port == port)
-            } else { None }
+            } else {
+                None
+            }
         };
 
         if let Some(f) = found {
             existing = Some(f);
             break;
         }
-        log::info!("UDP probe attempt {} for {}:{} — no response yet", attempt + 1, ip, port);
+        log::info!(
+            "UDP probe attempt {} for {}:{} — no response yet",
+            attempt + 1,
+            ip,
+            port
+        );
     }
 
     if let Some(found) = existing {
@@ -764,26 +880,25 @@ pub async fn discover_by_ip(
             let found_id = found.id.clone();
             tauri::async_runtime::spawn(async move {
                 let chat = runtime.chat.lock().await;
-                chat.exchange_contacts(&found_ip, found_port, &found_id).await;
+                chat.exchange_contacts(&found_ip, found_port, &found_id)
+                    .await;
             });
         }
         return Ok(DiscoverResult {
             online: true,
-            message: format!("已连接 {} ({}) @ {}:{}", found.username, found.department, found.ip, found.port),
+            message: format!(
+                "已连接 {} ({}) @ {}:{}",
+                found.username, found.department, found.ip, found.port
+            ),
         });
     }
 
     // Fallback: no unicast response received, register manually
-    let stored_peer = state
-        .db
-        .list_stored_peers()
-        .await
-        .ok()
-        .and_then(|peers| {
-            peers
-                .into_iter()
-                .find(|peer| peer.ip == ip && peer.port == port)
-        });
+    let stored_peer = state.db.list_stored_peers().await.ok().and_then(|peers| {
+        peers
+            .into_iter()
+            .find(|peer| peer.ip == ip && peer.port == port)
+    });
     let pid = stored_peer
         .as_ref()
         .map(|peer| peer.peer_id.clone())
@@ -963,10 +1078,7 @@ pub fn update_tray_unread(
 }
 
 #[tauri::command]
-pub async fn mark_read(
-    state: State<'_, AppState>,
-    peer_id: String,
-) -> Result<(), String> {
+pub async fn mark_read(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
     let runtime_opt = { state.runtime.read().await.clone() };
     let Some(runtime) = runtime_opt.as_ref() else {
         return Ok(());
@@ -1029,7 +1141,12 @@ pub fn open_file(path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("cmd")
-            .args(["/C", "start", "", &std::path::Path::new(&path).to_string_lossy().as_ref()])
+            .args([
+                "/C",
+                "start",
+                "",
+                &std::path::Path::new(&path).to_string_lossy().as_ref(),
+            ])
             .spawn()
             .map_err(|e| e.to_string())?;
     }
@@ -1075,7 +1192,7 @@ pub struct SearchResult {
     pub peer_name: String,
     pub messages: Vec<SearchHit>,
 }
-                         
+
 #[derive(Serialize)]
 pub struct SearchHit {
     pub id: i64,
@@ -1105,7 +1222,8 @@ pub async fn search_messages(
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut groups: std::collections::BTreeMap<String, SearchResult> = std::collections::BTreeMap::new();
+    let mut groups: std::collections::BTreeMap<String, SearchResult> =
+        std::collections::BTreeMap::new();
     for row in rows {
         let peer_id = if row.sender_id == runtime.my_id {
             row.receiver_id.clone()
@@ -1286,7 +1404,11 @@ pub async fn set_scan_subnets(
         .map_err(|e| e.to_string())?;
 
     if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
-        runtime.discovery.write().await.update_scan_subnets(&subnets);
+        runtime
+            .discovery
+            .write()
+            .await
+            .update_scan_subnets(&subnets);
     }
 
     Ok(())
@@ -1307,7 +1429,8 @@ fn path_mime(path: &str) -> &'static str {
         Some("svg") => "image/svg+xml",
         Some("pdf") => "application/pdf",
         Some("zip") => "application/zip",
-        Some("txt") | Some("md") | Some("rs") | Some("ts") | Some("js") | Some("json") | Some("html") | Some("css") => "text/plain",
+        Some("txt") | Some("md") | Some("rs") | Some("ts") | Some("js") | Some("json")
+        | Some("html") | Some("css") => "text/plain",
         _ => "application/octet-stream",
     }
 }
@@ -1327,7 +1450,10 @@ pub fn list_emoji_files() -> Result<Vec<String>, String> {
         let path = entry.path();
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if matches!(ext.to_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+                if matches!(
+                    ext.to_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "webp"
+                ) {
                     files.push(path.to_string_lossy().to_string());
                 }
             }
@@ -1357,7 +1483,11 @@ pub fn delete_emoji_file(file_path: String) -> Result<(), String> {
     if !path.starts_with(&dir) {
         return Err("invalid emoji path".to_string());
     }
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
         return Err("invalid emoji file type".to_string());
     }
@@ -1367,14 +1497,25 @@ pub fn delete_emoji_file(file_path: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn list_recent_contacts(state: State<'_, AppState>) -> Result<Vec<StoredPeer>, String> {
     log::info!("list_recent_contacts COMMAND called");
-    let result = state.db.list_recent_contacts().await.map_err(|e| e.to_string())?;
+    let result = state
+        .db
+        .list_recent_contacts()
+        .await
+        .map_err(|e| e.to_string())?;
     log::info!("list_recent_contacts: {} entries", result.len());
     Ok(result)
 }
 
 #[tauri::command]
-pub async fn remove_recent_contact(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
-    state.db.remove_recent_contact(&peer_id).await.map_err(|e| e.to_string())
+pub async fn remove_recent_contact(
+    state: State<'_, AppState>,
+    peer_id: String,
+) -> Result<(), String> {
+    state
+        .db
+        .remove_recent_contact(&peer_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ── Group commands ──
@@ -1387,18 +1528,33 @@ pub struct CreateGroupPayload {
 
 #[tauri::command]
 pub async fn create_group(
-    state: State<'_, AppState>, payload: CreateGroupPayload,
+    state: State<'_, AppState>,
+    payload: CreateGroupPayload,
 ) -> Result<crate::db::GroupInfo, String> {
-    let gid = format!("group-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
+    let gid = format!(
+        "group-{}",
+        uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("0")
+    );
     let my_id = {
         let runtime_opt = { state.runtime.read().await.clone() };
-        runtime_opt.as_ref().map(|r| r.my_id.clone()).unwrap_or_default()
+        runtime_opt
+            .as_ref()
+            .map(|r| r.my_id.clone())
+            .unwrap_or_default()
     };
     let mut all_members = payload.members.clone();
     if !all_members.iter().any(|m| m == &my_id) {
         all_members.push(my_id.clone());
     }
-    state.db.create_group(&gid, &payload.name, &my_id, &all_members).await.map_err(|e| e.to_string())?;
+    state
+        .db
+        .create_group(&gid, &payload.name, &my_id, &all_members)
+        .await
+        .map_err(|e| e.to_string())?;
     let members = state.db.get_group_members(&gid).await.unwrap_or_default();
 
     let (listen_port, online_peers) = {
@@ -1410,25 +1566,48 @@ pub async fn create_group(
     };
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
-        p.as_ref().map(|p| (p.username.clone(), p.department.clone()))
+        p.as_ref()
+            .map(|p| (p.username.clone(), p.department.clone()))
             .unwrap_or_default()
     };
     let directory = build_member_directory(
-        &state.db, &online_peers, &all_members,
-        &my_id, &my_name, &my_department, listen_port,
-    ).await;
+        &state.db,
+        &online_peers,
+        &all_members,
+        &my_id,
+        &my_name,
+        &my_department,
+        listen_port,
+    )
+    .await;
     let content = serde_json::json!({"name": payload.name, "member_ids": all_members}).to_string();
 
     send_or_queue_notification(
-        &state.db, &online_peers, &all_members,
-        &my_id, &my_name, &my_department, listen_port,
-        &content, "group_created", Some(&gid), None, &directory,
-    ).await;
+        &state.db,
+        &online_peers,
+        &all_members,
+        &my_id,
+        &my_name,
+        &my_department,
+        listen_port,
+        &content,
+        "group_created",
+        Some(&gid),
+        None,
+        &directory,
+    )
+    .await;
 
     Ok(crate::db::GroupInfo {
-        group_id: gid, name: payload.name, creator_id: my_id,
-        created_at: String::new(), members,
-        last_message: None, last_message_at: None, last_message_sender: None, unread_count: 0,
+        group_id: gid,
+        name: payload.name,
+        creator_id: my_id,
+        created_at: String::new(),
+        members,
+        last_message: None,
+        last_message_at: None,
+        last_message_sender: None,
+        unread_count: 0,
     })
 }
 
@@ -1436,37 +1615,80 @@ pub async fn create_group(
 pub async fn list_groups(state: State<'_, AppState>) -> Result<Vec<crate::db::GroupInfo>, String> {
     let my_id = {
         let runtime_opt = { state.runtime.read().await.clone() };
-        runtime_opt.as_ref().map(|r| r.my_id.clone()).unwrap_or_default()
+        runtime_opt
+            .as_ref()
+            .map(|r| r.my_id.clone())
+            .unwrap_or_default()
     };
-    let mut groups = state.db.list_groups(&my_id).await.map_err(|e| e.to_string())?;
+    let mut groups = state
+        .db
+        .list_groups(&my_id)
+        .await
+        .map_err(|e| e.to_string())?;
     for g in &mut groups {
-        g.members = state.db.get_group_members(&g.group_id).await.unwrap_or_default();
+        g.members = state
+            .db
+            .get_group_members(&g.group_id)
+            .await
+            .unwrap_or_default();
     }
     Ok(groups)
 }
 
 #[tauri::command]
 pub async fn send_group_message(
-    state: State<'_, AppState>, group_id: String, content: String, client_msg_id: Option<String>,
+    state: State<'_, AppState>,
+    group_id: String,
+    content: String,
+    client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
     send_group_message_typed(state, group_id, content, "text".to_string(), client_msg_id).await
 }
 
 #[tauri::command]
 pub async fn send_group_message_typed(
-    state: State<'_, AppState>, group_id: String, content: String, msg_type: String, client_msg_id: Option<String>,
+    state: State<'_, AppState>,
+    group_id: String,
+    content: String,
+    msg_type: String,
+    client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
     let (my_id, my_name, my_department, listen_port, members) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let prof = state.profile.lock().await;
-        let my_name = prof.as_ref().map(|p| p.username.clone()).unwrap_or_default();
-        let my_dept = prof.as_ref().map(|p| p.department.clone()).unwrap_or_default();
-        let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
+        let my_name = prof
+            .as_ref()
+            .map(|p| p.username.clone())
+            .unwrap_or_default();
+        let my_dept = prof
+            .as_ref()
+            .map(|p| p.department.clone())
+            .unwrap_or_default();
+        let members = state
+            .db
+            .get_group_members(&group_id)
+            .await
+            .map_err(|e| e.to_string())?;
         (r.my_id.clone(), my_name, my_dept, r.listen_port, members)
     };
 
-    let msg = state.db.save_group_message(&group_id, &my_id, &my_name, &content, &msg_type, None, None, None, true, client_msg_id.as_deref()).await.map_err(|e| e.to_string())?;
+    let msg = state
+        .db
+        .save_group_message(
+            &group_id,
+            &my_id,
+            &my_name,
+            &content,
+            &msg_type,
+            None,
+            None,
+            None,
+            true,
+            client_msg_id.as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
     let online_peers = {
         let runtime_opt = { state.runtime.read().await.clone() };
@@ -1479,10 +1701,20 @@ pub async fn send_group_message_typed(
     let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
     let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
     send_or_queue_notification(
-        &state.db, &online_peers, &target_ids,
-        &my_id, &my_name, &my_department, listen_port,
-        &content, &msg_type, Some(&group_id), None, &empty_dir,
-    ).await;
+        &state.db,
+        &online_peers,
+        &target_ids,
+        &my_id,
+        &my_name,
+        &my_department,
+        listen_port,
+        &content,
+        &msg_type,
+        Some(&group_id),
+        None,
+        &empty_dir,
+    )
+    .await;
 
     Ok(msg)
 }
@@ -1493,20 +1725,42 @@ pub async fn get_group_messages(
     group_id: String,
     limit: Option<i64>,
 ) -> Result<Vec<ChatMessage>, String> {
-    state.db.get_group_messages(&group_id, limit).await.map_err(|e| e.to_string())
+    state
+        .db
+        .get_group_messages(&group_id, limit)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn rename_group(state: State<'_, AppState>, group_id: String, new_name: String) -> Result<(), String> {
-    state.db.rename_group(&group_id, &new_name).await.map_err(|e| e.to_string())?;
+pub async fn rename_group(
+    state: State<'_, AppState>,
+    group_id: String,
+    new_name: String,
+) -> Result<(), String> {
+    state
+        .db
+        .rename_group(&group_id, &new_name)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
+    let members = state
+        .db
+        .get_group_members(&group_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let (my_id, my_name, my_department, listen_port, online_peers) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let prof = state.profile.lock().await;
-        let my_name = prof.as_ref().map(|p| p.username.clone()).unwrap_or_default();
-        let my_dept = prof.as_ref().map(|p| p.department.clone()).unwrap_or_default();
+        let my_name = prof
+            .as_ref()
+            .map(|p| p.username.clone())
+            .unwrap_or_default();
+        let my_dept = prof
+            .as_ref()
+            .map(|p| p.department.clone())
+            .unwrap_or_default();
         let peers = r.discovery.read().await.get_peers();
         (r.my_id.clone(), my_name, my_dept, r.listen_port, peers)
     };
@@ -1514,25 +1768,56 @@ pub async fn rename_group(state: State<'_, AppState>, group_id: String, new_name
     let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
     let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
     send_or_queue_notification(
-        &state.db, &online_peers, &target_ids,
-        &my_id, &my_name, &my_department, listen_port,
+        &state.db,
+        &online_peers,
+        &target_ids,
+        &my_id,
+        &my_name,
+        &my_department,
+        listen_port,
         &format!("群名已修改为「{}」", new_name),
-        "group_renamed", Some(&group_id), Some(&new_name), &empty_dir,
-    ).await;
+        "group_renamed",
+        Some(&group_id),
+        Some(&new_name),
+        &empty_dir,
+    )
+    .await;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn invite_to_group(state: State<'_, AppState>, group_id: String, members: Vec<String>) -> Result<(), String> {
-    state.db.add_group_members(&group_id, &members).await.map_err(|e| e.to_string())?;
+pub async fn invite_to_group(
+    state: State<'_, AppState>,
+    group_id: String,
+    members: Vec<String>,
+) -> Result<(), String> {
+    state
+        .db
+        .add_group_members(&group_id, &members)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let groups = {
-        let my_id_opt = { state.runtime.read().await.clone() }.as_ref().map(|r| r.my_id.clone());
+        let my_id_opt = { state.runtime.read().await.clone() }
+            .as_ref()
+            .map(|r| r.my_id.clone());
         let my_id = my_id_opt.unwrap_or_default();
-        state.db.list_groups(&my_id).await.map_err(|e| e.to_string())?
+        state
+            .db
+            .list_groups(&my_id)
+            .await
+            .map_err(|e| e.to_string())?
     };
-    let group = groups.iter().find(|g| g.group_id == group_id).ok_or("群组不存在")?.clone();
-    let member_records = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
+    let group = groups
+        .iter()
+        .find(|g| g.group_id == group_id)
+        .ok_or("群组不存在")?
+        .clone();
+    let member_records = state
+        .db
+        .get_group_members(&group_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let all_member_ids: Vec<String> = member_records.iter().map(|m| m.peer_id.clone()).collect();
 
     let (my_id, listen_port, online_peers) = {
@@ -1543,19 +1828,37 @@ pub async fn invite_to_group(state: State<'_, AppState>, group_id: String, membe
     };
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
-        p.as_ref().map(|p| (p.username.clone(), p.department.clone())).unwrap_or_default()
+        p.as_ref()
+            .map(|p| (p.username.clone(), p.department.clone()))
+            .unwrap_or_default()
     };
     let directory = build_member_directory(
-        &state.db, &online_peers, &all_member_ids,
-        &my_id, &my_name, &my_department, listen_port,
-    ).await;
+        &state.db,
+        &online_peers,
+        &all_member_ids,
+        &my_id,
+        &my_name,
+        &my_department,
+        listen_port,
+    )
+    .await;
     let content = serde_json::json!({"name": group.name, "member_ids": all_member_ids}).to_string();
 
     send_or_queue_notification(
-        &state.db, &online_peers, &all_member_ids,
-        &my_id, &my_name, &my_department, listen_port,
-        &content, "group_created", Some(&group_id), None, &directory,
-    ).await;
+        &state.db,
+        &online_peers,
+        &all_member_ids,
+        &my_id,
+        &my_name,
+        &my_department,
+        listen_port,
+        &content,
+        "group_created",
+        Some(&group_id),
+        None,
+        &directory,
+    )
+    .await;
     Ok(())
 }
 
@@ -1564,12 +1867,20 @@ pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result
     let (my_id, listen_port, online_peers, members) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
-        let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
+        let members = state
+            .db
+            .get_group_members(&group_id)
+            .await
+            .map_err(|e| e.to_string())?;
         let online = r.discovery.read().await.get_peers();
         (r.my_id.clone(), r.listen_port, online, members)
     };
 
-    let groups = state.db.list_groups(&my_id).await.map_err(|e| e.to_string())?;
+    let groups = state
+        .db
+        .list_groups(&my_id)
+        .await
+        .map_err(|e| e.to_string())?;
     if let Some(g) = groups.iter().find(|g| g.group_id == group_id) {
         if g.creator_id == my_id {
             return Err("群主不可退群，请使用解散群".to_string());
@@ -1577,23 +1888,43 @@ pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result
     }
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
-        p.as_ref().map(|p| (p.username.clone(), p.department.clone())).unwrap_or_default()
+        p.as_ref()
+            .map(|p| (p.username.clone(), p.department.clone()))
+            .unwrap_or_default()
     };
 
     let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
     let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
     send_or_queue_notification(
-        &state.db, &online_peers, &target_ids,
-        &my_id, &my_name, &my_department, listen_port,
-        "", "group_member_left", Some(&group_id), None, &empty_dir,
-    ).await;
+        &state.db,
+        &online_peers,
+        &target_ids,
+        &my_id,
+        &my_name,
+        &my_department,
+        listen_port,
+        "",
+        "group_member_left",
+        Some(&group_id),
+        None,
+        &empty_dir,
+    )
+    .await;
 
-    state.db.remove_group_member(&group_id, &my_id).await.map_err(|e| e.to_string())
+    state
+        .db
+        .remove_group_member(&group_id, &my_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn dissolve_group(state: State<'_, AppState>, group_id: String) -> Result<(), String> {
-    let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
+    let members = state
+        .db
+        .get_group_members(&group_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let (my_id, listen_port, online_peers) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
@@ -1602,18 +1933,34 @@ pub async fn dissolve_group(state: State<'_, AppState>, group_id: String) -> Res
     };
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
-        p.as_ref().map(|p| (p.username.clone(), p.department.clone())).unwrap_or_default()
+        p.as_ref()
+            .map(|p| (p.username.clone(), p.department.clone()))
+            .unwrap_or_default()
     };
 
-    state.db.dissolve_group(&group_id).await.map_err(|e| e.to_string())?;
+    state
+        .db
+        .dissolve_group(&group_id)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
     let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
     send_or_queue_notification(
-        &state.db, &online_peers, &target_ids,
-        &my_id, &my_name, &my_department, listen_port,
-        "群组已解散", "group_dissolved", Some(&group_id), None, &empty_dir,
-    ).await;
+        &state.db,
+        &online_peers,
+        &target_ids,
+        &my_id,
+        &my_name,
+        &my_department,
+        listen_port,
+        "群组已解散",
+        "group_dissolved",
+        Some(&group_id),
+        None,
+        &empty_dir,
+    )
+    .await;
     Ok(())
 }
 
@@ -1626,7 +1973,16 @@ pub async fn send_group_file(
     file_name: Option<String>,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_group_file_with_kind(app_handle, state, group_id, file_path, file_name, "file", client_msg_id).await
+    send_group_file_with_kind(
+        app_handle,
+        state,
+        group_id,
+        file_path,
+        file_name,
+        "file",
+        client_msg_id,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1638,7 +1994,16 @@ pub async fn send_group_sticker(
     file_name: Option<String>,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_group_file_with_kind(app_handle, state, group_id, file_path, file_name, "sticker", client_msg_id).await
+    send_group_file_with_kind(
+        app_handle,
+        state,
+        group_id,
+        file_path,
+        file_name,
+        "sticker",
+        client_msg_id,
+    )
+    .await
 }
 
 async fn send_group_file_with_kind(
@@ -1654,10 +2019,33 @@ async fn send_group_file_with_kind(
     let (my_id, my_name, my_department, listen_port, db, members) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
-        let my_name = state.profile.lock().await.as_ref().map(|p| p.username.clone()).unwrap_or_default();
-        let my_department = state.profile.lock().await.as_ref().map(|p| p.department.clone()).unwrap_or_default();
-        let members = state.db.get_group_members(&group_id).await.map_err(|e| e.to_string())?;
-        (r.my_id.clone(), my_name, my_department, r.listen_port, state.db.clone(), members)
+        let my_name = state
+            .profile
+            .lock()
+            .await
+            .as_ref()
+            .map(|p| p.username.clone())
+            .unwrap_or_default();
+        let my_department = state
+            .profile
+            .lock()
+            .await
+            .as_ref()
+            .map(|p| p.department.clone())
+            .unwrap_or_default();
+        let members = state
+            .db
+            .get_group_members(&group_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        (
+            r.my_id.clone(),
+            my_name,
+            my_department,
+            r.listen_port,
+            state.db.clone(),
+            members,
+        )
     };
 
     let file_name = file_name_override
@@ -1672,10 +2060,17 @@ async fn send_group_file_with_kind(
                 .unwrap_or("unknown")
                 .to_string()
         });
-    let file_size = tokio::fs::metadata(&file_path).await
-        .map(|m| m.len() as i64).map_err(|e| e.to_string())?;
-    let pending_cache: Arc<tokio::sync::Mutex<Option<String>>> = Arc::new(tokio::sync::Mutex::new(None));
-    let msg_kind = if file_kind == "sticker" { "sticker" } else { "file" };
+    let file_size = tokio::fs::metadata(&file_path)
+        .await
+        .map(|m| m.len() as i64)
+        .map_err(|e| e.to_string())?;
+    let pending_cache: Arc<tokio::sync::Mutex<Option<String>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let msg_kind = if file_kind == "sticker" {
+        "sticker"
+    } else {
+        "file"
+    };
     let content = if msg_kind == "sticker" {
         "[表情]".to_string()
     } else {
@@ -1694,14 +2089,19 @@ async fn send_group_file_with_kind(
     };
 
     for member in members {
-        if member.peer_id == my_id { continue; }
+        if member.peer_id == my_id {
+            continue;
+        }
         if let Err(e) = wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await {
             clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
-            let _ = app_handle.emit_all("file-error", serde_json::json!({
-                "fileName": file_name.as_str(),
-                "clientMsgId": client_msg_id.as_deref(),
-                "error": e.to_string(),
-            }));
+            let _ = app_handle.emit_all(
+                "file-error",
+                serde_json::json!({
+                    "fileName": file_name.as_str(),
+                    "clientMsgId": client_msg_id.as_deref(),
+                    "error": e.to_string(),
+                }),
+            );
             return Err(e.to_string());
         }
         let bg_path = file_path.clone();
@@ -1720,7 +2120,10 @@ async fn send_group_file_with_kind(
         let target_department = member.department.clone();
         let mut resolved_addr = resolve_peer_addr(&target_id, &db, &online_peers).await;
         if resolved_addr.is_none() && !target_name.is_empty() {
-            if let Ok(Some(latest_peer)) = db.find_peer_by_identity(&target_name, &target_department).await {
+            if let Ok(Some(latest_peer)) = db
+                .find_peer_by_identity(&target_name, &target_department)
+                .await
+            {
                 if latest_peer.peer_id != target_id {
                     log::info!(
                         "Group file target {} resolved by identity to latest peer_id {}",
@@ -1737,51 +2140,94 @@ async fn send_group_file_with_kind(
                 target_id.clone(),
                 target_name,
                 target_department,
-                ip, port,
+                ip,
+                port,
             );
             match send_group_file_to_peer_with_progress(
-                &bg_path, &bg_name, file_size, &peer,
-                &bg_my_id, &bg_my_name, &bg_my_dep, listen_port,
-                &bg_gid, &bg_kind, client_msg_id.as_deref(), &bg_handle,
-            ).await {
+                &bg_path,
+                &bg_name,
+                file_size,
+                &peer,
+                &bg_my_id,
+                &bg_my_name,
+                &bg_my_dep,
+                listen_port,
+                &bg_gid,
+                &bg_kind,
+                client_msg_id.as_deref(),
+                &bg_handle,
+            )
+            .await
+            {
                 Ok(_) => log::info!("Group file sent to {}", peer.id),
                 Err(e) if e == FILE_TRANSFER_CANCELLED_MESSAGE => {
                     clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
-                    let _ = bg_error_handle.emit_all("file-error", serde_json::json!({
-                        "fileName": bg_name,
-                        "clientMsgId": client_msg_id.as_deref(),
-                        "error": e,
-                    }));
+                    let _ = bg_error_handle.emit_all(
+                        "file-error",
+                        serde_json::json!({
+                            "fileName": bg_name,
+                            "clientMsgId": client_msg_id.as_deref(),
+                            "error": e,
+                        }),
+                    );
                     return Err(e);
                 }
                 Err(e) => {
                     log::error!("Group file send failed to {}: {}", peer.id, e);
                     if let Err(queue_err) = queue_group_file_for_peer(
-                        &bg_db, &bg_path, &bg_name, file_size, bg_pending_cache,
-                        &peer.id, &bg_my_id, &bg_my_name, &bg_my_dep,
-                        listen_port, &bg_gid, &bg_kind,
-                    ).await {
+                        &bg_db,
+                        &bg_path,
+                        &bg_name,
+                        file_size,
+                        bg_pending_cache,
+                        &peer.id,
+                        &bg_my_id,
+                        &bg_my_name,
+                        &bg_my_dep,
+                        listen_port,
+                        &bg_gid,
+                        &bg_kind,
+                    )
+                    .await
+                    {
                         log::error!("Failed to queue group file for {}: {}", peer.id, queue_err);
-                        let _ = bg_error_handle.emit_all("file-error", serde_json::json!({
-                            "fileName": bg_name,
-                            "clientMsgId": client_msg_id.as_deref(),
-                            "error": queue_err,
-                        }));
+                        let _ = bg_error_handle.emit_all(
+                            "file-error",
+                            serde_json::json!({
+                                "fileName": bg_name,
+                                "clientMsgId": client_msg_id.as_deref(),
+                                "error": queue_err,
+                            }),
+                        );
                     }
                 }
             }
         } else {
             if let Err(e) = queue_group_file_for_peer(
-                &bg_db, &bg_path, &bg_name, file_size, bg_pending_cache,
-                &target_id, &bg_my_id, &bg_my_name, &bg_my_dep,
-                listen_port, &bg_gid, &bg_kind,
-            ).await {
+                &bg_db,
+                &bg_path,
+                &bg_name,
+                file_size,
+                bg_pending_cache,
+                &target_id,
+                &bg_my_id,
+                &bg_my_name,
+                &bg_my_dep,
+                listen_port,
+                &bg_gid,
+                &bg_kind,
+            )
+            .await
+            {
                 log::error!("Failed to queue group file for {}: {}", target_id, e);
-                let _ = bg_error_handle.emit_all("file-error", serde_json::json!({
-                    "fileName": bg_name,
-                    "clientMsgId": client_msg_id.as_deref(),
-                    "error": e,
-                }));
+                let _ = bg_error_handle.emit_all(
+                    "file-error",
+                    serde_json::json!({
+                        "fileName": bg_name,
+                        "clientMsgId": client_msg_id.as_deref(),
+                        "error": e,
+                    }),
+                );
             } else {
                 log::info!("Queued group file for offline member {}", target_id);
             }
@@ -1790,19 +2236,32 @@ async fn send_group_file_with_kind(
 
     if let Err(e) = wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await {
         clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
-        let _ = app_handle.emit_all("file-error", serde_json::json!({
-            "fileName": file_name.as_str(),
-            "clientMsgId": client_msg_id.as_deref(),
-            "error": e.to_string(),
-        }));
+        let _ = app_handle.emit_all(
+            "file-error",
+            serde_json::json!({
+                "fileName": file_name.as_str(),
+                "clientMsgId": client_msg_id.as_deref(),
+                "error": e.to_string(),
+            }),
+        );
         return Err(e.to_string());
     }
 
-    let saved = match db.save_group_message(
-        &group_id, &my_id, &my_name,
-        &content, msg_kind,
-        Some(&file_path), Some(&file_name), Some(file_size), true, client_msg_id.as_deref(),
-    ).await {
+    let saved = match db
+        .save_group_message(
+            &group_id,
+            &my_id,
+            &my_name,
+            &content,
+            msg_kind,
+            Some(&file_path),
+            Some(&file_name),
+            Some(file_size),
+            true,
+            client_msg_id.as_deref(),
+        )
+        .await
+    {
         Ok(saved) => saved,
         Err(error) => {
             clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
@@ -1810,13 +2269,16 @@ async fn send_group_file_with_kind(
         }
     };
 
-    let _ = app_handle.emit_all("file-progress", serde_json::json!({
-        "fileName": file_name,
-        "clientMsgId": client_msg_id.as_deref(),
-        "sent": file_size,
-        "total": file_size,
-        "speed": 0,
-    }));
+    let _ = app_handle.emit_all(
+        "file-progress",
+        serde_json::json!({
+            "fileName": file_name,
+            "clientMsgId": client_msg_id.as_deref(),
+            "sent": file_size,
+            "total": file_size,
+            "speed": 0,
+        }),
+    );
     clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
 
     Ok(ChatMessage {
@@ -1863,24 +2325,29 @@ async fn send_group_file_to_peer_with_progress(
         file_kind: file_kind.to_string(),
     };
 
-    let _ = app_handle.emit_all("file-progress", serde_json::json!({
-        "fileName": file_name,
-        "clientMsgId": client_msg_id,
-        "sent": 0,
-        "total": file_size,
-        "speed": 0,
-    }));
+    let _ = app_handle.emit_all(
+        "file-progress",
+        serde_json::json!({
+            "fileName": file_name,
+            "clientMsgId": client_msg_id,
+            "sent": 0,
+            "total": file_size,
+            "speed": 0,
+        }),
+    );
 
-    send_group_file_payloads_over_tcp_controlled(&peer.address(), &transfer, client_msg_id)
-        .await?;
+    send_group_file_payloads_over_tcp_controlled(&peer.address(), &transfer, client_msg_id).await?;
 
-    let _ = app_handle.emit_all("file-progress", serde_json::json!({
-        "fileName": file_name,
-        "clientMsgId": client_msg_id,
-        "sent": file_size,
-        "total": file_size,
-        "speed": 0,
-    }));
+    let _ = app_handle.emit_all(
+        "file-progress",
+        serde_json::json!({
+            "fileName": file_name,
+            "clientMsgId": client_msg_id,
+            "sent": file_size,
+            "total": file_size,
+            "speed": 0,
+        }),
+    );
 
     Ok(())
 }
@@ -1899,7 +2366,8 @@ async fn queue_group_file_for_peer(
     group_id: &str,
     file_kind: &str,
 ) -> Result<(), String> {
-    let cached_file_path = get_or_create_pending_cache(file_path, file_name, &pending_cache).await?;
+    let cached_file_path =
+        get_or_create_pending_cache(file_path, file_name, &pending_cache).await?;
     db.queue_pending_file_transfer(
         group_id,
         peer_id,
@@ -1911,7 +2379,9 @@ async fn queue_group_file_for_peer(
         file_name,
         file_size,
         file_kind,
-    ).await.map_err(|e| e.to_string())
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 async fn get_or_create_pending_cache(
@@ -1931,24 +2401,38 @@ async fn get_or_create_pending_cache(
 
 async fn copy_file_to_pending_cache(file_path: &str, file_name: &str) -> Result<String, String> {
     let pending_dir = echo_files_dir().join("pending");
-    tokio::fs::create_dir_all(&pending_dir).await.map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&pending_dir)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let safe_name = std::path::Path::new(file_name)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("file");
-    let dest = pending_dir.join(format!("{}_{}", chrono::Utc::now().timestamp_millis(), safe_name));
-    tokio::fs::copy(file_path, &dest).await.map_err(|e| e.to_string())?;
+    let dest = pending_dir.join(format!(
+        "{}_{}",
+        chrono::Utc::now().timestamp_millis(),
+        safe_name
+    ));
+    tokio::fs::copy(file_path, &dest)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(dest.to_string_lossy().to_string())
 }
 
 #[tauri::command]
-pub async fn get_group_unread_counts(state: State<'_, AppState>) -> Result<Vec<crate::db::GroupUnread>, String> {
+pub async fn get_group_unread_counts(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::db::GroupUnread>, String> {
     let runtime_opt = { state.runtime.read().await.clone() };
     let Some(runtime) = runtime_opt.as_ref() else {
         return Ok(vec![]);
     };
-    state.db.get_group_unread_counts(&runtime.my_id).await.map_err(|e| e.to_string())
+    state
+        .db
+        .get_group_unread_counts(&runtime.my_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1957,13 +2441,23 @@ pub async fn mark_group_read(state: State<'_, AppState>, group_id: String) -> Re
     let Some(runtime) = runtime_opt.as_ref() else {
         return Ok(());
     };
-    state.db.mark_group_read(&group_id, &runtime.my_id).await.map_err(|e| e.to_string())
+    state
+        .db
+        .mark_group_read(&group_id, &runtime.my_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Result<(), String> {
-    let pending = state.db.get_pending_for_peer(&peer_id).await.map_err(|e| e.to_string())?;
-    if pending.is_empty() { return Ok(()); }
+    let pending = state
+        .db
+        .get_pending_for_peer(&peer_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if pending.is_empty() {
+        return Ok(());
+    }
 
     let (_my_id, listen_port) = {
         let runtime_opt = { state.runtime.read().await.clone() };
@@ -1974,24 +2468,38 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
     let mut delivered_ids = Vec::new();
     for p in &pending {
         let stored_opt = state.db.get_stored_peer(&peer_id).await.unwrap_or_default();
-        let ip = stored_opt.as_ref().and_then(|sp| sp.ip.parse::<std::net::IpAddr>().ok());
+        let ip = stored_opt
+            .as_ref()
+            .and_then(|sp| sp.ip.parse::<std::net::IpAddr>().ok());
         let port = stored_opt.as_ref().map(|sp| sp.port).unwrap_or(0);
         if let Some(ip) = ip {
             if !ip.is_unspecified() && port != 0 {
                 let addr = format!("{}:{}", ip, port);
                 let wm = crate::chat::WireMessage {
-                    sender_id: p.sender_id.clone(), sender_name: p.sender_name.clone(),
+                    sender_id: p.sender_id.clone(),
+                    sender_name: p.sender_name.clone(),
                     sender_department: String::new(),
                     sender_software_version: crate::profile_metadata::software_version(),
                     sender_mac_address: crate::profile_metadata::mac_address(),
                     sender_port: listen_port,
-                    receiver_id: peer_id.clone(), content: p.content.clone(),
-                    msg_type: p.msg_type.clone(), file_name: None, file_size: None, file_data: None,
+                    receiver_id: peer_id.clone(),
+                    content: p.content.clone(),
+                    msg_type: p.msg_type.clone(),
+                    file_name: None,
+                    file_size: None,
+                    file_data: None,
                     file_kind: None,
-                    known_peers: Vec::new(), group_id: Some(p.group_id.clone()),
+                    known_peers: Vec::new(),
+                    group_id: Some(p.group_id.clone()),
                 };
                 let json = serde_json::to_string(&wm).unwrap_or_default();
-                if let Ok(mut stream) = tokio::time::timeout(std::time::Duration::from_secs(3), tokio::net::TcpStream::connect(&addr)).await.map_err(|_| "")? {
+                if let Ok(mut stream) = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tokio::net::TcpStream::connect(&addr),
+                )
+                .await
+                .map_err(|_| "")?
+                {
                     use tokio::io::AsyncWriteExt;
                     if stream.write_all(json.as_bytes()).await.is_ok() {
                         delivered_ids.push(p.id);
@@ -2001,8 +2509,16 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
         }
     }
     if !delivered_ids.is_empty() {
-        state.db.delete_pending_msgs(&delivered_ids).await.map_err(|e| e.to_string())?;
-        log::info!("Delivered {} pending messages to {}", delivered_ids.len(), peer_id);
+        state
+            .db
+            .delete_pending_msgs(&delivered_ids)
+            .await
+            .map_err(|e| e.to_string())?;
+        log::info!(
+            "Delivered {} pending messages to {}",
+            delivered_ids.len(),
+            peer_id
+        );
     }
     Ok(())
 }
@@ -2018,23 +2534,37 @@ pub async fn deliver_pending_to_peer(db: &crate::db::Database, peer_id_str: &str
         Ok(ip) => ip,
         Err(_) => return,
     };
-    if ip.is_unspecified() || stored.port == 0 { return; }
+    if ip.is_unspecified() || stored.port == 0 {
+        return;
+    }
     let addr = format!("{}:{}", ip, stored.port);
 
     // 1) Generic pending_notifications (preferred — payload is a full WireMessage).
-    let notifs = db.get_pending_notifications(peer_id_str).await.unwrap_or_default();
+    let notifs = db
+        .get_pending_notifications(peer_id_str)
+        .await
+        .unwrap_or_default();
     let delivered_notif_ids = deliver_pending_payloads_over_tcp(&addr, &notifs).await;
     if !delivered_notif_ids.is_empty() {
         let _ = db.delete_pending_notifications(&delivered_notif_ids).await;
-        log::info!("Delivered {} pending notifs to {}", delivered_notif_ids.len(), peer_id_str);
+        log::info!(
+            "Delivered {} pending notifs to {}",
+            delivered_notif_ids.len(),
+            peer_id_str
+        );
     }
 
     // 2) Legacy pending_group_messages — still drained for backward-compat with
     // any data queued by previous app versions.
     deliver_pending_file_transfers_to_peer(db, peer_id_str, &stored, ip).await;
 
-    let pending = db.get_pending_for_peer(peer_id_str).await.unwrap_or_default();
-    if pending.is_empty() { return; }
+    let pending = db
+        .get_pending_for_peer(peer_id_str)
+        .await
+        .unwrap_or_default();
+    if pending.is_empty() {
+        return;
+    }
     let mut delivered = Vec::new();
     for p in &pending {
         let wm = serde_json::json!({
@@ -2051,7 +2581,11 @@ pub async fn deliver_pending_to_peer(db: &crate::db::Database, peer_id_str: &str
     }
     if !delivered.is_empty() {
         let _ = db.delete_pending_msgs(&delivered).await;
-        log::info!("Delivered {} legacy pending msgs to {}", delivered.len(), peer_id_str);
+        log::info!(
+            "Delivered {} legacy pending msgs to {}",
+            delivered.len(),
+            peer_id_str
+        );
     }
 }
 
@@ -2061,7 +2595,10 @@ async fn deliver_pending_file_transfers_to_peer(
     stored: &StoredPeer,
     ip: std::net::IpAddr,
 ) {
-    let pending_files = db.get_pending_file_transfers(peer_id).await.unwrap_or_default();
+    let pending_files = db
+        .get_pending_file_transfers(peer_id)
+        .await
+        .unwrap_or_default();
     if pending_files.is_empty() {
         return;
     }
@@ -2069,23 +2606,40 @@ async fn deliver_pending_file_transfers_to_peer(
 
     for transfer in pending_files {
         if !std::path::Path::new(&transfer.file_path).exists() {
-            log::error!("Pending group file missing for {}: {}", peer_id, transfer.file_path);
+            log::error!(
+                "Pending group file missing for {}: {}",
+                peer_id,
+                transfer.file_path
+            );
             let _ = db.delete_pending_file_transfer(transfer.id).await;
             continue;
         }
 
         let ok = send_group_file_payloads_over_tcp(&addr, &transfer).await;
         if !ok {
-            log::error!("Failed to deliver pending group file {} to {}", transfer.file_name, peer_id);
+            log::error!(
+                "Failed to deliver pending group file {} to {}",
+                transfer.file_name,
+                peer_id
+            );
             break;
         }
 
         let file_path = transfer.file_path.clone();
         let _ = db.delete_pending_file_transfer(transfer.id).await;
-        if db.count_pending_file_transfers_by_path(&file_path).await.unwrap_or(1) == 0 {
+        if db
+            .count_pending_file_transfers_by_path(&file_path)
+            .await
+            .unwrap_or(1)
+            == 0
+        {
             let _ = tokio::fs::remove_file(&file_path).await;
         }
-        log::info!("Delivered pending group file {} to {}", transfer.file_name, peer_id);
+        log::info!(
+            "Delivered pending group file {} to {}",
+            transfer.file_name,
+            peer_id
+        );
     }
 }
 
@@ -2093,7 +2647,9 @@ async fn send_group_file_payloads_over_tcp(
     addr: &str,
     transfer: &crate::db::PendingFileTransfer,
 ) -> bool {
-    send_group_file_payloads_over_tcp_controlled(addr, transfer, None).await.is_ok()
+    send_group_file_payloads_over_tcp_controlled(addr, transfer, None)
+        .await
+        .is_ok()
 }
 
 async fn send_group_file_payloads_over_tcp_controlled(
@@ -2114,12 +2670,21 @@ async fn send_group_file_payloads_over_tcp_controlled(
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         tokio::net::TcpStream::connect(addr),
-    ).await;
+    )
+    .await;
     let Ok(Ok(mut stream)) = stream else {
         return Err(format!("Failed to connect to {}", addr));
     };
+    let _ = stream.set_nodelay(true);
+    let socket = socket2::SockRef::from(&stream);
+    let _ = socket.set_send_buffer_size(FILE_SOCKET_BUFFER_SIZE);
+    let _ = socket.set_recv_buffer_size(FILE_SOCKET_BUFFER_SIZE);
 
     let mut buf = vec![0u8; FILE_CHUNK_SIZE];
+    let mut content_buf = String::with_capacity(base64_encoded_capacity(FILE_CHUNK_SIZE));
+    let mut payload = Vec::with_capacity(content_buf.capacity() + 1024);
+    let sender_software_version = crate::profile_metadata::software_version();
+    let sender_mac_address = crate::profile_metadata::mac_address();
     let mut chunk_index: usize = 0;
     loop {
         wait_for_outgoing_file_transfer(client_msg_id)
@@ -2133,29 +2698,30 @@ async fn send_group_file_payloads_over_tcp_controlled(
         };
         let is_last = n < FILE_CHUNK_SIZE
             || (transfer.file_size as usize) <= ((chunk_index + 1) * FILE_CHUNK_SIZE);
-        let msg = crate::chat::WireMessage {
-            sender_id: transfer.sender_id.clone(),
-            sender_name: transfer.sender_name.clone(),
-            sender_department: transfer.sender_department.clone(),
-            sender_software_version: crate::profile_metadata::software_version(),
-            sender_mac_address: crate::profile_metadata::mac_address(),
-            sender_port: transfer.sender_port,
-            receiver_id: transfer.peer_id.clone(),
-            content: base64_encode_std(&buf[..n]),
-            msg_type: if is_last { "file_end".to_string() } else { "file_chunk".to_string() },
-            file_name: Some(transfer.file_name.clone()),
-            file_size: Some(transfer.file_size as u64),
-            file_data: None,
-            file_kind: Some(transfer.file_kind.clone()),
-            known_peers: Vec::new(),
-            group_id: Some(transfer.group_id.clone()),
-        };
-        let Ok(json) = serde_json::to_string(&msg) else {
-            return Err("Failed to serialize group file chunk".to_string());
-        };
-        if stream.write_all(json.as_bytes()).await.is_err()
-            || stream.write_all(b"\n").await.is_err()
-        {
+        let msg_type = if is_last { "file_end" } else { "file_chunk" };
+        base64_encode_into(&buf[..n], &mut content_buf);
+        if let Err(error) = serialize_file_wire_message_line(
+            FileWireMessageLine {
+                sender_id: &transfer.sender_id,
+                sender_name: &transfer.sender_name,
+                sender_department: &transfer.sender_department,
+                sender_software_version: &sender_software_version,
+                sender_mac_address: &sender_mac_address,
+                sender_port: transfer.sender_port,
+                receiver_id: &transfer.peer_id,
+                content: &content_buf,
+                msg_type,
+                file_name: &transfer.file_name,
+                file_size: transfer.file_size as u64,
+                file_kind: &transfer.file_kind,
+                known_peers: &[],
+                group_id: Some(&transfer.group_id),
+            },
+            &mut payload,
+        ) {
+            return Err(format!("Failed to serialize group file chunk: {}", error));
+        }
+        if stream.write_all(&payload).await.is_err() {
             return Err(format!("Failed to write to {}", addr));
         }
         chunk_index += 1;
@@ -2180,9 +2746,15 @@ fn echo_files_dir() -> std::path::PathBuf {
 
 /// Build a WireMessage JSON for a notification.
 fn build_notification_json(
-    sender_id: &str, sender_name: &str, sender_department: &str, sender_port: u16,
-    receiver_id: &str, content: &str, msg_type: &str,
-    group_id: Option<&str>, file_name: Option<&str>,
+    sender_id: &str,
+    sender_name: &str,
+    sender_department: &str,
+    sender_port: u16,
+    receiver_id: &str,
+    content: &str,
+    msg_type: &str,
+    group_id: Option<&str>,
+    file_name: Option<&str>,
     known_peers: &[crate::discovery::PeerEntry],
 ) -> String {
     serde_json::json!({
@@ -2200,7 +2772,8 @@ fn build_notification_json(
         "file_size": null,
         "file_data": null,
         "known_peers": known_peers,
-    }).to_string()
+    })
+    .to_string()
 }
 
 /// Try a TCP delivery with a 2s timeout. Returns true if both header bytes
@@ -2209,11 +2782,12 @@ async fn deliver_over_tcp(addr: &str, json: &str) -> bool {
     match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::net::TcpStream::connect(addr),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(mut stream)) => {
             use tokio::io::AsyncWriteExt;
-            stream.write_all(json.as_bytes()).await.is_ok()
-                && stream.write_all(b"\n").await.is_ok()
+            stream.write_all(json.as_bytes()).await.is_ok() && stream.write_all(b"\n").await.is_ok()
         }
         _ => false,
     }
@@ -2231,7 +2805,8 @@ async fn deliver_pending_payloads_over_tcp(
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::net::TcpStream::connect(addr),
-    ).await;
+    )
+    .await;
 
     let Ok(Ok(mut stream)) = stream else {
         return delivered;
@@ -2278,11 +2853,21 @@ pub async fn send_or_queue_notification(
     let mut queued = 0usize;
 
     for pid in target_peer_ids {
-        if pid == self_id { continue; }
+        if pid == self_id {
+            continue;
+        }
 
         let json = build_notification_json(
-            self_id, self_name, self_department, self_port,
-            pid, content, kind, group_id, file_name, known_peers,
+            self_id,
+            self_name,
+            self_department,
+            self_port,
+            pid,
+            content,
+            kind,
+            group_id,
+            file_name,
+            known_peers,
         );
 
         let ok = match resolve_peer_addr(pid, db, online_peers).await {
@@ -2302,7 +2887,12 @@ pub async fn send_or_queue_notification(
     }
 
     if queued > 0 {
-        log::info!("Notification '{}' delivered={} queued={}", kind, delivered, queued);
+        log::info!(
+            "Notification '{}' delivered={} queued={}",
+            kind,
+            delivered,
+            queued
+        );
     }
     (delivered, queued)
 }
