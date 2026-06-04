@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::contact_sync;
-use crate::db::Database;
+use crate::db::{ChatMessage, Database};
 use crate::discovery::{Peer, PeerEntry};
 use tauri::{AppHandle, Manager};
 
@@ -353,6 +353,8 @@ struct ConversationUpdated {
     kind: String,
     peer_id: Option<String>,
     group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<ChatMessage>,
 }
 
 pub struct ChatServer {
@@ -987,7 +989,7 @@ impl ChatServer {
                             };
                             if let Some(ref gid) = file_state.group_id {
                                 // Group file message — is_read=false so unread fires
-                                if let Err(e) = db
+                                match db
                                     .save_group_message(
                                         gid,
                                         sender_id,
@@ -1002,12 +1004,14 @@ impl ChatServer {
                                     )
                                     .await
                                 {
-                                    error!("Failed to save incoming group file message: {}", e);
+                                    Ok(saved) => emit_group_message_updated(&app_handle, gid, saved),
+                                    Err(e) => {
+                                        error!("Failed to save incoming group file message: {}", e);
+                                    }
                                 }
-                                emit_group_updated(&app_handle, gid);
                             } else {
                                 let receiver_id = &my_id;
-                                if let Err(e) = db
+                                match db
                                     .save_message(
                                         sender_id,
                                         sender_name,
@@ -1021,9 +1025,11 @@ impl ChatServer {
                                     )
                                     .await
                                 {
-                                    error!("Failed to save incoming file message: {}", e);
+                                    Ok(saved) => emit_contact_message_updated(&app_handle, sender_id, saved),
+                                    Err(e) => {
+                                        error!("Failed to save incoming file message: {}", e);
+                                    }
                                 }
-                                emit_contact_updated(&app_handle, sender_id);
                             }
 
                             let _ = incoming_tx.send(IncomingMessage {
@@ -1051,7 +1057,7 @@ impl ChatServer {
 
                             if let Some(ref gid) = msg.group_id {
                                 // Group message — save with group_id; is_read=false so unread counts work
-                                let _ = db
+                                let saved = db
                                     .save_group_message(
                                         gid,
                                         &msg.sender_id,
@@ -1078,10 +1084,13 @@ impl ChatServer {
                                         .await;
                                     info!("Auto-joined group {} from message", gid);
                                 }
-                                emit_group_updated(&app_handle, gid);
+                                match saved {
+                                    Ok(saved) => emit_group_message_updated(&app_handle, gid, saved),
+                                    Err(e) => error!("Failed to save incoming group message: {}", e),
+                                }
                             } else {
                                 // Private message
-                                let _ = db
+                                match db
                                     .save_message(
                                         &msg.sender_id,
                                         &msg.sender_name,
@@ -1093,8 +1102,11 @@ impl ChatServer {
                                         msg.file_size.map(|s| s as i64),
                                         None,
                                     )
-                                    .await;
-                                emit_contact_updated(&app_handle, &msg.sender_id);
+                                    .await
+                                {
+                                    Ok(saved) => emit_contact_message_updated(&app_handle, &msg.sender_id, saved),
+                                    Err(e) => error!("Failed to save incoming private message: {}", e),
+                                }
                             }
 
                             let _ = incoming_tx.send(IncomingMessage {
@@ -1432,25 +1444,49 @@ impl ChatServer {
     }
 }
 
-fn emit_contact_updated(app_handle: &AppHandle, peer_id: &str) {
+fn emit_conversation_updated(
+    app_handle: &AppHandle,
+    kind: &str,
+    peer_id: Option<String>,
+    group_id: Option<String>,
+    message: Option<ChatMessage>,
+) {
     let _ = app_handle.emit_all(
         EVENT_CONVERSATION_UPDATED,
         ConversationUpdated {
-            kind: "contact".to_string(),
-            peer_id: Some(peer_id.to_string()),
-            group_id: None,
+            kind: kind.to_string(),
+            peer_id,
+            group_id,
+            message,
         },
     );
 }
 
+fn emit_contact_updated(app_handle: &AppHandle, peer_id: &str) {
+    emit_conversation_updated(app_handle, "contact", Some(peer_id.to_string()), None, None);
+}
+
+pub fn emit_contact_message_updated(app_handle: &AppHandle, peer_id: &str, message: ChatMessage) {
+    emit_conversation_updated(
+        app_handle,
+        "contact",
+        Some(peer_id.to_string()),
+        None,
+        Some(message),
+    );
+}
+
 fn emit_group_updated(app_handle: &AppHandle, group_id: &str) {
-    let _ = app_handle.emit_all(
-        EVENT_CONVERSATION_UPDATED,
-        ConversationUpdated {
-            kind: "group".to_string(),
-            peer_id: None,
-            group_id: Some(group_id.to_string()),
-        },
+    emit_conversation_updated(app_handle, "group", None, Some(group_id.to_string()), None);
+}
+
+pub fn emit_group_message_updated(app_handle: &AppHandle, group_id: &str, message: ChatMessage) {
+    emit_conversation_updated(
+        app_handle,
+        "group",
+        None,
+        Some(group_id.to_string()),
+        Some(message),
     );
 }
 
@@ -1734,6 +1770,7 @@ async fn send_file_in_background_inner(
                 client_msg_id.as_deref(),
             )
             .await?;
+        emit_contact_message_updated(&app_handle, &peer.id, saved.clone());
 
         // Update peer last_seen
         {

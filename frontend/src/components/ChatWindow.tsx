@@ -4,6 +4,7 @@ import type { GroupInfo } from "../api";
 import { MessageBubble, DateDivider } from "./MessageBubble";
 import { HistorySearchView } from "./HistorySearchView";
 import { Avatar } from "./Avatar";
+import { AvatarPreviewTrigger } from "./AvatarPreview";
 import { formatDateLabel, makeSearchHitId } from "./messageUtils";
 import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, sendMessage, sendMessageTyped, sendFile, sendSticker, sendGroupMessage, sendGroupMessageTyped, sendGroupFile, sendGroupSticker, renameGroup, leaveGroup, dissolveGroup, inviteToGroup, readFileBase64, pauseFileTransfer, resumeFileTransfer, cancelFileTransfer } from "../api";
 import type { ForwardCardData } from "./MessageBubble";
@@ -36,6 +37,7 @@ interface ChatWindowProps {
   myId: string;
   myName?: string;
   conversationResetKey: number;
+  loadingMessages?: boolean;
   isGroup?: boolean;
   groupId?: string | null;
   groupInfo?: GroupInfo | null;
@@ -94,7 +96,21 @@ async function readFileAndSave(file: File): Promise<string> {
   return await saveTempFile(data, file.name || "file");
 }
 
-const EMOJIS = ["😀","😂","🤣","😍","🥰","😘","😜","🤪","😎","🤩","😢","😭","😤","😡","🤬","👍","👎","👏","🙌","💪","🎉","🔥","❤️","💔","💯","✅","❌","⭐","🌟","📎","📁","💡","🎵","🌹","🍕","☕","🚀","🐱","🐶","🦊","🐼","👋","🤝","🙏","💀","👻","🤖","🎂","🏆","🥇","💩"];
+const EMOJIS = [
+  "😀","😃","😄","😁","😆","😂","🤣","😅","😊","🙂",
+  "🙃","😉","😍","🥰","😘","😋","😜","🤪","😎","🤩",
+  "🥳","🤭","🤫","🤔","🫡","😏","🙄","😬","😐","😑",
+  "😶","🫥","🫣","🫢","😳","😮","😲","😵","😵‍💫","🤯",
+  "🥺","😢","😭","😤","😡","🤬","😒","😔","😪","😴",
+  "🥱","🤤","😷","🤒","🤧","🤮","😇","😈","🤡","🫠",
+  "🤦","🙈","🙉","🙊","👍","👎","👌","🤌","👏","🙌",
+  "🙏","🤝","💪","👊","✌️","🤟","👋","🤲","💅","👀",
+  "🎉","🔥","❤️","🧡","💛","💚","💙","💜","💔","💯",
+  "✅","❌","⭐","🌟","💡","🎵","🌹","☕","🍕","🚀",
+  "🐶","🐕","🦮","🐾","🦴","🐱","🐭","🐹","🐰","🦊",
+  "🐼","🐻","🐨","🐯","🦁","🐸","🐵","🐧","🐔","🐟",
+  "📎","📁","🎂","🏆","🥇","💩"
+];
 
 function EmojiThumb({ path }: { path: string }) {
   const [failedPath, setFailedPath] = useState<string | null>(null);
@@ -276,7 +292,7 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
   );
 }
 
-export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, historySearchRequest = null }: ChatWindowProps) {
+export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, loadingMessages = false, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, historySearchRequest = null }: ChatWindowProps) {
   const peerId = peer?.id ?? null;
   const pendingConversationKey = isGroup
     ? groupId ? `group:${groupId}` : peerId ? `group:${peerId}` : ""
@@ -495,9 +511,50 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const emojiPopoverRef = useRef<HTMLDivElement>(null);
+  const dragResetTimerRef = useRef<number | null>(null);
   const nearBottomRef = useRef(true);
 
   const pendingScrollRef = useRef(false);
+
+  const hideDragOverlay = useCallback(() => {
+    if (dragResetTimerRef.current !== null) {
+      window.clearTimeout(dragResetTimerRef.current);
+      dragResetTimerRef.current = null;
+    }
+    setIsDragging(false);
+  }, []);
+
+  const showDragOverlay = useCallback(() => {
+    setIsDragging(true);
+    if (dragResetTimerRef.current !== null) {
+      window.clearTimeout(dragResetTimerRef.current);
+    }
+    dragResetTimerRef.current = window.setTimeout(() => {
+      dragResetTimerRef.current = null;
+      setIsDragging(false);
+    }, 2500);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (dragResetTimerRef.current !== null) {
+        window.clearTimeout(dragResetTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener("blur", hideDragOverlay);
+    window.addEventListener("focus", hideDragOverlay);
+    document.addEventListener("dragend", hideDragOverlay);
+    document.addEventListener("drop", hideDragOverlay);
+    return () => {
+      window.removeEventListener("blur", hideDragOverlay);
+      window.removeEventListener("focus", hideDragOverlay);
+      document.removeEventListener("dragend", hideDragOverlay);
+      document.removeEventListener("drop", hideDragOverlay);
+    };
+  }, [hideDragOverlay]);
 
   const scrollToMessage = useCallback((messageId: number) => {
     requestAnimationFrame(() => {
@@ -882,15 +939,15 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
 
     import("@tauri-apps/api/event").then(({ listen }) => {
       listen("tauri://file-drop-hover", () => {
-        setIsDragging(true);
+        showDragOverlay();
       }).then((fn) => { unlistenHover = fn; });
 
       listen("tauri://file-drop-cancelled", () => {
-        setIsDragging(false);
+        hideDragOverlay();
       }).then((fn) => { unlistenCancelled = fn; });
 
       listen("tauri://file-drop", (event) => {
-        setIsDragging(false);
+        hideDragOverlay();
         const paths = event.payload as string[];
         for (const filePath of paths) {
           const name = filePath.replace(/\\/g, "/").split("/").pop() || "file";
@@ -915,7 +972,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       unlistenDrop?.();
       unlistenCancelled?.();
     };
-  }, [peerId, onSendFile, updatePendingMessagesForKey]);
+  }, [hideDragOverlay, peerId, onSendFile, showDragOverlay, updatePendingMessagesForKey]);
 
   const handlePickFile = async () => {
     const selected = await open({ multiple: true });
@@ -1122,10 +1179,21 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     <div className="flex-1 flex h-full min-w-0">
     <div
       className="chat-surface flex-1 flex flex-col bg-gray-800 h-full relative min-w-0"
-      onDragOver={(e) => e.preventDefault()}
+      onDragEnter={(e) => {
+        e.preventDefault();
+        showDragOverlay();
+      }}
+      onDragOver={(e) => {
+        e.preventDefault();
+        showDragOverlay();
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        hideDragOverlay();
+      }}
     >
       {isDragging && (
-        <div className="absolute inset-0 z-50 bg-indigo-600/20 border-2 border-dashed border-indigo-400 flex items-center justify-center backdrop-blur-sm">
+        <div className="pointer-events-none absolute inset-0 z-50 bg-indigo-600/20 border-2 border-dashed border-indigo-400 flex items-center justify-center backdrop-blur-sm">
           <div className="text-center">
             <svg className="w-16 h-16 mx-auto text-indigo-300 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
@@ -1142,7 +1210,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
             <div className="w-9 h-9 rounded-full flex items-center justify-center text-base text-white bg-indigo-700">👥</div>
           </div>
         ) : (
-          <Avatar name={peer.username} src={peer.avatar_path} size="md" online={peer.online} />
+          <AvatarPreviewTrigger name={peer.username} src={peer.avatar_path} size="md" online={peer.online} />
         )}
         <div className="flex-1 min-w-0">
           <p className="text-white text-sm font-semibold truncate">{peer.username}</p>
@@ -1245,7 +1313,12 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       })()}
 
       <div ref={messagesContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto py-4">
-        {allItems.length === 0 ? (
+        {loadingMessages ? (
+          <div className="flex flex-col items-center justify-center h-full text-gray-500">
+            <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin mb-3" />
+            <p className="text-sm">正在加载聊天记录...</p>
+          </div>
+        ) : allItems.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-gray-500">
             <p className="text-sm">{isGroup ? "暂无群消息" : "暂无消息"}</p>
             <p className="text-xs mt-1">
@@ -1390,20 +1463,6 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
             </button>
             {showEmoji && (
               <div className="absolute bottom-full right-0 mb-2 bg-gray-800 border border-gray-600 rounded-xl shadow-2xl z-50 w-80 overflow-hidden">
-                <div className="flex border-b border-gray-700">
-                  <button
-                    onClick={() => setEmojiTab("default")}
-                    className={`flex-1 py-2 text-xs font-medium ${emojiTab === "default" ? "text-indigo-300 border-b-2 border-indigo-400" : "text-gray-400 hover:text-gray-200"}`}
-                  >
-                    默认
-                  </button>
-                  <button
-                    onClick={() => setEmojiTab("custom")}
-                    className={`flex-1 py-2 text-xs font-medium ${emojiTab === "custom" ? "text-indigo-300 border-b-2 border-indigo-400" : "text-gray-400 hover:text-gray-200"}`}
-                  >
-                    自定义
-                  </button>
-                </div>
                 <div className="p-3">
                   {emojiTab === "custom" ? (
                     <>
@@ -1428,7 +1487,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                                 title="删除表情"
                                 aria-label={`删除表情 ${name}`}
                               >
-                                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 6l12 12M18 6L6 18" />
                                 </svg>
                               </button>
@@ -1476,6 +1535,20 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                       ))}
                     </div>
                   )}
+                </div>
+                <div className="flex border-t border-gray-700">
+                  <button
+                    onClick={() => setEmojiTab("default")}
+                    className={`flex-1 py-2 text-xs font-medium ${emojiTab === "default" ? "text-indigo-300 border-t-2 border-indigo-400" : "text-gray-400 hover:text-gray-200 border-t-2 border-transparent"}`}
+                  >
+                    默认
+                  </button>
+                  <button
+                    onClick={() => setEmojiTab("custom")}
+                    className={`flex-1 py-2 text-xs font-medium ${emojiTab === "custom" ? "text-indigo-300 border-t-2 border-indigo-400" : "text-gray-400 hover:text-gray-200 border-t-2 border-transparent"}`}
+                  >
+                    自定义
+                  </button>
                 </div>
               </div>
             )}
@@ -1568,7 +1641,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                 const displayName = m.peer_id === myId ? (myName || m.username || "我") : (m.username || m.peer_id);
                 return (
                   <div key={m.peer_id} className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-gray-800/70">
-                    <Avatar name={displayName} src={m.avatar_path} size="xs" online={m.peer_id === myId || m.is_online} />
+                    <AvatarPreviewTrigger name={displayName} src={m.avatar_path} size="xs" online={m.peer_id === myId || m.is_online} />
                     <div className="flex-1 min-w-0">
                       <p className="text-xs text-gray-200 truncate" title={displayName}>{displayName}{m.peer_id === myId ? " (我)" : ""}</p>
                       <p className="text-[10px] text-gray-500 truncate">

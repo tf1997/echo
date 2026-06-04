@@ -4,7 +4,7 @@ import { ask, message, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
-import { Avatar } from "./components/Avatar";
+import { AvatarPreviewTrigger } from "./components/AvatarPreview";
 import { applyTheme, getInitialTheme } from "./theme";
 import type { ThemeId } from "./theme";
 import {
@@ -58,6 +58,7 @@ interface ConversationUpdatedEvent {
   kind: "contact" | "group";
   peer_id?: string | null;
   group_id?: string | null;
+  message?: ChatMessage | null;
 }
 
 interface HistorySearchRequest {
@@ -105,12 +106,44 @@ function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
   return true;
 }
 
-function reconcileFetchedMessages(currentMessages: ChatMessage[], nextMessages: ChatMessage[]) {
-  // A transient empty response can happen during peer refresh or event races; keep
-  // the visible chat stable until a non-empty refresh arrives.
-  if (currentMessages.length > 0 && nextMessages.length === 0) {
+function isSameStoredMessage(left: ChatMessage, right: ChatMessage) {
+  if (left.id > 0 && right.id > 0) return left.id === right.id;
+  if (left.client_msg_id && right.client_msg_id) return left.client_msg_id === right.client_msg_id;
+  return false;
+}
+
+function compareMessages(left: ChatMessage, right: ChatMessage) {
+  if (left.id > 0 && right.id > 0 && left.id !== right.id) return left.id - right.id;
+  const leftTime = new Date(left.timestamp).getTime();
+  const rightTime = new Date(right.timestamp).getTime();
+  if (!Number.isNaN(leftTime) && !Number.isNaN(rightTime) && leftTime !== rightTime) {
+    return leftTime - rightTime;
+  }
+  return left.id - right.id;
+}
+
+function mergeMessageIntoList(currentMessages: ChatMessage[], message: ChatMessage) {
+  if (message.msg_type === "file_chunk" || message.msg_type === "file_end") {
     return currentMessages;
   }
+
+  let changed = false;
+  let found = false;
+  const nextMessages = currentMessages.map((current) => {
+    if (!isSameStoredMessage(current, message)) return current;
+    found = true;
+    if (areMessageListsEqual([current], [message])) return current;
+    changed = true;
+    return message;
+  });
+
+  if (!found) {
+    changed = true;
+    nextMessages.push(message);
+  }
+
+  if (!changed) return currentMessages;
+  nextMessages.sort(compareMessages);
   return areMessageListsEqual(currentMessages, nextMessages) ? currentMessages : nextMessages;
 }
 
@@ -119,6 +152,7 @@ function App() {
   const [peers, setPeers] = useState<Peer[]>([]);
   const [selectedPeer, setSelectedPeer] = useState<Peer | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [conversationLoading, setConversationLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [unreadCounts, setUnreadCounts] = useState<UnreadCount[]>([]);
 
@@ -135,6 +169,7 @@ function App() {
   const [scanSubnets, setScanSubnetsState] = useState<string[]>([]);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [groups, setGroups] = useState<GroupInfo[]>([]);
+  const [recentRefreshKey, setRecentRefreshKey] = useState(0);
   const [themeId, setThemeId] = useState<ThemeId>(() => getInitialTheme());
   const [historySearchRequest, setHistorySearchRequest] = useState<HistorySearchRequest | null>(null);
   const [conversationResetKey, setConversationResetKey] = useState(0);
@@ -566,56 +601,34 @@ function App() {
     return active?.kind === kind && active.id === id;
   }, []);
 
-  // Poll contact messages
-  useEffect(() => {
-    if (!appInfo?.initialized || !selectedPeerId) return;
-    let cancelled = false;
-    let inFlight = false;
-    const activePeerId = selectedPeerId;
-    const interval = setInterval(() => {
-      if (inFlight) return;
-      inFlight = true;
-      getConversation(activePeerId, MESSAGE_FETCH_LIMIT)
-        .then((nextMessages) => {
-          if (cancelled || !isActiveConversation("contact", activePeerId)) return;
-          setMessages((currentMessages) => reconcileFetchedMessages(currentMessages, nextMessages));
-          return markRead(activePeerId);
-        })
-        .catch(console.error)
-        .finally(() => {
-          inFlight = false;
-        });
-    }, 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [appInfo?.initialized, selectedPeerId, isActiveConversation]);
+  const refreshActiveConversation = useCallback(async () => {
+    const active = activeConversationRef.current;
+    if (!active) return;
+    if (active.kind === "group") {
+      const nextMessages = await getGroupMessages(active.id, MESSAGE_FETCH_LIMIT);
+      if (!isActiveConversation("group", active.id)) return;
+      setMessages((currentMessages) => nextMessages.reduce(mergeMessageIntoList, currentMessages));
+      await markGroupRead(active.id);
+      const nextGroups = await listGroups();
+      setGroups(nextGroups);
+      return;
+    }
 
-  // Poll group messages
+    const nextMessages = await getConversation(active.id, MESSAGE_FETCH_LIMIT);
+    if (!isActiveConversation("contact", active.id)) return;
+    setMessages((currentMessages) => nextMessages.reduce(mergeMessageIntoList, currentMessages));
+    await markRead(active.id);
+    await loadPeerState();
+  }, [isActiveConversation, loadPeerState]);
+
   useEffect(() => {
-    if (!appInfo?.initialized || !selectedGroupId) return;
-    let cancelled = false;
-    let inFlight = false;
-    const interval = setInterval(() => {
-      if (inFlight) return;
-      inFlight = true;
-      getGroupMessages(selectedGroupId, MESSAGE_FETCH_LIMIT)
-        .then((nextMessages) => {
-          if (cancelled || !isActiveConversation("group", selectedGroupId)) return;
-          setMessages((currentMessages) => reconcileFetchedMessages(currentMessages, nextMessages));
-          return markGroupRead(selectedGroupId);
-        })
-        .catch(console.error)
-        .finally(() => {
-          inFlight = false;
-        });
-    }, 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
+    if (!appInfo?.initialized) return;
+    const handleFocus = () => {
+      refreshActiveConversation().catch(console.error);
     };
-  }, [appInfo?.initialized, selectedGroupId, isActiveConversation]);
+    window.addEventListener("focus", handleFocus);
+    return () => window.removeEventListener("focus", handleFocus);
+  }, [appInfo?.initialized, refreshActiveConversation]);
 
   // Load groups (with unread + last message)
   useEffect(() => {
@@ -634,6 +647,7 @@ function App() {
   const handleSelectPeer = useCallback(async (peer: Peer, options?: SelectConversationOptions) => {
     const nonce = ++selectionNonceRef.current;
     activeConversationRef.current = { kind: "contact", id: peer.id };
+    setConversationLoading(true);
     setConversationResetKey((key) => key + 1);
     if (!options?.preserveHistory) {
       setHistorySearchRequest(null);
@@ -647,7 +661,7 @@ function App() {
         markRead(peer.id),
       ]);
       if (selectionNonceRef.current !== nonce) return;
-      setMessages(conv);
+      setMessages((currentMessages) => conv.reduce(mergeMessageIntoList, currentMessages));
       checkPeerOnline(peer.id, peer.ip, peer.port).then((online) => {
         if (!online) {
           onlineGraceUntilRef.current.delete(peer.id);
@@ -661,12 +675,17 @@ function App() {
       });
     } catch (err) {
       console.error("Failed to load conversation:", err);
+    } finally {
+      if (selectionNonceRef.current === nonce) {
+        setConversationLoading(false);
+      }
     }
   }, []);
 
   const handleSelectGroup = useCallback(async (groupId: string, options?: SelectConversationOptions) => {
     const nonce = ++selectionNonceRef.current;
     activeConversationRef.current = { kind: "group", id: groupId };
+    setConversationLoading(true);
     setConversationResetKey((key) => key + 1);
     if (!options?.preserveHistory) {
       setHistorySearchRequest(null);
@@ -680,9 +699,13 @@ function App() {
         markGroupRead(groupId),
       ]);
       if (selectionNonceRef.current !== nonce) return;
-      setMessages(msgs);
+      setMessages((currentMessages) => msgs.reduce(mergeMessageIntoList, currentMessages));
     } catch (err) {
       console.error("Failed to load group messages:", err);
+    } finally {
+      if (selectionNonceRef.current === nonce) {
+        setConversationLoading(false);
+      }
     }
   }, []);
 
@@ -701,32 +724,36 @@ function App() {
     let unlisten: (() => void) | undefined;
     listen<ConversationUpdatedEvent>("conversation-updated", (event) => {
       const payload = event.payload;
-      loadPeerState().catch(console.error);
+      setRecentRefreshKey((key) => key + 1);
 
       if (payload.kind === "group") {
-        listGroups().then(setGroups).catch(console.error);
         const groupId = payload.group_id;
-        if (groupId && isActiveConversation("group", groupId)) {
-          getGroupMessages(groupId, MESSAGE_FETCH_LIMIT)
-            .then((nextMessages) => {
-              if (!isActiveConversation("group", groupId)) return;
-              setMessages((currentMessages) => reconcileFetchedMessages(currentMessages, nextMessages));
-              return markGroupRead(groupId);
-            })
+        if (!groupId) return;
+        if (isActiveConversation("group", groupId)) {
+          if (payload.message) {
+            setMessages((currentMessages) => mergeMessageIntoList(currentMessages, payload.message!));
+          }
+          markGroupRead(groupId)
+            .then(() => listGroups())
+            .then(setGroups)
             .catch(console.error);
+        } else {
+          listGroups().then(setGroups).catch(console.error);
         }
         return;
       }
 
       const peerId = payload.peer_id;
-      if (peerId && isActiveConversation("contact", peerId)) {
-        getConversation(peerId, MESSAGE_FETCH_LIMIT)
-          .then((nextMessages) => {
-            if (!isActiveConversation("contact", peerId)) return;
-            setMessages((currentMessages) => reconcileFetchedMessages(currentMessages, nextMessages));
-            return markRead(peerId);
-          })
+      if (!peerId) return;
+      if (isActiveConversation("contact", peerId)) {
+        if (payload.message) {
+          setMessages((currentMessages) => mergeMessageIntoList(currentMessages, payload.message!));
+        }
+        markRead(peerId)
+          .then(() => loadPeerState())
           .catch(console.error);
+      } else {
+        loadPeerState().catch(console.error);
       }
     }).then((fn) => { unlisten = fn; });
 
@@ -754,13 +781,15 @@ function App() {
   const handleSendMessage = useCallback(async (content: string, clientMsgId?: string) => {
     if (!selectedPeer) throw new Error("未选择联系人");
     const sent = await sendMessage(selectedPeer.id, content, clientMsgId);
-    setMessages((prev) => [...prev, sent]);
+    setMessages((prev) => mergeMessageIntoList(prev, sent));
+    setRecentRefreshKey((key) => key + 1);
     return sent;
   }, [selectedPeer]);
 
   const handleSendGroupMsg = useCallback(async (groupId: string, content: string, clientMsgId?: string) => {
     const msg = await sendGroupMessage(groupId, content, clientMsgId);
-    setMessages((prev) => [...prev, msg]);
+    setMessages((prev) => mergeMessageIntoList(prev, msg));
+    listGroups().then(setGroups).catch(console.error);
     return msg;
   }, []);
 
@@ -775,7 +804,8 @@ function App() {
   const handleSendSticker = useCallback(async (filePath: string, clientMsgId?: string) => {
     if (selectedGroupId) {
       const sent = await sendGroupSticker(selectedGroupId, filePath, clientMsgId);
-      setMessages((prev) => [...prev, sent]);
+      setMessages((prev) => mergeMessageIntoList(prev, sent));
+      listGroups().then(setGroups).catch(console.error);
       return sent;
     }
     if (!selectedPeer) throw new Error("未选择联系人");
@@ -936,11 +966,12 @@ function App() {
           <h1 className="text-xl font-semibold">{appInfo?.initialized ? "编辑个人信息" : "首次启动设置"}</h1>
           <p className="text-sm text-gray-400">请填写用户名和部门，部门可使用已保存候选项。</p>
           <div className="flex items-center gap-4">
-            <Avatar
+            <AvatarPreviewTrigger
               name={username || "我"}
               src={profileAvatarPath}
               size="xl"
               fallbackClassName="bg-indigo-500"
+              title="预览头像"
             />
             <div className="flex min-w-0 flex-1 items-center gap-2">
               <button
@@ -1055,6 +1086,7 @@ function App() {
         groups={groups}
         themeId={themeId}
         onThemeChange={handleThemeChange}
+        recentRefreshKey={recentRefreshKey}
       />
       <ChatWindow
         peer={selectedGroupId ? { id: selectedGroupId, username: groups.find(g => g.group_id === selectedGroupId)?.name || "群聊", department: "", software_version: "", mac_address: "", ip: "", port: 0, online: true } : selectedPeer}
@@ -1062,6 +1094,7 @@ function App() {
         myId={appInfo.peer_id}
         myName={appInfo.username}
         conversationResetKey={conversationResetKey}
+        loadingMessages={conversationLoading}
         isGroup={!!selectedGroupId}
         groupId={selectedGroupId}
         groupInfo={selectedGroupId ? groups.find(g => g.group_id === selectedGroupId) ?? null : null}

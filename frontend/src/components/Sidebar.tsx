@@ -5,6 +5,7 @@ import { THEMES } from "../theme";
 import type { ThemeId } from "../theme";
 import type { GroupInfo, SearchResult } from "../api";
 import { Avatar } from "./Avatar";
+import { AvatarPreviewTrigger } from "./AvatarPreview";
 
 interface SidebarProps {
   peers: Peer[];
@@ -30,6 +31,7 @@ interface SidebarProps {
   groups: GroupInfo[];
   themeId: ThemeId;
   onThemeChange: (themeId: ThemeId) => void;
+  recentRefreshKey: number;
 }
 
 function peerEndpointKey(peer: Pick<Peer, "ip" | "port">) {
@@ -40,7 +42,7 @@ function storedPeerEndpointKey(peer: Pick<StoredPeer, "ip" | "port">) {
   return peer.ip && peer.port ? `${peer.ip}:${peer.port}` : "";
 }
 
-export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myId, myName, myDepartment, mySoftwareVersion, myMacAddress, myAvatarPath, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit, onJumpToGroupSearchHit, selectedGroupId, onSelectGroup, groups, themeId, onThemeChange }: SidebarProps) {
+export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myId, myName, myDepartment, mySoftwareVersion, myMacAddress, myAvatarPath, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit, onJumpToGroupSearchHit, selectedGroupId, onSelectGroup, groups, themeId, onThemeChange, recentRefreshKey }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [groupSearchResults, setGroupSearchResults] = useState<{ group: GroupInfo; messages: ChatMessage[] }[]>([]);
@@ -76,7 +78,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
     });
   }, []);
 
-  useEffect(() => { listRecentContacts().then(setRecentContacts).catch(() => {}); }, [peers, tab]);
+  useEffect(() => { listRecentContacts().then(setRecentContacts).catch(() => {}); }, [recentRefreshKey, tab]);
 
   useEffect(() => {
     return () => {
@@ -401,13 +403,14 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
     <div className="app-sidebar relative flex flex-col w-72 bg-gray-900 text-white h-full border-r border-gray-700">
       <div className="p-4 border-b border-gray-700 relative">
         <div className="flex items-center gap-3">
-          <button
-            onClick={() => setShowProfile(!showProfile)}
-            className="own-profile-avatar relative flex-shrink-0 w-10 h-10 rounded-full bg-indigo-500 hover:bg-indigo-400 transition-colors flex items-center justify-center text-lg font-bold cursor-pointer"
-            title="查看个人信息"
-          >
-            <Avatar name={myName} src={myAvatarPath} size="lg" fallbackClassName="bg-indigo-500" />
-          </button>
+          <AvatarPreviewTrigger
+            name={myName}
+            src={myAvatarPath}
+            size="lg"
+            fallbackClassName="bg-indigo-500"
+            className="own-profile-avatar"
+            title="预览头像"
+          />
           <button
             onClick={() => setShowProfile(!showProfile)}
             className="flex-1 min-w-0 text-left cursor-pointer hover:opacity-80"
@@ -427,7 +430,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
         {showProfile && (
           <div className="absolute top-full left-2 right-2 mt-1 z-50 bg-gray-800 border border-gray-600 rounded-xl p-4 shadow-2xl">
             <div className="flex items-center gap-3 mb-3">
-              <Avatar name={myName} src={myAvatarPath} size="xl" fallbackClassName="bg-indigo-500" />
+              <AvatarPreviewTrigger name={myName} src={myAvatarPath} size="xl" fallbackClassName="bg-indigo-500" />
               <div>
                 <p className="text-sm font-semibold">{myName}</p>
                 <p className="text-xs text-gray-400">{myDepartment}</p>
@@ -1074,7 +1077,9 @@ function PeerItem({ peer, isSelected, unread, onClick, onAvatarClick }: { peer: 
       >
         <p className="text-sm font-medium truncate">{peer.username}</p>
         <p className="text-xs text-gray-400 truncate">{peer.department}</p>
-        <p className="text-[10px] text-gray-500 truncate">{peer.online ? `${peer.ip}:${peer.port}` : "离线"}</p>
+        <p className="text-[10px] text-gray-500 truncate">
+          {peer.ip && peer.port ? `${peer.online ? "在线" : "离线"} · ${peer.ip}:${peer.port}` : (peer.online ? "在线" : "离线")}
+        </p>
       </button>
       {unread > 0 && !isSelected && (
         <div className="flex-shrink-0 w-5 h-5 rounded-full bg-red-500 flex items-center justify-center text-[10px] font-bold">
@@ -1112,7 +1117,7 @@ function PeerProfileCard({ peer, copied, refreshing, onCopy, onClose }: { peer: 
     <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/50 px-4">
       <div className="w-full rounded-xl border border-gray-600 bg-gray-800 p-4 shadow-2xl">
         <div className="mb-4 flex items-center gap-3">
-          <Avatar name={peer.username} src={peer.avatar_path} size="xl" online={peer.online} />
+          <AvatarPreviewTrigger name={peer.username} src={peer.avatar_path} size="xl" online={peer.online} />
           <div className="min-w-0 flex-1">
             <p className="truncate text-sm font-semibold text-gray-100">{peer.username}</p>
             <p className="truncate text-xs text-gray-400">{peer.department || "未分组"}</p>

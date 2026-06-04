@@ -2710,6 +2710,7 @@ async fn send_group_file_with_kind(
             return Err(error.to_string());
         }
     };
+    crate::chat::emit_group_message_updated(&app_handle, &group_id, saved.clone());
 
     let _ = app_handle.emit_all(
         "file-progress",
