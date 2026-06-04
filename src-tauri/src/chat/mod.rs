@@ -44,6 +44,25 @@ fn normalized_client_msg_id(client_msg_id: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+pub fn is_self_peer(peer: &Peer, my_id: &str, listen_port: u16) -> bool {
+    if peer.id == my_id || peer.address() == my_id {
+        return true;
+    }
+
+    if peer.port != listen_port {
+        return false;
+    }
+
+    if peer.ip.is_loopback() {
+        return true;
+    }
+
+    my_id
+        .rsplit_once(':')
+        .map(|(my_ip, _)| peer.ip.to_string() == my_ip)
+        .unwrap_or(false)
+}
+
 pub async fn register_outgoing_file_transfer(client_msg_id: Option<&str>) {
     let Some(client_msg_id) = normalized_client_msg_id(client_msg_id) else {
         return;
@@ -1154,6 +1173,29 @@ impl ChatServer {
         msg_type: &str,
         client_msg_id: Option<&str>,
     ) -> Result<crate::db::ChatMessage> {
+        if is_self_peer(peer, &self.my_id, self.listen_port) {
+            let _ = self.db.add_recent_contact(&peer.id).await;
+            let mut saved = self
+                .db
+                .save_message(
+                    &self.my_id,
+                    &self.my_name,
+                    &peer.id,
+                    content,
+                    msg_type,
+                    None,
+                    None,
+                    None,
+                    client_msg_id,
+                )
+                .await?;
+            if peer.id == self.my_id {
+                let _ = self.db.mark_read(&peer.id, &self.my_id).await;
+                saved.is_read = true;
+            }
+            return Ok(saved);
+        }
+
         let msg = WireMessage {
             sender_id: self.my_id.clone(),
             sender_name: self.my_name.clone(),
@@ -1821,5 +1863,36 @@ async fn send_file_in_background_inner(
             is_read: true,
             client_msg_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_self_peer, Peer};
+
+    #[test]
+    fn self_peer_matches_identity() {
+        let peer = Peer::new(
+            "192.168.1.8:9527".to_string(),
+            "me".to_string(),
+            String::new(),
+            "192.168.1.8".parse().unwrap(),
+            9527,
+        );
+
+        assert!(is_self_peer(&peer, "192.168.1.8:9527", 9527));
+    }
+
+    #[test]
+    fn loopback_peer_on_listen_port_matches_self() {
+        let peer = Peer::new(
+            "127.0.0.1:9527".to_string(),
+            "me".to_string(),
+            String::new(),
+            "127.0.0.1".parse().unwrap(),
+            9527,
+        );
+
+        assert!(is_self_peer(&peer, "192.168.1.8:9527", 9527));
     }
 }

@@ -6,7 +6,8 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::chat::{
     base64_encode_into, base64_encoded_capacity, cancel_outgoing_file_transfer,
-    clear_outgoing_file_transfer, pause_outgoing_file_transfer, register_outgoing_file_transfer,
+    clear_outgoing_file_transfer, emit_contact_message_updated, is_self_peer,
+    pause_outgoing_file_transfer, register_outgoing_file_transfer,
     resume_outgoing_file_transfer, send_file_in_background_with_kind,
     serialize_file_wire_message_line, wait_for_outgoing_file_transfer, FileWireMessageLine,
     WireMessage, FILE_CHUNK_SIZE, FILE_SOCKET_BUFFER_SIZE, FILE_TRANSFER_CANCELLED_MESSAGE,
@@ -900,7 +901,8 @@ async fn send_file_with_kind(
     };
     drop(discovery);
 
-    if !peer.online {
+    let peer_is_self = is_self_peer(&peer, &runtime.my_id, runtime.listen_port);
+    if !peer_is_self && !peer.online {
         return Err("对方当前离线，文件未发送。请等待对方上线后重试。".to_string());
     }
 
@@ -930,6 +932,45 @@ async fn send_file_with_kind(
                 .unwrap_or("unknown")
                 .to_string()
         });
+
+    if peer_is_self {
+        let file_size = tokio::fs::metadata(&file_path)
+            .await
+            .map(|metadata| metadata.len() as i64)
+            .map_err(|e| e.to_string())?;
+        let msg_kind = if file_kind == "sticker" {
+            "sticker"
+        } else {
+            "file"
+        };
+        let content = if msg_kind == "sticker" {
+            "[表情]".to_string()
+        } else {
+            format!("📎 {}", file_name)
+        };
+
+        let _ = db.add_recent_contact(&peer.id).await;
+        let mut saved = db
+            .save_message(
+                &my_id,
+                &my_name,
+                &peer.id,
+                &content,
+                msg_kind,
+                Some(&file_path),
+                Some(&file_name),
+                Some(file_size),
+                client_msg_id.as_deref(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if peer.id == my_id {
+            let _ = db.mark_read(&peer.id, &my_id).await;
+            saved.is_read = true;
+        }
+        emit_contact_message_updated(&app_handle, &peer.id, saved.clone());
+        return Ok(saved);
+    }
 
     // Clone for placeholder (before moving into background task)
     let placeholder_my_id = my_id.clone();
