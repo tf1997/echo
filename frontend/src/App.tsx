@@ -2,11 +2,13 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import type { Peer, ChatMessage, AppInfo, StoredPeer, UnreadCount, UpdateCheckResult } from "./types";
 import { ask, message, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
+import { appWindow } from "@tauri-apps/api/window";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
 import { AvatarPreviewTrigger } from "./components/AvatarPreview";
 import { applyTheme, getInitialTheme } from "./theme";
 import type { ThemeId } from "./theme";
+import { MESSAGE_TYPE_NUDGE, NUDGE_COOLDOWN_MS, NUDGE_MESSAGE_CONTENT } from "./messageTypes";
 import {
   downloadUpdate,
   getAppInfo,
@@ -14,6 +16,7 @@ import {
   getConversation,
   getConversationHistory,
   sendMessage,
+  sendMessageTyped,
   sendFile,
   sendSticker,
   markRead,
@@ -29,6 +32,7 @@ import {
   getGroupMessages,
   getGroupHistory,
   sendGroupMessage,
+  sendGroupMessageTyped,
   sendGroupFile,
   sendGroupSticker,
   listGroups,
@@ -72,6 +76,28 @@ type ConversationKind = "contact" | "group";
 interface ActiveConversation {
   kind: ConversationKind;
   id: string;
+}
+
+interface NudgeSignal {
+  kind: ConversationKind;
+  targetId: string;
+  nonce: number;
+}
+
+function isIncomingNudge(message: ChatMessage | null | undefined, myId: string | undefined): message is ChatMessage {
+  return !!message && message.msg_type === MESSAGE_TYPE_NUDGE && message.sender_id !== myId;
+}
+
+async function bringAppToFrontForNudge() {
+  try {
+    await appWindow.show();
+    if (await appWindow.isMinimized().catch(() => false)) {
+      await appWindow.unminimize();
+    }
+    await appWindow.setFocus();
+  } catch (error) {
+    console.error("Failed to bring app to front for nudge:", error);
+  }
 }
 
 interface SelectConversationOptions {
@@ -171,6 +197,7 @@ function App() {
   const [themeId, setThemeId] = useState<ThemeId>(() => getInitialTheme());
   const [historySearchRequest, setHistorySearchRequest] = useState<HistorySearchRequest | null>(null);
   const [conversationResetKey, setConversationResetKey] = useState(0);
+  const [nudgeSignal, setNudgeSignal] = useState<NudgeSignal | null>(null);
   const checkingUpdateRef = useRef(false);
   const departmentPickerRef = useRef<HTMLDivElement | null>(null);
   const historySearchNonceRef = useRef(0);
@@ -187,6 +214,8 @@ function App() {
   const loadPeerStateInFlightRef = useRef(false);
   const activeConversationRef = useRef<ActiveConversation | null>(null);
   const selectionNonceRef = useRef(0);
+  const nudgeNonceRef = useRef(0);
+  const incomingNudgeCooldownRef = useRef(new Map<string, number>());
   const avatarRequestsRef = useRef(new Set<string>());
   const avatarRequestAttemptsRef = useRef(new Set<string>());
 
@@ -505,6 +534,7 @@ function App() {
       );
       return canonicalPeer ?? current;
     });
+    return mergedPeers;
   }, [mergePeers]);
 
   const loadMainData = useCallback(async () => {
@@ -716,6 +746,41 @@ function App() {
   useEffect(() => { selectPeerRef.current = handleSelectPeer; }, [handleSelectPeer]);
   useEffect(() => { selectGroupRef.current = handleSelectGroup; }, [handleSelectGroup]);
 
+  const triggerNudge = useCallback((kind: ConversationKind, targetId: string) => {
+    setNudgeSignal({
+      kind,
+      targetId,
+      nonce: ++nudgeNonceRef.current,
+    });
+  }, []);
+
+  const canInterruptForIncomingNudge = useCallback((kind: ConversationKind, targetId: string, senderId: string) => {
+    const key = `${kind}:${targetId}:${senderId}`;
+    const now = Date.now();
+    const cooldownUntil = incomingNudgeCooldownRef.current.get(key) ?? 0;
+    if (cooldownUntil > now) return false;
+    incomingNudgeCooldownRef.current.set(key, now + NUDGE_COOLDOWN_MS);
+    return true;
+  }, []);
+
+  const selectIncomingNudgePeer = useCallback(async (peerId: string) => {
+    const currentPeer = peersRef.current.find((peer) => peer.id === peerId);
+    if (currentPeer) {
+      void selectPeerRef.current(currentPeer);
+      return;
+    }
+
+    try {
+      const refreshedPeers = await loadPeerState();
+      const refreshedPeer = refreshedPeers.find((peer) => peer.id === peerId);
+      if (refreshedPeer) {
+        void selectPeerRef.current(refreshedPeer);
+      }
+    } catch (error) {
+      console.error("Failed to select nudge peer:", error);
+    }
+  }, [loadPeerState]);
+
   useEffect(() => {
     if (!appInfo?.initialized) return;
 
@@ -727,7 +792,19 @@ function App() {
       if (payload.kind === "group") {
         const groupId = payload.group_id;
         if (!groupId) return;
-        if (isActiveConversation("group", groupId)) {
+        const incomingNudge = isIncomingNudge(payload.message, appInfo?.peer_id) ? payload.message : null;
+        const canInterrupt = incomingNudge
+          ? canInterruptForIncomingNudge("group", groupId, incomingNudge.sender_id)
+          : false;
+        const activeGroup = isActiveConversation("group", groupId);
+        if (canInterrupt) {
+          void bringAppToFrontForNudge();
+          triggerNudge("group", groupId);
+          if (!activeGroup) {
+            void selectGroupRef.current(groupId);
+          }
+        }
+        if (activeGroup) {
           if (payload.message) {
             setMessages((currentMessages) => mergeMessageIntoList(currentMessages, payload.message!));
           }
@@ -743,7 +820,19 @@ function App() {
 
       const peerId = payload.peer_id;
       if (!peerId) return;
-      if (isActiveConversation("contact", peerId)) {
+      const incomingNudge = isIncomingNudge(payload.message, appInfo?.peer_id) ? payload.message : null;
+      const canInterrupt = incomingNudge
+        ? canInterruptForIncomingNudge("contact", peerId, incomingNudge.sender_id)
+        : false;
+      const activeContact = isActiveConversation("contact", peerId);
+      if (canInterrupt) {
+        void bringAppToFrontForNudge();
+        triggerNudge("contact", peerId);
+        if (!activeContact) {
+          void selectIncomingNudgePeer(peerId);
+        }
+      }
+      if (activeContact) {
         if (payload.message) {
           setMessages((currentMessages) => mergeMessageIntoList(currentMessages, payload.message!));
         }
@@ -758,7 +847,7 @@ function App() {
     return () => {
       unlisten?.();
     };
-  }, [appInfo?.initialized, loadPeerState, isActiveConversation]);
+  }, [appInfo?.initialized, appInfo?.peer_id, canInterruptForIncomingNudge, loadPeerState, isActiveConversation, selectIncomingNudgePeer, triggerNudge]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -790,6 +879,22 @@ function App() {
     listGroups().then(setGroups).catch(console.error);
     return msg;
   }, []);
+
+  const handleSendNudge = useCallback(async (clientMsgId?: string) => {
+    if (selectedGroupId) {
+      const msg = await sendGroupMessageTyped(selectedGroupId, NUDGE_MESSAGE_CONTENT, MESSAGE_TYPE_NUDGE, clientMsgId);
+      setMessages((prev) => mergeMessageIntoList(prev, msg));
+      triggerNudge("group", selectedGroupId);
+      listGroups().then(setGroups).catch(console.error);
+      return msg;
+    }
+    if (!selectedPeer) throw new Error("未选择联系人");
+    const sent = await sendMessageTyped(selectedPeer.id, NUDGE_MESSAGE_CONTENT, MESSAGE_TYPE_NUDGE, clientMsgId);
+    setMessages((prev) => mergeMessageIntoList(prev, sent));
+    triggerNudge("contact", selectedPeer.id);
+    setRecentRefreshKey((key) => key + 1);
+    return sent;
+  }, [selectedGroupId, selectedPeer, triggerNudge]);
 
   const handleSendFile = useCallback(async (filePath: string, clientMsgId?: string, fileName?: string | null) => {
     if (selectedGroupId) {
@@ -1101,8 +1206,10 @@ function App() {
         peers={peers}
         groups={groups}
         onSendMessage={selectedGroupId ? ((content: string, clientMsgId?: string) => handleSendGroupMsg(selectedGroupId!, content, clientMsgId)) : handleSendMessage}
+        onSendNudge={handleSendNudge}
         onSendFile={handleSendFile}
         onSendSticker={handleSendSticker}
+        nudgeSignal={nudgeSignal}
         onGroupUpdated={() => listGroups().then(setGroups).catch(() => {})}
         onLoadHistoryContext={handleLoadHistoryContext}
         historySearchRequest={

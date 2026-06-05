@@ -11,6 +11,7 @@ import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, sendMessag
 import type { ForwardCardData } from "./MessageBubble";
 import { ask, message as showDialogMessage, open } from "@tauri-apps/api/dialog";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
+import { MESSAGE_TYPE_NUDGE, NUDGE_COOLDOWN_MS } from "../messageTypes";
 
 export interface PendingMessage {
   id: number;
@@ -45,10 +46,16 @@ interface ChatWindowProps {
   peers?: Peer[];
   groups?: GroupInfo[];
   onSendMessage: (content: string, clientMsgId?: string) => Promise<ChatMessage>;
+  onSendNudge: (clientMsgId?: string) => Promise<ChatMessage>;
   onSendFile: (filePath: string, clientMsgId?: string, fileName?: string | null) => Promise<void | ChatMessage>;
   onSendSticker: (filePath: string, clientMsgId?: string) => Promise<ChatMessage>;
   onGroupUpdated?: () => void;
   onLoadHistoryContext?: (messageId: number) => Promise<void>;
+  nudgeSignal?: {
+    kind: "contact" | "group";
+    targetId: string;
+    nonce: number;
+  } | null;
   historySearchRequest?: {
     query: string;
     messageId?: number | null;
@@ -340,6 +347,10 @@ function getPendingStatusText(message: PendingMessage): string {
   return "发送中...";
 }
 
+function getNudgeFallbackText(senderName: string, isOwn: boolean): string {
+  return isOwn ? "你发送了一个抖一抖" : `${senderName || "对方"} 发送了一个抖一抖`;
+}
+
 type ForwardMode = "individual" | "merged";
 
 function isAttachmentMessage(message: ChatMessage): boolean {
@@ -350,6 +361,7 @@ function fallbackForwardText(message: ChatMessage): string {
   if (message.msg_type === "file") return `📎 ${message.file_name || message.content || "文件"}`;
   if (message.msg_type === "sticker") return "[表情]";
   if (message.msg_type === "forward_card") return "[聊天记录]";
+  if (message.msg_type === MESSAGE_TYPE_NUDGE) return getNudgeFallbackText(message.sender_name, false);
   return message.content;
 }
 
@@ -490,7 +502,7 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
   );
 }
 
-export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, loadingMessages = false, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, historySearchRequest = null }: ChatWindowProps) {
+export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, loadingMessages = false, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendNudge, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, nudgeSignal = null, historySearchRequest = null }: ChatWindowProps) {
   const peerId = peer?.id ?? null;
   const pendingConversationKey = isGroup
     ? groupId ? `group:${groupId}` : peerId ? `group:${peerId}` : ""
@@ -578,6 +590,9 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const [groupMemberQuery, setGroupMemberQuery] = useState("");
   const [groupInviteQuery, setGroupInviteQuery] = useState("");
   const [contextHighlightId, setContextHighlightId] = useState<number | null>(null);
+  const [nudgeSending, setNudgeSending] = useState(false);
+  const [nudgeCooldownRemainingMs, setNudgeCooldownRemainingMs] = useState(0);
+  const [nudgeAnimating, setNudgeAnimating] = useState(false);
   const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const pendingJumpMessageIdRef = useRef<number | null>(null);
   const contextHighlightTimerRef = useRef<number | null>(null);
@@ -710,6 +725,8 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const fileInputRef = useRef<HTMLInputElement>(null);
   const emojiPopoverRef = useRef<HTMLDivElement>(null);
   const dragResetTimerRef = useRef<number | null>(null);
+  const nudgeTimerRef = useRef<number | null>(null);
+  const nudgeCooldownUntilRef = useRef(new Map<string, number>());
   const nearBottomRef = useRef(true);
   const composerCaretOffsetRef = useRef(0);
   const composerRenderingRef = useRef(false);
@@ -741,8 +758,37 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       if (dragResetTimerRef.current !== null) {
         window.clearTimeout(dragResetTimerRef.current);
       }
+      if (nudgeTimerRef.current !== null) {
+        window.clearTimeout(nudgeTimerRef.current);
+      }
     };
   }, []);
+
+  const playNudgeAnimation = useCallback(() => {
+    if (nudgeTimerRef.current !== null) {
+      window.clearTimeout(nudgeTimerRef.current);
+      nudgeTimerRef.current = null;
+    }
+    setNudgeAnimating(false);
+    requestAnimationFrame(() => {
+      setNudgeAnimating(true);
+      nudgeTimerRef.current = window.setTimeout(() => {
+        setNudgeAnimating(false);
+        nudgeTimerRef.current = null;
+      }, 620);
+    });
+  }, []);
+
+  useEffect(() => {
+    const updateCooldown = () => {
+      const cooldownUntil = nudgeCooldownUntilRef.current.get(pendingConversationKey) ?? 0;
+      setNudgeCooldownRemainingMs(Math.max(0, cooldownUntil - Date.now()));
+    };
+
+    updateCooldown();
+    const interval = window.setInterval(updateCooldown, 500);
+    return () => window.clearInterval(interval);
+  }, [pendingConversationKey]);
 
   useEffect(() => {
     window.addEventListener("blur", hideDragOverlay);
@@ -857,6 +903,14 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     document.addEventListener("mousedown", handlePointerDown);
     return () => document.removeEventListener("mousedown", handlePointerDown);
   }, [showEmoji]);
+
+  useEffect(() => {
+    if (!nudgeSignal) return;
+    const activeKind = isGroup ? "group" : "contact";
+    const activeId = isGroup ? groupId : peer?.id;
+    if (!activeId || nudgeSignal.kind !== activeKind || nudgeSignal.targetId !== activeId) return;
+    playNudgeAnimation();
+  }, [groupId, isGroup, nudgeSignal, peer?.id, playNudgeAnimation]);
 
   const syncComposerDom = useCallback((text: string, caretOffset: number | null = null) => {
     const el = inputRef.current;
@@ -1073,6 +1127,33 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       ));
     }
   }, [peer, isGroup, onSendSticker, updatePendingMessagesForKey]);
+
+  const sendNudge = useCallback(async () => {
+    if (!peer || nudgeSending) return;
+    const now = Date.now();
+    const cooldownUntil = nudgeCooldownUntilRef.current.get(pendingConversationKey) ?? 0;
+    if (cooldownUntil > now) {
+      setNudgeCooldownRemainingMs(cooldownUntil - now);
+      return;
+    }
+
+    setNudgeSending(true);
+    nearBottomRef.current = true;
+    try {
+      await onSendNudge();
+      const nextCooldownUntil = Date.now() + NUDGE_COOLDOWN_MS;
+      nudgeCooldownUntilRef.current.set(pendingConversationKey, nextCooldownUntil);
+      setNudgeCooldownRemainingMs(NUDGE_COOLDOWN_MS);
+    } catch (error) {
+      await showDialogMessage(String(error || "抖一抖发送失败"), {
+        title: "抖一抖失败",
+        type: "error",
+        okLabel: "确定",
+      }).catch(() => {});
+    } finally {
+      setNudgeSending(false);
+    }
+  }, [nudgeSending, onSendNudge, peer, pendingConversationKey]);
 
   const sendText = useCallback(async () => {
     const currentText = inputRef.current ? decodeEchoEmojiTokens(readComposerText(inputRef.current)) : inputText;
@@ -1432,11 +1513,14 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const historyConversationKey = isGroup
     ? `group:${groupId ?? peer.id}`
     : `contact:${peer.ip && peer.port ? `${peer.ip}:${peer.port}` : peer.id}`;
+  const nudgeCooldownSeconds = Math.ceil(nudgeCooldownRemainingMs / 1000);
+  const nudgeDisabled = nudgeSending || nudgeCooldownSeconds > 0;
+  const nudgeTitle = nudgeCooldownSeconds > 0 ? `抖一抖冷却中（${nudgeCooldownSeconds} 秒）` : "抖一抖";
 
   return (
     <div className="flex-1 flex h-full min-w-0">
     <div
-      className="chat-surface flex-1 flex flex-col bg-gray-800 h-full relative min-w-0"
+      className={`chat-surface flex-1 flex flex-col bg-gray-800 h-full relative min-w-0 ${nudgeAnimating ? "nudge-shake" : ""}`}
       onDragEnter={(e) => {
         e.preventDefault();
         showDragOverlay();
@@ -1811,6 +1895,24 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
               </div>
             )}
           </div>
+          <button
+            type="button"
+            onClick={sendNudge}
+            disabled={nudgeDisabled}
+            className="relative flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:hover:bg-gray-700 transition-colors flex items-center justify-center"
+            title={nudgeTitle}
+            aria-label="抖一抖"
+          >
+            <svg className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M9 4h6a2 2 0 012 2v12a2 2 0 01-2 2H9a2 2 0 01-2-2V6a2 2 0 012-2z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M4 8l-2 2 2 2M20 8l2 2-2 2M4 14l-2 2 2 2M20 14l2 2-2 2" />
+            </svg>
+            {nudgeCooldownSeconds > 0 ? (
+              <span className="absolute -right-1 -top-1 min-w-4 h-4 px-1 rounded-full border border-gray-600 bg-gray-900 text-[10px] leading-4 text-gray-300">
+                {nudgeCooldownSeconds}
+              </span>
+            ) : null}
+          </button>
           <button onClick={handlePickFile} className="flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center" title="发送文件">
             <svg className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />

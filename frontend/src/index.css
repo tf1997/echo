@@ -961,6 +961,71 @@ body {
   margin-right: auto;
 }
 
+.nudge-shake {
+  animation: echo-nudge-shake 560ms cubic-bezier(0.36, 0.07, 0.19, 0.97);
+  transform-origin: center center;
+  will-change: transform;
+}
+
+.nudge-message-row {
+  user-select: none;
+}
+
+.nudge-message-pill {
+  display: inline-flex;
+  max-width: min(86%, 30rem);
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--echo-border-soft);
+  border-radius: 999px;
+  background: var(--echo-bg-soft);
+  color: var(--echo-muted);
+  padding: 4px 10px;
+  font-size: 0.72rem;
+  line-height: 1.2;
+  box-shadow: 0 6px 18px var(--echo-shadow);
+}
+
+.nudge-message-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+@keyframes echo-nudge-shake {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) rotate(0);
+  }
+  12% {
+    transform: translate3d(-7px, 0, 0) rotate(-0.35deg);
+  }
+  24% {
+    transform: translate3d(7px, -1px, 0) rotate(0.35deg);
+  }
+  36% {
+    transform: translate3d(-6px, 1px, 0) rotate(-0.25deg);
+  }
+  48% {
+    transform: translate3d(6px, 0, 0) rotate(0.25deg);
+  }
+  60% {
+    transform: translate3d(-4px, 0, 0) rotate(-0.15deg);
+  }
+  72% {
+    transform: translate3d(4px, 0, 0) rotate(0.15deg);
+  }
+  84% {
+    transform: translate3d(-2px, 0, 0) rotate(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nudge-shake {
+    animation: none;
+  }
+}
+
 .message-stack {
   max-width: min(76%, 42rem);
 }

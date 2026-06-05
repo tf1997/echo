@@ -6,6 +6,7 @@ import { WebviewWindow } from "@tauri-apps/api/window";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
 import { makeSearchHitId } from "./messageUtils";
 import { decodeEchoEmojiTokens, emojiAssetSrc, splitInlineEmojis } from "./emojiCatalog";
+import { MESSAGE_TYPE_NUDGE } from "../messageTypes";
 
 const MAX_PREVIEW_BYTES = 20 * 1024 * 1024;
 const COLLAPSED_TEXT_CHARS = 520;
@@ -69,6 +70,10 @@ function isImageFile(name: string | null): boolean {
 
 function getCopyableBubbleText(message: ChatMessage): string {
   return message.msg_type === "text" ? decodeEchoEmojiTokens(message.content) : "";
+}
+
+function getNudgeDisplayText(message: ChatMessage, isOwn: boolean): string {
+  return isOwn ? "你发送了一个抖一抖" : `${message.sender_name || "对方"} 发送了一个抖一抖`;
 }
 
 function getFileExtension(name: string | null): string {
@@ -201,6 +206,7 @@ function getForwardItemText(item: ForwardCardItem): string {
   if (item.msg_type === "file") return item.file_name ? `📎 ${item.file_name}` : "[文件]";
   if (item.msg_type === "sticker") return item.file_name ? `[图片] ${item.file_name}` : "[图片]";
   if (item.msg_type === "forward_card") return "[聊天记录]";
+  if (item.msg_type === MESSAGE_TYPE_NUDGE) return "[抖一抖]";
   return decodeEchoEmojiTokens(item.content);
 }
 
@@ -393,6 +399,7 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
 }
 
 export function MessageBubble({ message, isOwn, showSender = false, highlighted = false, searchQuery = "", activeSearchHitId, selectMode = false, selected = false, onToggleSelect, onStartForward, onAddSticker }: MessageBubbleProps) {
+  const isNudge = message.msg_type === MESSAGE_TYPE_NUDGE;
   const isSticker = message.msg_type === "sticker";
   const isFile = message.msg_type === "file";
   const showPreview = isFile && !!message.file_path && (isImageFile(message.file_name) || isImageFile(message.file_path));
@@ -440,6 +447,23 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
       setMenuPosition({ x: nextX, y: nextY });
     }
   }, [showMenu, menuPosition]);
+
+  if (isNudge) {
+    return (
+      <div
+        className={`message-row nudge-message-row flex justify-center mb-3 px-4 ${highlighted ? "bg-indigo-900/30 rounded-lg" : ""} ${selected ? "bg-indigo-900/20 rounded-lg" : ""} ${selectMode ? "cursor-pointer" : ""}`}
+        onClick={() => { if (selectMode) onToggleSelect?.(message); }}
+      >
+        <span className="nudge-message-pill" title={formatTime(message.timestamp)}>
+          <svg className="nudge-message-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M9 4h6a2 2 0 012 2v12a2 2 0 01-2 2H9a2 2 0 01-2-2V6a2 2 0 012-2z" />
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M4 8l-2 2 2 2M20 8l2 2-2 2M4 14l-2 2 2 2M20 14l2 2-2 2" />
+          </svg>
+          {getNudgeDisplayText(message, isOwn)}
+        </span>
+      </div>
+    );
+  }
 
   return (
     <div

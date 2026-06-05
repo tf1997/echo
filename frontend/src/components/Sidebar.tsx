@@ -6,6 +6,7 @@ import type { ThemeId } from "../theme";
 import type { GroupInfo, SearchResult } from "../api";
 import { Avatar } from "./Avatar";
 import { AvatarPreviewTrigger } from "./AvatarPreview";
+import { MESSAGE_TYPE_NUDGE } from "../messageTypes";
 
 interface SidebarProps {
   peers: Peer[];
@@ -32,6 +33,13 @@ interface SidebarProps {
   themeId: ThemeId;
   onThemeChange: (themeId: ThemeId) => void;
   recentRefreshKey: number;
+}
+
+function getSearchHitPreview(hit: { msg_type: string; file_name?: string | null; content: string }): string {
+  if (hit.msg_type === "file") return `📎 ${hit.file_name || "文件"}`;
+  if (hit.msg_type === "sticker") return "[表情]";
+  if (hit.msg_type === MESSAGE_TYPE_NUDGE) return "[抖一抖]";
+  return hit.content.slice(0, 60);
 }
 
 function peerEndpointKey(peer: Pick<Peer, "ip" | "port">) {
@@ -634,7 +642,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                       className="w-full text-left px-4 py-1.5 pl-6 hover:bg-gray-800"
                     >
                       <p className="text-xs text-gray-300 truncate">
-                        {hit.msg_type === "file" ? `📎 ${hit.file_name || "文件"}` : hit.content.slice(0, 60)}
+                        {getSearchHitPreview(hit)}
                       </p>
                       <p className="text-[10px] text-gray-500 mt-0.5">
                         {hit.sender_name} · {new Date(hit.timestamp).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
@@ -658,7 +666,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                       className="w-full text-left px-4 py-1.5 pl-6 hover:bg-gray-800"
                     >
                       <p className="text-xs text-gray-300 truncate">
-                        {hit.msg_type === "file" ? `📎 ${hit.file_name || "文件"}` : hit.msg_type === "sticker" ? "[表情]" : hit.content.slice(0, 60)}
+                        {getSearchHitPreview(hit)}
                       </p>
                       <p className="text-[10px] text-gray-500 mt-0.5">
                         {hit.sender_name} · {new Date(hit.timestamp).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}

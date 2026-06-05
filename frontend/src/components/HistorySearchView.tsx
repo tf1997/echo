@@ -10,6 +10,7 @@ import {
 import type { HistoryFilter } from "../api";
 import { DateDivider } from "./MessageBubble";
 import { formatDateLabel } from "./messageUtils";
+import { MESSAGE_TYPE_NUDGE } from "../messageTypes";
 
 const HISTORY_PAGE_LIMIT = 80;
 const HISTORY_SEARCH_LIMIT = 200;
@@ -50,6 +51,7 @@ function getResultText(message: ChatMessage): string {
   if (message.msg_type === "file") return message.file_name || message.content || "[文件]";
   if (message.msg_type === "sticker") return message.file_name || "[表情]";
   if (message.msg_type === "forward_card") return "[聊天记录]";
+  if (message.msg_type === MESSAGE_TYPE_NUDGE) return "[抖一抖]";
   return message.content;
 }
 
@@ -57,6 +59,7 @@ function getTypeLabel(message: ChatMessage): string {
   if (message.msg_type === "file") return "文件";
   if (message.msg_type === "sticker") return "图片";
   if (message.msg_type === "forward_card") return "聊天记录";
+  if (message.msg_type === MESSAGE_TYPE_NUDGE) return "抖一抖";
   return "";
 }
 
