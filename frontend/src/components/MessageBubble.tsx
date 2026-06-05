@@ -373,7 +373,8 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
 export function MessageBubble({ message, isOwn, showSender = false, highlighted = false, searchQuery = "", activeSearchHitId, selectMode = false, selected = false, onToggleSelect, onStartForward, onAddSticker }: MessageBubbleProps) {
   const isSticker = message.msg_type === "sticker";
   const isFile = message.msg_type === "file";
-  const showPreview = isFile && isImageFile(message.file_name) && message.file_path;
+  const showPreview = isFile && !!message.file_path && (isImageFile(message.file_name) || isImageFile(message.file_path));
+  const isMediaBubble = isSticker || showPreview;
   const [showMenu, setShowMenu] = useState(false);
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null);
   const [addingSticker, setAddingSticker] = useState(false);
@@ -535,7 +536,7 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
         {!isOwn && showSender && (
           <span className="message-sender-label" title={message.sender_name}>{message.sender_name}</span>
         )}
-        <div className={`${isSticker ? "bg-transparent" : `message-bubble-shell rounded-2xl overflow-hidden ${isOwn ? "message-bubble-own bg-indigo-600 text-white rounded-br-md" : "message-bubble-other bg-gray-700 text-gray-100 rounded-bl-md"}`} ${!isSticker && !showPreview && message.msg_type !== "forward_card" ? "px-4 py-2.5" : ""}`}>
+        <div className={`${isMediaBubble ? "bg-transparent" : `message-bubble-shell rounded-2xl overflow-hidden ${isOwn ? "message-bubble-own bg-indigo-600 text-white rounded-br-md" : "message-bubble-other bg-gray-700 text-gray-100 rounded-bl-md"}`} ${!isMediaBubble && message.msg_type !== "forward_card" ? "px-4 py-2.5" : ""}`}>
           {message.msg_type === "forward_card" ? (() => {
             try {
               const card: ForwardCardData = JSON.parse(message.content);
@@ -548,17 +549,8 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
               <ImagePreview filePath={message.file_path} fileSize={message.file_size} />
             </div>
           ) : showPreview ? (
-            <div className="max-w-[260px]">
+            <div className="max-w-[160px]">
               <ImagePreview filePath={message.file_path!} fileSize={message.file_size} />
-              <div className="flex items-center gap-1 px-3 py-2">
-                <div className="flex-1 min-w-0 cursor-pointer hover:opacity-80" onClick={() => handleOpenFile(message.file_path)} title={attachmentName}>
-                  <p className="text-xs font-medium truncate">{attachmentName}</p>
-                  {message.file_size ? <p className="text-[10px] opacity-70">{formatFileSize(message.file_size)}</p> : null}
-                </div>
-                <button onClick={(e) => { e.stopPropagation(); handleOpenFolder(message.file_path); }} className="flex-shrink-0 w-6 h-6 rounded flex items-center justify-center hover:bg-white/10" title="在文件夹中显示">
-                  <svg className="w-3.5 h-3.5 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
-                </button>
-              </div>
             </div>
           ) : isFile ? (
             <div className="message-file-card flex items-center gap-2">

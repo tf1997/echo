@@ -96,6 +96,14 @@ async function readFileAndSave(file: File): Promise<string> {
   return await saveTempFile(data, file.name || "file");
 }
 
+const IMAGE_FILE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tiff"]);
+
+function isImageFileName(name?: string | null): boolean {
+  if (!name) return false;
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  return IMAGE_FILE_EXTENSIONS.has(ext);
+}
+
 const EMOJIS = [
   "😀","😃","😄","😁","😆","😂","🤣","😅","😊","🙂",
   "🙃","😉","😍","🥰","😘","😋","😜","🤪","😎","🤩",
@@ -1322,16 +1330,18 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
             }
             if ("status" in item) {
               const isPendingSticker = item.msg_type === "sticker" && !!item.file_path;
+              const isPendingImageFile = item.msg_type === "file" && !!item.file_path && (isImageFileName(item.file_name) || isImageFileName(item.file_path));
+              const isPendingMedia = isPendingSticker || isPendingImageFile;
               const pendingStatusText = getPendingStatusText(item);
               elements.push(
                 <div key={`pending-${item.id}`} className="message-row flex justify-end mb-3 px-4">
                   <div className="message-stack flex flex-col items-end">
-                    <div className={`${isPendingSticker ? "overflow-hidden rounded-xl" : "message-bubble-shell rounded-2xl px-4 py-2.5 rounded-br-md"} ${
+                    <div className={`${isPendingMedia ? "overflow-hidden rounded-xl" : "message-bubble-shell rounded-2xl px-4 py-2.5 rounded-br-md"} ${
                       item.status === "failed"
-                        ? isPendingSticker ? "ring-1 ring-red-500/70" : "bg-red-600/30 border border-red-500/50"
-                        : isPendingSticker ? "" : "message-bubble-own bg-indigo-600/50"
+                        ? isPendingMedia ? "ring-1 ring-red-500/70" : "bg-red-600/30 border border-red-500/50"
+                        : isPendingMedia ? "" : "message-bubble-own bg-indigo-600/50"
                     } text-white`}>
-                      {isPendingSticker ? (
+                      {isPendingMedia ? (
                         <div className="w-32 h-32">
                           <EmojiThumb path={item.file_path!} />
                         </div>
