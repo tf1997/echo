@@ -7,10 +7,10 @@ use tauri::{AppHandle, Manager, State};
 use crate::chat::{
     base64_encode_into, base64_encoded_capacity, cancel_outgoing_file_transfer,
     clear_outgoing_file_transfer, emit_contact_message_updated, is_self_peer,
-    pause_outgoing_file_transfer, register_outgoing_file_transfer,
-    resume_outgoing_file_transfer, send_file_in_background_with_kind,
-    serialize_file_wire_message_line, wait_for_outgoing_file_transfer, FileWireMessageLine,
-    WireMessage, FILE_CHUNK_SIZE, FILE_SOCKET_BUFFER_SIZE, FILE_TRANSFER_CANCELLED_MESSAGE,
+    pause_outgoing_file_transfer, register_outgoing_file_transfer, resume_outgoing_file_transfer,
+    send_file_in_background_with_kind, serialize_file_wire_message_line,
+    wait_for_outgoing_file_transfer, FileWireMessageLine, WireMessage, FILE_CHUNK_SIZE,
+    FILE_SOCKET_BUFFER_SIZE, FILE_TRANSFER_CANCELLED_MESSAGE,
 };
 use crate::db::{ChatMessage, StoredPeer, UnreadCount, UserProfile};
 use crate::discovery::Peer;
@@ -188,7 +188,11 @@ pub async fn save_profile(
     if let Some(avatar) = avatar_update.as_ref() {
         state
             .db
-            .update_user_avatar(&avatar.avatar_path, &avatar.avatar_hash, avatar.avatar_updated_at)
+            .update_user_avatar(
+                &avatar.avatar_path,
+                &avatar.avatar_hash,
+                avatar.avatar_updated_at,
+            )
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -240,6 +244,17 @@ pub async fn save_profile(
 
 fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+fn normalized_client_msg_id(client_msg_id: Option<String>) -> Option<String> {
+    client_msg_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn client_msg_id_or_new(client_msg_id: Option<String>) -> String {
+    normalized_client_msg_id(client_msg_id)
+        .unwrap_or_else(|| format!("server-{}", uuid::Uuid::new_v4()))
 }
 
 fn echo_home_dir() -> std::path::PathBuf {
@@ -331,7 +346,8 @@ fn prepare_avatar_info(source_path: &str) -> Result<AvatarInfo, String> {
     validate_avatar_bytes(&ext, &bytes)?;
 
     let avatar_hash = hash_avatar_bytes(&bytes);
-    let avatar_path = write_avatar_file(avatar_root_dir().join("self"), &avatar_hash, &ext, &bytes)?;
+    let avatar_path =
+        write_avatar_file(avatar_root_dir().join("self"), &avatar_hash, &ext, &bytes)?;
     let avatar_updated_at = now_millis();
 
     Ok(AvatarInfo {
@@ -395,6 +411,7 @@ async fn notify_profile_updated_to_peers(
         "profile_updated",
         None,
         None,
+        None,
         &empty_dir,
     )
     .await;
@@ -412,6 +429,7 @@ fn spawn_send_or_queue_notification(
     kind: String,
     group_id: Option<String>,
     file_name: Option<String>,
+    client_msg_id: Option<String>,
     known_peers: Vec<crate::discovery::PeerEntry>,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -427,6 +445,7 @@ fn spawn_send_or_queue_notification(
             &kind,
             group_id.as_deref(),
             file_name.as_deref(),
+            client_msg_id.as_deref(),
             &known_peers,
         )
         .await;
@@ -442,7 +461,11 @@ pub async fn set_profile_avatar(
 
     state
         .db
-        .update_user_avatar(&avatar.avatar_path, &avatar.avatar_hash, avatar.avatar_updated_at)
+        .update_user_avatar(
+            &avatar.avatar_path,
+            &avatar.avatar_hash,
+            avatar.avatar_updated_at,
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -515,8 +538,8 @@ pub async fn request_peer_avatar(
     state: State<'_, AppState>,
     peer_id: String,
 ) -> Result<Option<StoredPeer>, String> {
-    let runtime = { state.runtime.read().await.clone() }
-        .ok_or_else(|| "应用尚未初始化".to_string())?;
+    let runtime =
+        { state.runtime.read().await.clone() }.ok_or_else(|| "应用尚未初始化".to_string())?;
 
     let online_peer = runtime.discovery.read().await.get_peer(&peer_id);
     let stored_peer = state
@@ -585,9 +608,13 @@ pub async fn request_peer_avatar(
         file_kind: None,
         known_peers: Vec::new(),
         group_id: None,
+        client_msg_id: None,
     };
     let json = serde_json::to_string(&request).map_err(|e| e.to_string())?;
-    writer.write_all(json.as_bytes()).await.map_err(|e| e.to_string())?;
+    writer
+        .write_all(json.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
     writer.write_all(b"\n").await.map_err(|e| e.to_string())?;
     writer.flush().await.map_err(|e| e.to_string())?;
 
@@ -641,18 +668,22 @@ pub async fn request_peer_avatar(
         .await
         .map_err(|e| e.to_string())?;
 
-    runtime.discovery.read().await.register_peer(Peer::new_with_avatar(
-        peer.id.clone(),
-        peer.username,
-        peer.department,
-        peer.software_version,
-        peer.mac_address,
-        avatar_path,
-        payload.avatar_hash,
-        payload.avatar_updated_at,
-        peer.ip,
-        peer.port,
-    ));
+    runtime
+        .discovery
+        .read()
+        .await
+        .register_peer(Peer::new_with_avatar(
+            peer.id.clone(),
+            peer.username,
+            peer.department,
+            peer.software_version,
+            peer.mac_address,
+            avatar_path,
+            payload.avatar_hash,
+            payload.avatar_updated_at,
+            peer.ip,
+            peer.port,
+        ));
 
     state
         .db
@@ -787,6 +818,7 @@ pub async fn send_message_typed(
     msg_type: String,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
+    let client_msg_id = client_msg_id_or_new(client_msg_id);
     let runtime_opt = { state.runtime.read().await.clone() };
     let Some(runtime) = runtime_opt.as_ref() else {
         return Err("应用尚未初始化用户信息".to_string());
@@ -819,7 +851,7 @@ pub async fn send_message_typed(
     drop(discovery);
 
     let chat = runtime.chat.lock().await;
-    chat.send_message_typed(&peer, &content, &msg_type, client_msg_id.as_deref())
+    chat.send_message_typed(&peer, &content, &msg_type, Some(client_msg_id.as_str()))
         .await
         .map_err(|e| e.to_string())
 }
@@ -903,6 +935,7 @@ async fn send_file_with_kind(
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
     info!("send_file: start ({})", file_kind);
+    let client_msg_id = Some(client_msg_id_or_new(client_msg_id));
     let t0 = std::time::Instant::now();
     let runtime_opt = { state.runtime.read().await.clone() };
     let Some(runtime) = runtime_opt.as_ref() else {
@@ -990,7 +1023,7 @@ async fn send_file_with_kind(
 
         let _ = db.add_recent_contact(&peer.id).await;
         let mut saved = db
-            .save_message(
+            .save_message_dedup(
                 &my_id,
                 &my_name,
                 &peer.id,
@@ -1147,6 +1180,7 @@ async fn probe_identity(
         file_kind: None,
         known_peers: Vec::new(),
         group_id: None,
+        client_msg_id: None,
     };
 
     let json = serde_json::to_string(&probe).ok()?;
@@ -2102,7 +2136,8 @@ pub async fn create_group(
         listen_port,
     )
     .await;
-    let content = serde_json::json!({"name": payload.name, "member_ids": all_members.clone()}).to_string();
+    let content =
+        serde_json::json!({"name": payload.name, "member_ids": all_members.clone()}).to_string();
     spawn_send_or_queue_notification(
         state.db.clone(),
         online_peers,
@@ -2114,6 +2149,7 @@ pub async fn create_group(
         content,
         "group_created".to_string(),
         Some(gid.clone()),
+        None,
         None,
         directory,
     );
@@ -2173,6 +2209,7 @@ pub async fn send_group_message_typed(
     msg_type: String,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
+    let client_msg_id = client_msg_id_or_new(client_msg_id);
     let (my_id, my_name, my_department, listen_port, members) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
@@ -2193,23 +2230,6 @@ pub async fn send_group_message_typed(
         (r.my_id.clone(), my_name, my_dept, r.listen_port, members)
     };
 
-    let msg = state
-        .db
-        .save_group_message(
-            &group_id,
-            &my_id,
-            &my_name,
-            &content,
-            &msg_type,
-            None,
-            None,
-            None,
-            true,
-            client_msg_id.as_deref(),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
     let online_peers = {
         let runtime_opt = { state.runtime.read().await.clone() };
         match runtime_opt.as_ref() {
@@ -2220,20 +2240,43 @@ pub async fn send_group_message_typed(
 
     let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
     let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
-    spawn_send_or_queue_notification(
-        state.db.clone(),
-        online_peers,
-        target_ids,
-        my_id,
-        my_name,
-        my_department,
+    let (_delivered, _queued, failed) = send_or_queue_notification(
+        state.db.as_ref(),
+        &online_peers,
+        &target_ids,
+        &my_id,
+        &my_name,
+        &my_department,
         listen_port,
-        content,
-        msg_type,
-        Some(group_id),
+        &content,
+        &msg_type,
+        Some(&group_id),
         None,
-        empty_dir,
-    );
+        Some(client_msg_id.as_str()),
+        &empty_dir,
+    )
+    .await;
+
+    if failed > 0 {
+        return Err(format!("{} 名群成员消息未能发送或入队，请稍后重试", failed));
+    }
+
+    let msg = state
+        .db
+        .save_group_message_dedup(
+            &group_id,
+            &my_id,
+            &my_name,
+            &content,
+            &msg_type,
+            None,
+            None,
+            None,
+            true,
+            Some(client_msg_id.as_str()),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(msg)
 }
@@ -2298,6 +2341,7 @@ pub async fn rename_group(
         "group_renamed".to_string(),
         Some(group_id),
         Some(new_name),
+        None,
         empty_dir,
     );
     Ok(())
@@ -2360,7 +2404,8 @@ pub async fn invite_to_group(
         listen_port,
     )
     .await;
-    let content = serde_json::json!({"name": group.name, "member_ids": all_member_ids.clone()}).to_string();
+    let content =
+        serde_json::json!({"name": group.name, "member_ids": all_member_ids.clone()}).to_string();
     spawn_send_or_queue_notification(
         state.db.clone(),
         online_peers,
@@ -2372,6 +2417,7 @@ pub async fn invite_to_group(
         content,
         "group_created".to_string(),
         Some(group_id),
+        None,
         None,
         directory,
     );
@@ -2423,6 +2469,7 @@ pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result
         "group_member_left".to_string(),
         Some(group_id.clone()),
         None,
+        None,
         empty_dir,
     );
 
@@ -2472,6 +2519,7 @@ pub async fn dissolve_group(state: State<'_, AppState>, group_id: String) -> Res
         "群组已解散".to_string(),
         "group_dissolved".to_string(),
         Some(group_id),
+        None,
         None,
         empty_dir,
     );
@@ -2530,6 +2578,7 @@ async fn send_group_file_with_kind(
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
     use chrono::Utc;
+    let client_msg_id = Some(client_msg_id_or_new(client_msg_id));
     let (my_id, my_name, my_department, listen_port, db, members) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
@@ -2638,7 +2687,8 @@ async fn send_group_file_with_kind(
             let mut target_id = member.peer_id.clone();
             let target_name = member.username.clone();
             let target_department = member.department.clone();
-            let mut resolved_addr = resolve_peer_addr(&target_id, bg_db.as_ref(), &bg_online_peers).await;
+            let mut resolved_addr =
+                resolve_peer_addr(&target_id, bg_db.as_ref(), &bg_online_peers).await;
             if resolved_addr.is_none() && !target_name.is_empty() {
                 if let Ok(Some(latest_peer)) = bg_db
                     .find_peer_by_identity(&target_name, &target_department)
@@ -2651,7 +2701,8 @@ async fn send_group_file_with_kind(
                             latest_peer.peer_id
                         );
                         target_id = latest_peer.peer_id.clone();
-                        resolved_addr = resolve_peer_addr(&target_id, bg_db.as_ref(), &bg_online_peers).await;
+                        resolved_addr =
+                            resolve_peer_addr(&target_id, bg_db.as_ref(), &bg_online_peers).await;
                     }
                 }
             }
@@ -2708,10 +2759,15 @@ async fn send_group_file_with_kind(
                             listen_port,
                             &bg_group_id,
                             &bg_msg_kind,
+                            bg_client_msg_id.as_deref(),
                         )
                         .await
                         {
-                            log::error!("Failed to queue group file for {}: {}", peer.id, queue_err);
+                            log::error!(
+                                "Failed to queue group file for {}: {}",
+                                peer.id,
+                                queue_err
+                            );
                             let _ = bg_error_handle.emit_all(
                                 "file-error",
                                 serde_json::json!({
@@ -2737,6 +2793,7 @@ async fn send_group_file_with_kind(
                     listen_port,
                     &bg_group_id,
                     &bg_msg_kind,
+                    bg_client_msg_id.as_deref(),
                 )
                 .await
                 {
@@ -2769,7 +2826,7 @@ async fn send_group_file_with_kind(
         }
 
         let saved = match bg_db
-            .save_group_message(
+            .save_group_message_dedup(
                 &bg_group_id,
                 &bg_my_id,
                 &bg_my_name,
@@ -2854,6 +2911,7 @@ async fn send_group_file_to_peer_with_progress(
         file_name: file_name.to_string(),
         file_size,
         file_kind: file_kind.to_string(),
+        client_msg_id: client_msg_id.unwrap_or_default().to_string(),
     };
 
     let _ = app_handle.emit_all(
@@ -2896,6 +2954,7 @@ async fn queue_group_file_for_peer(
     listen_port: u16,
     group_id: &str,
     file_kind: &str,
+    client_msg_id: Option<&str>,
 ) -> Result<(), String> {
     let cached_file_path =
         get_or_create_pending_cache(file_path, file_name, &pending_cache).await?;
@@ -2910,6 +2969,7 @@ async fn queue_group_file_for_peer(
         file_name,
         file_size,
         file_kind,
+        client_msg_id,
     )
     .await
     .map_err(|e| e.to_string())
@@ -3022,6 +3082,7 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
                     file_kind: None,
                     known_peers: Vec::new(),
                     group_id: Some(p.group_id.clone()),
+                    client_msg_id: None,
                 };
                 let json = serde_json::to_string(&wm).unwrap_or_default();
                 if let Ok(mut stream) = tokio::time::timeout(
@@ -3106,7 +3167,7 @@ pub async fn deliver_pending_to_peer(db: &crate::db::Database, peer_id_str: &str
             "known_peers": [], "file_name": null, "file_size": null, "file_data": null,
         });
         let json = serde_json::to_string(&wm).unwrap_or_default();
-        if deliver_over_tcp(&addr, &json).await {
+        if deliver_over_tcp(&addr, &json, None).await {
             delivered.push(p.id);
         }
     }
@@ -3189,6 +3250,14 @@ async fn send_group_file_payloads_over_tcp_controlled(
     client_msg_id: Option<&str>,
 ) -> Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let stored_client_msg_id = transfer.client_msg_id.trim();
+    let wire_client_msg_id = client_msg_id.or_else(|| {
+        if stored_client_msg_id.is_empty() {
+            None
+        } else {
+            Some(stored_client_msg_id)
+        }
+    });
 
     wait_for_outgoing_file_transfer(client_msg_id)
         .await
@@ -3217,20 +3286,11 @@ async fn send_group_file_payloads_over_tcp_controlled(
     let sender_software_version = crate::profile_metadata::software_version();
     let sender_mac_address = crate::profile_metadata::mac_address();
     let mut chunk_index: usize = 0;
-    loop {
+    if transfer.file_size == 0 {
         wait_for_outgoing_file_transfer(client_msg_id)
             .await
             .map_err(|e| e.to_string())?;
-
-        let n = match file.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(error) => return Err(error.to_string()),
-        };
-        let is_last = n < FILE_CHUNK_SIZE
-            || (transfer.file_size as usize) <= ((chunk_index + 1) * FILE_CHUNK_SIZE);
-        let msg_type = if is_last { "file_end" } else { "file_chunk" };
-        base64_encode_into(&buf[..n], &mut content_buf);
+        base64_encode_into(&[], &mut content_buf);
         if let Err(error) = serialize_file_wire_message_line(
             FileWireMessageLine {
                 sender_id: &transfer.sender_id,
@@ -3241,12 +3301,13 @@ async fn send_group_file_payloads_over_tcp_controlled(
                 sender_port: transfer.sender_port,
                 receiver_id: &transfer.peer_id,
                 content: &content_buf,
-                msg_type,
+                msg_type: "file_end",
                 file_name: &transfer.file_name,
-                file_size: transfer.file_size as u64,
+                file_size: 0,
                 file_kind: &transfer.file_kind,
                 known_peers: &[],
                 group_id: Some(&transfer.group_id),
+                client_msg_id: wire_client_msg_id,
             },
             &mut payload,
         ) {
@@ -3255,7 +3316,48 @@ async fn send_group_file_payloads_over_tcp_controlled(
         if stream.write_all(&payload).await.is_err() {
             return Err(format!("Failed to write to {}", addr));
         }
-        chunk_index += 1;
+    } else {
+        loop {
+            wait_for_outgoing_file_transfer(client_msg_id)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let n = match file.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(error) => return Err(error.to_string()),
+            };
+            let is_last = n < FILE_CHUNK_SIZE
+                || (transfer.file_size as usize) <= ((chunk_index + 1) * FILE_CHUNK_SIZE);
+            let msg_type = if is_last { "file_end" } else { "file_chunk" };
+            base64_encode_into(&buf[..n], &mut content_buf);
+            if let Err(error) = serialize_file_wire_message_line(
+                FileWireMessageLine {
+                    sender_id: &transfer.sender_id,
+                    sender_name: &transfer.sender_name,
+                    sender_department: &transfer.sender_department,
+                    sender_software_version: &sender_software_version,
+                    sender_mac_address: &sender_mac_address,
+                    sender_port: transfer.sender_port,
+                    receiver_id: &transfer.peer_id,
+                    content: &content_buf,
+                    msg_type,
+                    file_name: &transfer.file_name,
+                    file_size: transfer.file_size as u64,
+                    file_kind: &transfer.file_kind,
+                    known_peers: &[],
+                    group_id: Some(&transfer.group_id),
+                    client_msg_id: wire_client_msg_id,
+                },
+                &mut payload,
+            ) {
+                return Err(format!("Failed to serialize group file chunk: {}", error));
+            }
+            if stream.write_all(&payload).await.is_err() {
+                return Err(format!("Failed to write to {}", addr));
+            }
+            chunk_index += 1;
+        }
     }
 
     stream.flush().await.map_err(|e| e.to_string())
@@ -3286,6 +3388,7 @@ fn build_notification_json(
     msg_type: &str,
     group_id: Option<&str>,
     file_name: Option<&str>,
+    client_msg_id: Option<&str>,
     known_peers: &[crate::discovery::PeerEntry],
 ) -> String {
     serde_json::json!({
@@ -3302,14 +3405,15 @@ fn build_notification_json(
         "file_name": file_name,
         "file_size": null,
         "file_data": null,
+        "client_msg_id": client_msg_id,
         "known_peers": known_peers,
     })
     .to_string()
 }
 
-/// Try a TCP delivery with a 2s timeout. Returns true if both header bytes
-/// and the trailing newline were written successfully.
-async fn deliver_over_tcp(addr: &str, json: &str) -> bool {
+/// Try a TCP delivery with a 2s timeout. Returns true if the payload was written.
+/// Newer peers may respond with `message_ack`; older peers are still accepted.
+async fn deliver_over_tcp(addr: &str, json: &str, client_msg_id: Option<&str>) -> bool {
     match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::net::TcpStream::connect(addr),
@@ -3317,8 +3421,40 @@ async fn deliver_over_tcp(addr: &str, json: &str) -> bool {
     .await
     {
         Ok(Ok(mut stream)) => {
-            use tokio::io::AsyncWriteExt;
-            stream.write_all(json.as_bytes()).await.is_ok() && stream.write_all(b"\n").await.is_ok()
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            if stream.write_all(json.as_bytes()).await.is_err()
+                || stream.write_all(b"\n").await.is_err()
+                || stream.flush().await.is_err()
+            {
+                return false;
+            }
+            let Some(expected_client_msg_id) = client_msg_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return true;
+            };
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(180),
+                reader.read_line(&mut line),
+            )
+            .await
+            {
+                Ok(Ok(bytes_read)) if bytes_read > 0 => {
+                    let line_for_parse = line.trim_end_matches('\n').trim_end_matches('\r');
+                    if let Ok(msg) = serde_json::from_str::<WireMessage>(line_for_parse) {
+                        if msg.msg_type == "message_ack"
+                            && msg.client_msg_id.as_deref() == Some(expected_client_msg_id)
+                        {
+                            log::debug!("Delivery ack received from {}", addr);
+                        }
+                    }
+                    true
+                }
+                _ => true,
+            }
         }
         _ => false,
     }
@@ -3343,12 +3479,47 @@ async fn deliver_pending_payloads_over_tcp(
         return delivered;
     };
 
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     for (id, _kind, payload) in payloads {
         if stream.write_all(payload.as_bytes()).await.is_err()
             || stream.write_all(b"\n").await.is_err()
+            || stream.flush().await.is_err()
         {
             break;
+        }
+        let expected_client_msg_id = serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("client_msg_id")
+                    .and_then(|id| id.as_str())
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+            });
+        if let Some(expected_client_msg_id) = expected_client_msg_id.as_deref() {
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            if let Ok(Ok(bytes_read)) = tokio::time::timeout(
+                std::time::Duration::from_millis(180),
+                reader.read_line(&mut line),
+            )
+            .await
+            {
+                if bytes_read > 0 {
+                    let line_for_parse = line.trim_end_matches('\n').trim_end_matches('\r');
+                    if let Ok(msg) = serde_json::from_str::<WireMessage>(line_for_parse) {
+                        if msg.msg_type == "message_ack"
+                            && msg.client_msg_id.as_deref() == Some(expected_client_msg_id)
+                        {
+                            log::debug!(
+                                "Pending delivery ack received for {}",
+                                expected_client_msg_id
+                            );
+                        }
+                    }
+                }
+            }
         }
         delivered.push(*id);
     }
@@ -3379,7 +3550,7 @@ fn stored_peer_recently_online(peer: &StoredPeer) -> bool {
 /// `msg_type`). The receiver's TCP handler dispatches by `msg_type` inside the
 /// payload, so we don't need separate tables per kind.
 ///
-/// Returns the count of (delivered, queued).
+/// Returns the count of (delivered, queued, failed_to_queue).
 pub async fn send_or_queue_notification(
     db: &crate::db::Database,
     online_peers: &[Peer],
@@ -3392,10 +3563,12 @@ pub async fn send_or_queue_notification(
     kind: &str,
     group_id: Option<&str>,
     file_name: Option<&str>,
+    client_msg_id: Option<&str>,
     known_peers: &[crate::discovery::PeerEntry],
-) -> (usize, usize) {
+) -> (usize, usize, usize) {
     let mut delivered = 0usize;
     let mut queued = 0usize;
+    let mut failed = 0usize;
 
     for pid in target_peer_ids {
         if pid == self_id {
@@ -3412,13 +3585,14 @@ pub async fn send_or_queue_notification(
             kind,
             group_id,
             file_name,
+            client_msg_id,
             known_peers,
         );
 
         let ok = match resolve_peer_addr(pid, db, online_peers).await {
             Some((ip, port)) => {
                 let addr = format!("{}:{}", ip, port);
-                deliver_over_tcp(&addr, &json).await
+                deliver_over_tcp(&addr, &json, client_msg_id).await
             }
             None => false,
         };
@@ -3426,20 +3600,31 @@ pub async fn send_or_queue_notification(
         if ok {
             delivered += 1;
         } else {
-            let _ = db.queue_pending_notification(pid, kind, &json).await;
-            queued += 1;
+            match db.queue_pending_notification(pid, kind, &json).await {
+                Ok(()) => queued += 1,
+                Err(error) => {
+                    failed += 1;
+                    log::error!(
+                        "Failed to queue notification '{}' for {}: {}",
+                        kind,
+                        pid,
+                        error
+                    );
+                }
+            }
         }
     }
 
-    if queued > 0 {
+    if queued > 0 || failed > 0 {
         log::info!(
-            "Notification '{}' delivered={} queued={}",
+            "Notification '{}' delivered={} queued={} failed={}",
             kind,
             delivered,
-            queued
+            queued,
+            failed
         );
     }
-    (delivered, queued)
+    (delivered, queued, failed)
 }
 
 async fn resolve_peer_addr(

@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
@@ -19,6 +19,8 @@ const FILE_LINE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const FILE_RECEIVE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 pub const FILE_SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 const FILE_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+const TCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const MESSAGE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(180);
 const EVENT_CONVERSATION_UPDATED: &str = "conversation-updated";
 pub const FILE_TRANSFER_CANCELLED_MESSAGE: &str = "发送已取消";
 const AVATAR_MAX_BYTES: u64 = 5 * 1024 * 1024;
@@ -159,6 +161,8 @@ pub struct WireMessage {
     pub known_peers: Vec<PeerEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_msg_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -183,6 +187,8 @@ struct WireMessageRef<'a> {
     known_peers: &'a [PeerEntry],
     #[serde(skip_serializing_if = "Option::is_none")]
     group_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_msg_id: Option<&'a str>,
 }
 
 pub struct FileWireMessageLine<'a> {
@@ -200,6 +206,7 @@ pub struct FileWireMessageLine<'a> {
     pub file_kind: &'a str,
     pub known_peers: &'a [PeerEntry],
     pub group_id: Option<&'a str>,
+    pub client_msg_id: Option<&'a str>,
 }
 
 struct IncomingFileState {
@@ -210,6 +217,7 @@ struct IncomingFileState {
     sender_name: String,
     group_id: Option<String>,
     kind: String,
+    client_msg_id: Option<String>,
 }
 
 async fn create_received_file(filename: &str) -> Result<(tokio::fs::File, String)> {
@@ -239,7 +247,27 @@ async fn start_incoming_file(msg: &WireMessage) -> Result<IncomingFileState> {
         sender_name: msg.sender_name.clone(),
         group_id: msg.group_id.clone(),
         kind: msg.file_kind.as_deref().unwrap_or("file").to_string(),
+        client_msg_id: normalized_client_msg_id(msg.client_msg_id.as_deref()),
     })
+}
+
+async fn remove_incomplete_incoming_file(file_state: IncomingFileState) {
+    let path = file_state.path.clone();
+    drop(file_state);
+    if let Err(error) = tokio::fs::remove_file(&path).await {
+        warn!(
+            "Failed to remove incomplete incoming file {}: {}",
+            path, error
+        );
+    }
+}
+
+async fn connect_peer_with_timeout(peer: &Peer) -> Result<TcpStream> {
+    let addr = peer.address();
+    tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(&addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("连接 {} 超时", addr))?
+        .with_context(|| format!("Failed to connect to peer {}", addr))
 }
 
 fn file_send_connection_error(error: std::io::Error, peer: &Peer) -> anyhow::Error {
@@ -281,6 +309,68 @@ fn serialize_wire_message_line(msg: &WireMessage) -> Result<Vec<u8>> {
     let mut payload = serde_json::to_vec(msg).context("Failed to serialize message")?;
     payload.push(b'\n');
     Ok(payload)
+}
+
+async fn write_message_ack<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    my_id: &str,
+    my_name: &str,
+    my_department: &str,
+    my_software_version: &str,
+    my_mac_address: &str,
+    my_port: u16,
+    receiver_id: &str,
+    client_msg_id: Option<&str>,
+) -> Result<()> {
+    let Some(client_msg_id) = normalized_client_msg_id(client_msg_id) else {
+        return Ok(());
+    };
+
+    let ack = WireMessage {
+        sender_id: my_id.to_string(),
+        sender_name: my_name.to_string(),
+        sender_department: my_department.to_string(),
+        sender_software_version: my_software_version.to_string(),
+        sender_mac_address: my_mac_address.to_string(),
+        sender_port: my_port,
+        receiver_id: receiver_id.to_string(),
+        content: String::new(),
+        msg_type: "message_ack".to_string(),
+        file_name: None,
+        file_size: None,
+        file_data: None,
+        file_kind: None,
+        known_peers: Vec::new(),
+        group_id: None,
+        client_msg_id: Some(client_msg_id),
+    };
+    let payload = serialize_wire_message_line(&ack)?;
+    writer
+        .write_all(&payload)
+        .await
+        .context("Failed to write message ack")?;
+    writer.flush().await.context("Failed to flush message ack")
+}
+
+async fn wait_for_message_ack(stream: &mut TcpStream, client_msg_id: Option<&str>) -> bool {
+    let Some(expected_client_msg_id) = normalized_client_msg_id(client_msg_id) else {
+        return false;
+    };
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    match tokio::time::timeout(MESSAGE_ACK_TIMEOUT, reader.read_line(&mut line)).await {
+        Ok(Ok(bytes_read)) if bytes_read > 0 => {
+            let line_for_parse = line.trim_end_matches('\n').trim_end_matches('\r');
+            serde_json::from_str::<WireMessage>(line_for_parse)
+                .map(|msg| {
+                    msg.msg_type == "message_ack"
+                        && msg.client_msg_id.as_deref() == Some(expected_client_msg_id.as_str())
+                })
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 pub fn base64_encoded_capacity(input_len: usize) -> usize {
@@ -331,6 +421,7 @@ pub fn serialize_file_wire_message_line(
         file_kind: Some(msg.file_kind),
         known_peers: msg.known_peers,
         group_id: msg.group_id,
+        client_msg_id: msg.client_msg_id,
     };
     serde_json::to_writer(&mut *payload, &wire_msg).context("Failed to serialize message")?;
     payload.push(b'\n');
@@ -573,6 +664,10 @@ impl ChatServer {
                         continue;
                     }
 
+                    if msg_type == "message_ack" {
+                        continue;
+                    }
+
                     if msg_type == "identity_probe" {
                         let profile = db.get_user_profile().await.ok().flatten();
                         let avatar_content = serde_json::json!({
@@ -602,6 +697,7 @@ impl ChatServer {
                             file_kind: None,
                             known_peers: Vec::new(),
                             group_id: None,
+                            client_msg_id: None,
                         };
                         let json = serde_json::to_string(&response)
                             .context("Failed to serialize identity response")?;
@@ -634,11 +730,12 @@ impl ChatServer {
                                                     base64_encoded_capacity(bytes.len()),
                                                 );
                                                 base64_encode_into(&bytes, &mut encoded);
-                                                let file_name = std::path::Path::new(&profile.avatar_path)
-                                                    .file_name()
-                                                    .and_then(|name| name.to_str())
-                                                    .unwrap_or("avatar")
-                                                    .to_string();
+                                                let file_name =
+                                                    std::path::Path::new(&profile.avatar_path)
+                                                        .file_name()
+                                                        .and_then(|name| name.to_str())
+                                                        .unwrap_or("avatar")
+                                                        .to_string();
                                                 response_payload = serde_json::json!({
                                                     "avatar_hash": profile.avatar_hash,
                                                     "avatar_updated_at": profile.avatar_updated_at,
@@ -647,7 +744,10 @@ impl ChatServer {
                                                 });
                                             }
                                             Err(error) => {
-                                                warn!("Failed to read avatar for request: {}", error);
+                                                warn!(
+                                                    "Failed to read avatar for request: {}",
+                                                    error
+                                                );
                                             }
                                         }
                                     }
@@ -683,6 +783,7 @@ impl ChatServer {
                             file_kind: None,
                             known_peers: Vec::new(),
                             group_id: None,
+                            client_msg_id: None,
                         };
                         let json = serde_json::to_string(&response)
                             .context("Failed to serialize avatar response")?;
@@ -785,7 +886,9 @@ impl ChatServer {
                     let mut sender_avatar_hash = String::new();
                     let mut sender_avatar_updated_at = 0i64;
                     if msg.msg_type == "profile_updated" {
-                        if let Ok(profile_payload) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+                        if let Ok(profile_payload) =
+                            serde_json::from_str::<serde_json::Value>(&msg.content)
+                        {
                             sender_avatar_hash = profile_payload
                                 .get("avatar_hash")
                                 .and_then(|value| value.as_str())
@@ -941,11 +1044,18 @@ impl ChatServer {
                                 .as_deref()
                                 .unwrap_or(&file_state.kind)
                                 .to_string();
+                            if file_state.client_msg_id.is_none() {
+                                file_state.client_msg_id =
+                                    normalized_client_msg_id(msg.client_msg_id.as_deref());
+                            }
                             if let Err(error) =
                                 base64_decode_into(&msg.content, &mut incoming_decode_buf)
                             {
                                 warn!("Failed to decode incoming file chunk: {}", error);
-                                incoming_decode_buf.clear();
+                                if let Some(file_state) = incoming_file.take() {
+                                    remove_incomplete_incoming_file(file_state).await;
+                                }
+                                return Err(error.context("Failed to decode incoming file chunk"));
                             }
                             file_state
                                 .file
@@ -970,11 +1080,16 @@ impl ChatServer {
                                 .as_deref()
                                 .unwrap_or(&file_state.kind)
                                 .to_string();
+                            if file_state.client_msg_id.is_none() {
+                                file_state.client_msg_id =
+                                    normalized_client_msg_id(msg.client_msg_id.as_deref());
+                            }
                             if let Err(error) =
                                 base64_decode_into(&msg.content, &mut incoming_decode_buf)
                             {
                                 warn!("Failed to decode incoming file end: {}", error);
-                                incoming_decode_buf.clear();
+                                remove_incomplete_incoming_file(file_state).await;
+                                return Err(error.context("Failed to decode incoming file end"));
                             }
                             file_state
                                 .file
@@ -996,6 +1111,7 @@ impl ChatServer {
 
                             let sender_id = file_state.sender_id.as_str();
                             let sender_name = file_state.sender_name.as_str();
+                            let client_msg_id = file_state.client_msg_id.as_deref();
                             let msg_kind = if file_state.kind == "sticker" {
                                 "sticker"
                             } else {
@@ -1009,7 +1125,7 @@ impl ChatServer {
                             if let Some(ref gid) = file_state.group_id {
                                 // Group file message — is_read=false so unread fires
                                 match db
-                                    .save_group_message(
+                                    .save_group_message_dedup(
                                         gid,
                                         sender_id,
                                         sender_name,
@@ -1019,11 +1135,25 @@ impl ChatServer {
                                         Some(file_name_display),
                                         msg.file_size.map(|s| s as i64),
                                         false,
-                                        None,
+                                        client_msg_id,
                                     )
                                     .await
                                 {
-                                    Ok(saved) => emit_group_message_updated(&app_handle, gid, saved),
+                                    Ok(saved) => {
+                                        emit_group_message_updated(&app_handle, gid, saved);
+                                        let _ = write_message_ack(
+                                            &mut writer,
+                                            &my_id,
+                                            &my_name,
+                                            &my_department,
+                                            &my_software_version,
+                                            &my_mac_address,
+                                            my_port,
+                                            sender_id,
+                                            client_msg_id,
+                                        )
+                                        .await;
+                                    }
                                     Err(e) => {
                                         error!("Failed to save incoming group file message: {}", e);
                                     }
@@ -1031,7 +1161,7 @@ impl ChatServer {
                             } else {
                                 let receiver_id = &my_id;
                                 match db
-                                    .save_message(
+                                    .save_message_dedup(
                                         sender_id,
                                         sender_name,
                                         receiver_id,
@@ -1040,11 +1170,25 @@ impl ChatServer {
                                         Some(&saved_path),
                                         Some(file_name_display),
                                         msg.file_size.map(|s| s as i64),
-                                        None, // client_msg_id - incoming messages don't have it
+                                        client_msg_id,
                                     )
                                     .await
                                 {
-                                    Ok(saved) => emit_contact_message_updated(&app_handle, sender_id, saved),
+                                    Ok(saved) => {
+                                        emit_contact_message_updated(&app_handle, sender_id, saved);
+                                        let _ = write_message_ack(
+                                            &mut writer,
+                                            &my_id,
+                                            &my_name,
+                                            &my_department,
+                                            &my_software_version,
+                                            &my_mac_address,
+                                            my_port,
+                                            sender_id,
+                                            client_msg_id,
+                                        )
+                                        .await;
+                                    }
                                     Err(e) => {
                                         error!("Failed to save incoming file message: {}", e);
                                     }
@@ -1077,7 +1221,7 @@ impl ChatServer {
                             if let Some(ref gid) = msg.group_id {
                                 // Group message — save with group_id; is_read=false so unread counts work
                                 let saved = db
-                                    .save_group_message(
+                                    .save_group_message_dedup(
                                         gid,
                                         &msg.sender_id,
                                         &msg.sender_name,
@@ -1087,7 +1231,7 @@ impl ChatServer {
                                         None,
                                         None,
                                         false,
-                                        None,
+                                        msg.client_msg_id.as_deref(),
                                     )
                                     .await;
                                 // Auto-join if needed (only when group truly missing — typical when we missed group_created)
@@ -1104,13 +1248,29 @@ impl ChatServer {
                                     info!("Auto-joined group {} from message", gid);
                                 }
                                 match saved {
-                                    Ok(saved) => emit_group_message_updated(&app_handle, gid, saved),
-                                    Err(e) => error!("Failed to save incoming group message: {}", e),
+                                    Ok(saved) => {
+                                        emit_group_message_updated(&app_handle, gid, saved);
+                                        let _ = write_message_ack(
+                                            &mut writer,
+                                            &my_id,
+                                            &my_name,
+                                            &my_department,
+                                            &my_software_version,
+                                            &my_mac_address,
+                                            my_port,
+                                            &msg.sender_id,
+                                            msg.client_msg_id.as_deref(),
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to save incoming group message: {}", e)
+                                    }
                                 }
                             } else {
                                 // Private message
                                 match db
-                                    .save_message(
+                                    .save_message_dedup(
                                         &msg.sender_id,
                                         &msg.sender_name,
                                         &my_id,
@@ -1119,12 +1279,32 @@ impl ChatServer {
                                         msg.file_name.as_deref(),
                                         None,
                                         msg.file_size.map(|s| s as i64),
-                                        None,
+                                        msg.client_msg_id.as_deref(),
                                     )
                                     .await
                                 {
-                                    Ok(saved) => emit_contact_message_updated(&app_handle, &msg.sender_id, saved),
-                                    Err(e) => error!("Failed to save incoming private message: {}", e),
+                                    Ok(saved) => {
+                                        emit_contact_message_updated(
+                                            &app_handle,
+                                            &msg.sender_id,
+                                            saved,
+                                        );
+                                        let _ = write_message_ack(
+                                            &mut writer,
+                                            &my_id,
+                                            &my_name,
+                                            &my_department,
+                                            &my_software_version,
+                                            &my_mac_address,
+                                            my_port,
+                                            &msg.sender_id,
+                                            msg.client_msg_id.as_deref(),
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to save incoming private message: {}", e)
+                                    }
                                 }
                             }
 
@@ -1147,14 +1327,7 @@ impl ChatServer {
         }
 
         if let Some(file_state) = incoming_file.take() {
-            let path = file_state.path.clone();
-            drop(file_state);
-            if let Err(error) = tokio::fs::remove_file(&path).await {
-                warn!(
-                    "Failed to remove incomplete incoming file {}: {}",
-                    path, error
-                );
-            }
+            remove_incomplete_incoming_file(file_state).await;
         }
 
         Ok(())
@@ -1177,7 +1350,7 @@ impl ChatServer {
             let _ = self.db.add_recent_contact(&peer.id).await;
             let mut saved = self
                 .db
-                .save_message(
+                .save_message_dedup(
                     &self.my_id,
                     &self.my_name,
                     &peer.id,
@@ -1212,6 +1385,7 @@ impl ChatServer {
             file_kind: None,
             known_peers: self.build_known_peers(),
             group_id: None,
+            client_msg_id: normalized_client_msg_id(client_msg_id),
         };
 
         let delivered = match self.send_wire_message(peer, &msg).await {
@@ -1251,7 +1425,7 @@ impl ChatServer {
         }
         let saved = self
             .db
-            .save_message(
+            .save_message_dedup(
                 &self.my_id,
                 &self.my_name,
                 &peer.id,
@@ -1289,9 +1463,7 @@ impl ChatServer {
             .await
             .with_context(|| format!("Failed to open file: {}", file_path))?;
 
-        let mut stream = TcpStream::connect(peer.address())
-            .await
-            .with_context(|| format!("Failed to connect to peer {}", peer.address()))?;
+        let mut stream = connect_peer_with_timeout(peer).await?;
         tune_file_tcp_stream(&stream, peer);
 
         let peers_list = self.build_known_peers();
@@ -1332,6 +1504,7 @@ impl ChatServer {
                     file_kind: "file",
                     known_peers,
                     group_id: None,
+                    client_msg_id: None,
                 },
                 &mut payload,
             )?;
@@ -1363,7 +1536,7 @@ impl ChatServer {
         // Save outgoing file message to DB
         let saved = self
             .db
-            .save_message(
+            .save_message_dedup(
                 &self.my_id,
                 &self.my_name,
                 &peer.id,
@@ -1380,9 +1553,7 @@ impl ChatServer {
     }
 
     async fn send_wire_message(&self, peer: &Peer, msg: &WireMessage) -> Result<()> {
-        let mut stream = TcpStream::connect(peer.address())
-            .await
-            .with_context(|| format!("Failed to connect to peer {}", peer.address()))?;
+        let mut stream = connect_peer_with_timeout(peer).await?;
         tune_file_tcp_stream(&stream, peer);
 
         let payload = serialize_wire_message_line(msg)?;
@@ -1391,6 +1562,15 @@ impl ChatServer {
             .await
             .context("Failed to write message")?;
         stream.flush().await?;
+
+        if msg.client_msg_id.is_some()
+            && !wait_for_message_ack(&mut stream, msg.client_msg_id.as_deref()).await
+        {
+            warn!(
+                "No message ack from {} for {:?}; treating as legacy peer success",
+                peer.id, msg.client_msg_id
+            );
+        }
 
         // TCP success = peer is definitely online
         self.bump_last_seen(peer);
@@ -1660,9 +1840,7 @@ async fn send_file_in_background_inner(
 
     wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await?;
 
-    let mut stream = TcpStream::connect(peer.address())
-        .await
-        .with_context(|| format!("Failed to connect to peer {}", peer.address()))?;
+    let mut stream = connect_peer_with_timeout(peer).await?;
     tune_file_tcp_stream(&stream, peer);
 
     // Build known_peers once
@@ -1704,23 +1882,9 @@ async fn send_file_in_background_inner(
     let start_time = std::time::Instant::now();
     let mut last_progress_emit = start_time;
 
-    loop {
+    if file_size == 0 {
         wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await?;
-
-        let n = file
-            .read(&mut buf)
-            .await
-            .with_context(|| format!("Failed to read file chunk {}", i))?;
-        if n == 0 {
-            break;
-        }
-
-        let is_last =
-            n < FILE_CHUNK_SIZE || (file_size as usize) <= ((i as usize + 1) * FILE_CHUNK_SIZE);
-        let msg_type = if is_last { "file_end" } else { "file_chunk" };
-        let known_peers: &[PeerEntry] = if i == 0 { peers_list.as_slice() } else { &[] };
-        base64_encode_into(&buf[..n], &mut content_buf);
-
+        base64_encode_into(&[], &mut content_buf);
         serialize_file_wire_message_line(
             FileWireMessageLine {
                 sender_id: &my_id,
@@ -1731,12 +1895,13 @@ async fn send_file_in_background_inner(
                 sender_port: listen_port,
                 receiver_id: &peer.id,
                 content: &content_buf,
-                msg_type,
+                msg_type: "file_end",
                 file_name,
                 file_size,
                 file_kind,
-                known_peers,
+                known_peers: peers_list.as_slice(),
                 group_id: group_id.as_deref(),
+                client_msg_id: client_msg_id.as_deref(),
             },
             &mut payload,
         )?;
@@ -1744,21 +1909,64 @@ async fn send_file_in_background_inner(
             .write_all(&payload)
             .await
             .map_err(|error| file_send_connection_error(error, peer))?;
-        i += 1;
+    } else {
+        loop {
+            wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await?;
 
-        let sent = std::cmp::min((i as usize) * FILE_CHUNK_SIZE, file_size as usize) as u64;
-        if last_progress_emit.elapsed() >= FILE_PROGRESS_INTERVAL {
-            let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
-            let speed = (sent as f64 / elapsed) as u64;
-            emit_file_progress(
-                &app_handle,
-                file_name,
-                client_msg_id.as_deref(),
-                sent,
-                file_size,
-                speed,
-            );
-            last_progress_emit = std::time::Instant::now();
+            let n = file
+                .read(&mut buf)
+                .await
+                .with_context(|| format!("Failed to read file chunk {}", i))?;
+            if n == 0 {
+                break;
+            }
+
+            let is_last =
+                n < FILE_CHUNK_SIZE || (file_size as usize) <= ((i as usize + 1) * FILE_CHUNK_SIZE);
+            let msg_type = if is_last { "file_end" } else { "file_chunk" };
+            let known_peers: &[PeerEntry] = if i == 0 { peers_list.as_slice() } else { &[] };
+            base64_encode_into(&buf[..n], &mut content_buf);
+
+            serialize_file_wire_message_line(
+                FileWireMessageLine {
+                    sender_id: &my_id,
+                    sender_name: &my_name,
+                    sender_department: &my_department,
+                    sender_software_version: &sender_software_version,
+                    sender_mac_address: &sender_mac_address,
+                    sender_port: listen_port,
+                    receiver_id: &peer.id,
+                    content: &content_buf,
+                    msg_type,
+                    file_name,
+                    file_size,
+                    file_kind,
+                    known_peers,
+                    group_id: group_id.as_deref(),
+                    client_msg_id: client_msg_id.as_deref(),
+                },
+                &mut payload,
+            )?;
+            stream
+                .write_all(&payload)
+                .await
+                .map_err(|error| file_send_connection_error(error, peer))?;
+            i += 1;
+
+            let sent = std::cmp::min((i as usize) * FILE_CHUNK_SIZE, file_size as usize) as u64;
+            if last_progress_emit.elapsed() >= FILE_PROGRESS_INTERVAL {
+                let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
+                let speed = (sent as f64 / elapsed) as u64;
+                emit_file_progress(
+                    &app_handle,
+                    file_name,
+                    client_msg_id.as_deref(),
+                    sent,
+                    file_size,
+                    speed,
+                );
+                last_progress_emit = std::time::Instant::now();
+            }
         }
     }
     stream
@@ -1800,7 +2008,7 @@ async fn send_file_in_background_inner(
             format!("📎 {}", file_name)
         };
         let saved = db
-            .save_message(
+            .save_message_dedup(
                 &my_id,
                 &my_name,
                 &peer.id,

@@ -237,7 +237,10 @@ pub async fn handle_contact_summary(
     let entries: Vec<ContactSummaryEntry> = match serde_json::from_str(content) {
         Ok(v) => v,
         Err(e) => {
-            warn!("contact_sync: bad contact_summary from {}: {}", sender_id, e);
+            warn!(
+                "contact_sync: bad contact_summary from {}: {}",
+                sender_id, e
+            );
             return false;
         }
     };
@@ -300,7 +303,8 @@ pub async fn handle_contact_summary(
         my_mac_address,
         my_port,
         my_ip,
-    ).await;
+    )
+    .await;
 
     // 3. Compute what they're missing
     let our_set: HashSet<&str> = our_summaries.iter().map(|s| s.peer_id.as_str()).collect();
@@ -318,8 +322,7 @@ pub async fn handle_contact_summary(
         summaries: our_summaries,
         missing_details,
     };
-    let response_content =
-        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+    let response_content = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
 
     let response_msg = WireMessage {
         sender_id: my_id.to_string(),
@@ -337,6 +340,7 @@ pub async fn handle_contact_summary(
         file_kind: None,
         known_peers: Vec::new(),
         group_id: None,
+        client_msg_id: None,
     };
 
     let target_addr = format!("{}:{}", sender_ip, sender_port);
@@ -465,7 +469,8 @@ pub async fn exchange_with_peer(
         my_mac_address,
         my_port,
         my_ip,
-    ).await;
+    )
+    .await;
     let content = serde_json::to_string(&summaries).unwrap_or_else(|_| "[]".to_string());
 
     let msg = WireMessage {
@@ -484,6 +489,7 @@ pub async fn exchange_with_peer(
         file_kind: None,
         known_peers: Vec::new(),
         group_id: None,
+        client_msg_id: None,
     };
 
     let addr = format!("{}:{}", target_ip, target_port);

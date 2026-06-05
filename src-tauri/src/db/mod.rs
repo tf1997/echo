@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use log::info;
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::{SqlitePoolOptions, SqliteRow}, Pool, Row, Sqlite};
+use sqlx::{
+    sqlite::{SqlitePoolOptions, SqliteRow},
+    Pool, Row, Sqlite,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserProfile {
@@ -44,6 +47,8 @@ pub struct PendingFileTransfer {
     pub file_name: String,
     pub file_size: i64,
     pub file_kind: String,
+    #[serde(default)]
+    pub client_msg_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,11 +128,17 @@ const DEFAULT_SEARCH_LIMIT: i64 = 200;
 const MAX_SEARCH_LIMIT: i64 = 500;
 
 fn normalize_message_limit(limit: Option<i64>) -> i64 {
-    limit.unwrap_or(DEFAULT_MESSAGE_LIMIT).max(1).min(MAX_MESSAGE_LIMIT)
+    limit
+        .unwrap_or(DEFAULT_MESSAGE_LIMIT)
+        .max(1)
+        .min(MAX_MESSAGE_LIMIT)
 }
 
 fn normalize_search_limit(limit: Option<i64>) -> i64 {
-    limit.unwrap_or(DEFAULT_SEARCH_LIMIT).max(1).min(MAX_SEARCH_LIMIT)
+    limit
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .max(1)
+        .min(MAX_SEARCH_LIMIT)
 }
 
 fn message_filter_clause(filter: Option<&str>) -> &'static str {
@@ -219,10 +230,11 @@ impl Database {
             }
         }
 
-        if let Err(error) =
-            sqlx::query("ALTER TABLE user_profile ADD COLUMN software_version TEXT NOT NULL DEFAULT ''")
-                .execute(&self.pool)
-                .await
+        if let Err(error) = sqlx::query(
+            "ALTER TABLE user_profile ADD COLUMN software_version TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await
         {
             let message = error.to_string();
             if !message.contains("duplicate column name") {
@@ -263,14 +275,16 @@ impl Database {
             }
         }
 
-        if let Err(error) =
-            sqlx::query("ALTER TABLE user_profile ADD COLUMN avatar_updated_at INTEGER NOT NULL DEFAULT 0")
-                .execute(&self.pool)
-                .await
+        if let Err(error) = sqlx::query(
+            "ALTER TABLE user_profile ADD COLUMN avatar_updated_at INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
         {
             let message = error.to_string();
             if !message.contains("duplicate column name") {
-                return Err(error).context("Failed to add avatar_updated_at column to user_profile");
+                return Err(error)
+                    .context("Failed to add avatar_updated_at column to user_profile");
             }
         }
 
@@ -399,7 +413,8 @@ impl Database {
         // On a fresh database the base CREATE TABLE does not include this column,
         // so creating idx_messages_group_recent first would fail during startup.
         if let Err(error) = sqlx::query("ALTER TABLE messages ADD COLUMN group_id TEXT")
-            .execute(&self.pool).await
+            .execute(&self.pool)
+            .await
         {
             let msg = error.to_string();
             if !msg.contains("duplicate column name") {
@@ -459,7 +474,8 @@ impl Database {
 
         // Add client_msg_id to messages if not exists
         if let Err(error) = sqlx::query("ALTER TABLE messages ADD COLUMN client_msg_id TEXT")
-            .execute(&self.pool).await
+            .execute(&self.pool)
+            .await
         {
             let msg = error.to_string();
             if !msg.contains("duplicate column name") {
@@ -468,10 +484,12 @@ impl Database {
         }
 
         // Create index on client_msg_id for fast lookups
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_client_msg_id ON messages(client_msg_id)")
-            .execute(&self.pool)
-            .await
-            .context("Failed to create client_msg_id index")?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_client_msg_id ON messages(client_msg_id)",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create client_msg_id index")?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS pending_group_messages (
@@ -486,7 +504,8 @@ impl Database {
                 created_at TEXT NOT NULL
             )",
         )
-        .execute(&self.pool).await
+        .execute(&self.pool)
+        .await
         .context("Failed to create pending_group_messages table")?;
 
         // Generic offline-delivery queue. `payload` is a full WireMessage JSON
@@ -501,11 +520,16 @@ impl Database {
                 created_at TEXT NOT NULL
             )",
         )
-        .execute(&self.pool).await
+        .execute(&self.pool)
+        .await
         .context("Failed to create pending_notifications table")?;
 
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_notif_peer ON pending_notifications(peer_id)")
-            .execute(&self.pool).await.ok();
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pending_notif_peer ON pending_notifications(peer_id)",
+        )
+        .execute(&self.pool)
+        .await
+        .ok();
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS pending_file_transfers (
@@ -520,14 +544,19 @@ impl Database {
                 file_name TEXT NOT NULL,
                 file_size INTEGER NOT NULL,
                 file_kind TEXT NOT NULL DEFAULT 'file',
+                client_msg_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             )",
         )
-        .execute(&self.pool).await
+        .execute(&self.pool)
+        .await
         .context("Failed to create pending_file_transfers table")?;
 
-        if let Err(error) = sqlx::query("ALTER TABLE pending_file_transfers ADD COLUMN file_kind TEXT NOT NULL DEFAULT 'file'")
-            .execute(&self.pool).await
+        if let Err(error) = sqlx::query(
+            "ALTER TABLE pending_file_transfers ADD COLUMN file_kind TEXT NOT NULL DEFAULT 'file'",
+        )
+        .execute(&self.pool)
+        .await
         {
             let msg = error.to_string();
             if !msg.contains("duplicate column name") {
@@ -535,8 +564,24 @@ impl Database {
             }
         }
 
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_file_peer ON pending_file_transfers(peer_id)")
-            .execute(&self.pool).await.ok();
+        if let Err(error) = sqlx::query(
+            "ALTER TABLE pending_file_transfers ADD COLUMN client_msg_id TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await
+        {
+            let msg = error.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(error).context("Failed to add client_msg_id to pending_file_transfers");
+            }
+        }
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pending_file_peer ON pending_file_transfers(peer_id)",
+        )
+        .execute(&self.pool)
+        .await
+        .ok();
 
         info!("Database initialized successfully.");
         Ok(())
@@ -579,34 +624,38 @@ impl Database {
                 last_message_id DESC,
                 r.added_at DESC",
         )
-        .fetch_all(&self.pool).await
+        .fetch_all(&self.pool)
+        .await
         .context("Failed to list recent contacts")?;
 
-        Ok(rows.iter().map(|r| StoredPeer {
-            peer_id: r.get("peer_id"),
-            username: r.get("username"),
-            department: r.get("department"),
-            software_version: r.get("software_version"),
-            mac_address: r.get("mac_address"),
-            avatar_path: r.get("avatar_path"),
-            avatar_hash: r.get("avatar_hash"),
-            avatar_updated_at: r.get("avatar_updated_at"),
-            ip: r.get("ip"),
-            port: r.get::<i64, _>("port") as u16,
-            is_online: r.get::<bool, _>("is_online"),
-            first_seen_at: r.get("first_seen_at"),
-            last_seen_at: r.get("last_seen_at"),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| StoredPeer {
+                peer_id: r.get("peer_id"),
+                username: r.get("username"),
+                department: r.get("department"),
+                software_version: r.get("software_version"),
+                mac_address: r.get("mac_address"),
+                avatar_path: r.get("avatar_path"),
+                avatar_hash: r.get("avatar_hash"),
+                avatar_updated_at: r.get("avatar_updated_at"),
+                ip: r.get("ip"),
+                port: r.get::<i64, _>("port") as u16,
+                is_online: r.get::<bool, _>("is_online"),
+                first_seen_at: r.get("first_seen_at"),
+                last_seen_at: r.get("last_seen_at"),
+            })
+            .collect())
     }
 
     pub async fn remove_recent_contact(&self, peer_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM recent_contacts WHERE peer_id = ?")
             .bind(peer_id)
-            .execute(&self.pool).await
+            .execute(&self.pool)
+            .await
             .context("Failed to remove recent contact")?;
         Ok(())
     }
-
 
     pub async fn get_user_profile(&self) -> Result<Option<UserProfile>> {
         let row = sqlx::query("SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at FROM user_profile WHERE id = 1")
@@ -615,7 +664,11 @@ impl Database {
             .context("Failed to load user profile")?;
 
         Ok(row.map(|row| UserProfile {
-            peer_id: row.try_get::<Option<String>, _>("peer_id").ok().flatten().unwrap_or_default(),
+            peer_id: row
+                .try_get::<Option<String>, _>("peer_id")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
             username: row.get("username"),
             department: row.get("department"),
             software_version: row.try_get("software_version").unwrap_or_default(),
@@ -708,8 +761,14 @@ impl Database {
     // generic pending notification queue below.
     #[allow(dead_code)]
     pub async fn store_pending_group_msg(
-        &self, group_id: &str, peer_id: &str,
-        sender_id: &str, sender_name: &str, content: &str, msg_type: &str, timestamp: &str,
+        &self,
+        group_id: &str,
+        peer_id: &str,
+        sender_id: &str,
+        sender_name: &str,
+        content: &str,
+        msg_type: &str,
+        timestamp: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query("INSERT INTO pending_group_messages (group_id, peer_id, sender_id, sender_name, content, msg_type, original_timestamp, created_at) VALUES (?,?,?,?,?,?,?,?)")
@@ -722,17 +781,28 @@ impl Database {
     pub async fn get_pending_for_peer(&self, peer_id: &str) -> Result<Vec<PendingGroupMsg>> {
         let rows = sqlx::query("SELECT id, group_id, peer_id, sender_id, sender_name, content, msg_type, original_timestamp FROM pending_group_messages WHERE peer_id = ? ORDER BY id ASC")
             .bind(peer_id).fetch_all(&self.pool).await.context("Failed to get pending msgs")?;
-        Ok(rows.iter().map(|r| PendingGroupMsg {
-            id: r.get("id"), group_id: r.get("group_id"), peer_id: r.get("peer_id"),
-            sender_id: r.get("sender_id"), sender_name: r.get("sender_name"),
-            content: r.get("content"), msg_type: r.get("msg_type"),
-            original_timestamp: r.get("original_timestamp"),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| PendingGroupMsg {
+                id: r.get("id"),
+                group_id: r.get("group_id"),
+                peer_id: r.get("peer_id"),
+                sender_id: r.get("sender_id"),
+                sender_name: r.get("sender_name"),
+                content: r.get("content"),
+                msg_type: r.get("msg_type"),
+                original_timestamp: r.get("original_timestamp"),
+            })
+            .collect())
     }
 
     pub async fn delete_pending_msgs(&self, ids: &[i64]) -> Result<()> {
         for id in ids {
-            sqlx::query("DELETE FROM pending_group_messages WHERE id = ?").bind(id).execute(&self.pool).await.ok();
+            sqlx::query("DELETE FROM pending_group_messages WHERE id = ?")
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .ok();
         }
         Ok(())
     }
@@ -745,13 +815,21 @@ impl Database {
     // covers private messages, group control messages, profile updates, etc.
 
     pub async fn queue_pending_notification(
-        &self, peer_id: &str, kind: &str, payload: &str,
+        &self,
+        peer_id: &str,
+        kind: &str,
+        payload: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         // Dedupe profile_updated — only one queued copy per peer makes sense.
         if kind == "profile_updated" {
-            sqlx::query("DELETE FROM pending_notifications WHERE peer_id = ? AND kind = 'profile_updated'")
-                .bind(peer_id).execute(&self.pool).await.ok();
+            sqlx::query(
+                "DELETE FROM pending_notifications WHERE peer_id = ? AND kind = 'profile_updated'",
+            )
+            .bind(peer_id)
+            .execute(&self.pool)
+            .await
+            .ok();
         }
         sqlx::query("INSERT INTO pending_notifications (peer_id, kind, payload, created_at) VALUES (?, ?, ?, ?)")
             .bind(peer_id).bind(kind).bind(payload).bind(&now)
@@ -759,20 +837,36 @@ impl Database {
         Ok(())
     }
 
-    pub async fn get_pending_notifications(&self, peer_id: &str) -> Result<Vec<(i64, String, String)>> {
-        let rows = sqlx::query("SELECT id, kind, payload FROM pending_notifications WHERE peer_id = ? ORDER BY id ASC")
-            .bind(peer_id).fetch_all(&self.pool).await.context("Failed to load pending notifications")?;
-        Ok(rows.iter().map(|r| (
-            r.get::<i64, _>("id"),
-            r.get::<String, _>("kind"),
-            r.get::<String, _>("payload"),
-        )).collect())
+    pub async fn get_pending_notifications(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<(i64, String, String)>> {
+        let rows = sqlx::query(
+            "SELECT id, kind, payload FROM pending_notifications WHERE peer_id = ? ORDER BY id ASC",
+        )
+        .bind(peer_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to load pending notifications")?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<i64, _>("id"),
+                    r.get::<String, _>("kind"),
+                    r.get::<String, _>("payload"),
+                )
+            })
+            .collect())
     }
 
     pub async fn delete_pending_notifications(&self, ids: &[i64]) -> Result<()> {
         for id in ids {
             sqlx::query("DELETE FROM pending_notifications WHERE id = ?")
-                .bind(id).execute(&self.pool).await.ok();
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .ok();
         }
         Ok(())
     }
@@ -791,12 +885,13 @@ impl Database {
         file_name: &str,
         file_size: i64,
         file_kind: &str,
+        client_msg_id: Option<&str>,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO pending_file_transfers
-             (group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, file_kind, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, file_kind, client_msg_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(group_id)
         .bind(peer_id)
@@ -808,50 +903,69 @@ impl Database {
         .bind(file_name)
         .bind(file_size)
         .bind(file_kind)
+        .bind(client_msg_id.unwrap_or_default())
         .bind(&now)
         .execute(&self.pool).await
         .context("Failed to queue pending file transfer")?;
         Ok(())
     }
 
-    pub async fn get_pending_file_transfers(&self, peer_id: &str) -> Result<Vec<PendingFileTransfer>> {
+    pub async fn get_pending_file_transfers(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<PendingFileTransfer>> {
         let rows = sqlx::query(
-            "SELECT id, group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, file_kind
+            "SELECT id, group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, file_kind, client_msg_id
              FROM pending_file_transfers WHERE peer_id = ? ORDER BY id ASC",
         )
         .bind(peer_id).fetch_all(&self.pool).await
         .context("Failed to load pending file transfers")?;
 
-        Ok(rows.iter().map(|r| PendingFileTransfer {
-            id: r.get("id"),
-            group_id: r.get("group_id"),
-            peer_id: r.get("peer_id"),
-            sender_id: r.get("sender_id"),
-            sender_name: r.get("sender_name"),
-            sender_department: r.get("sender_department"),
-            sender_port: r.get::<i64, _>("sender_port") as u16,
-            file_path: r.get("file_path"),
-            file_name: r.get("file_name"),
-            file_size: r.get("file_size"),
-            file_kind: r.get("file_kind"),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| PendingFileTransfer {
+                id: r.get("id"),
+                group_id: r.get("group_id"),
+                peer_id: r.get("peer_id"),
+                sender_id: r.get("sender_id"),
+                sender_name: r.get("sender_name"),
+                sender_department: r.get("sender_department"),
+                sender_port: r.get::<i64, _>("sender_port") as u16,
+                file_path: r.get("file_path"),
+                file_name: r.get("file_name"),
+                file_size: r.get("file_size"),
+                file_kind: r.get("file_kind"),
+                client_msg_id: r.try_get("client_msg_id").unwrap_or_default(),
+            })
+            .collect())
     }
 
     pub async fn delete_pending_file_transfer(&self, id: i64) -> Result<()> {
         sqlx::query("DELETE FROM pending_file_transfers WHERE id = ?")
-            .bind(id).execute(&self.pool).await
+            .bind(id)
+            .execute(&self.pool)
+            .await
             .context("Failed to delete pending file transfer")?;
         Ok(())
     }
 
     pub async fn count_pending_file_transfers_by_path(&self, file_path: &str) -> Result<i64> {
-        let row = sqlx::query("SELECT COUNT(*) AS count FROM pending_file_transfers WHERE file_path = ?")
-            .bind(file_path).fetch_one(&self.pool).await
-            .context("Failed to count pending file transfers")?;
+        let row =
+            sqlx::query("SELECT COUNT(*) AS count FROM pending_file_transfers WHERE file_path = ?")
+                .bind(file_path)
+                .fetch_one(&self.pool)
+                .await
+                .context("Failed to count pending file transfers")?;
         Ok(row.get("count"))
     }
 
-    pub async fn create_group(&self, group_id: &str, name: &str, creator_id: &str, member_ids: &[String]) -> Result<()> {
+    pub async fn create_group(
+        &self,
+        group_id: &str,
+        name: &str,
+        creator_id: &str,
+        member_ids: &[String],
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query("INSERT OR IGNORE INTO groups (group_id, name, creator_id, created_at) VALUES (?, ?, ?, ?)")
             .bind(group_id).bind(name).bind(creator_id).bind(&now)
@@ -867,8 +981,12 @@ impl Database {
     pub async fn list_groups(&self, my_id: &str) -> Result<Vec<GroupInfo>> {
         let rows = sqlx::query(
             "SELECT g.group_id, g.name, g.creator_id, g.created_at FROM groups g
-             INNER JOIN group_members gm ON g.group_id = gm.group_id WHERE gm.peer_id = ?"
-        ).bind(my_id).fetch_all(&self.pool).await.context("Failed to list groups")?;
+             INNER JOIN group_members gm ON g.group_id = gm.group_id WHERE gm.peer_id = ?",
+        )
+        .bind(my_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list groups")?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let group_id: String = r.get("group_id");
@@ -876,8 +994,13 @@ impl Database {
             let last_row = sqlx::query(
                 "SELECT content, msg_type, file_name, sender_name, timestamp FROM messages
                  WHERE group_id = ? AND msg_type NOT IN ('file_chunk','file_end')
-                 ORDER BY id DESC LIMIT 1"
-            ).bind(&group_id).fetch_optional(&self.pool).await.ok().flatten();
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .bind(&group_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
             let (last_message, last_message_at, last_message_sender) = if let Some(lr) = last_row {
                 let msg_type: String = lr.get("msg_type");
                 let preview = if msg_type == "file" {
@@ -950,25 +1073,28 @@ impl Database {
              LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = gm.peer_id
              WHERE gm.group_id = ?"
         ).bind(group_id).fetch_all(&self.pool).await.context("Failed to get group members")?;
-        let mut members: Vec<StoredPeer> = rows.iter().map(|r| {
-            let is_self: i64 = r.try_get("is_self").unwrap_or(0);
-            StoredPeer {
-                peer_id: r.get("peer_id"),
-                username: r.try_get("username").unwrap_or_default(),
-                department: r.try_get("department").unwrap_or_default(),
-                software_version: r.try_get("software_version").unwrap_or_default(),
-                mac_address: r.try_get("mac_address").unwrap_or_default(),
-                avatar_path: r.try_get("avatar_path").unwrap_or_default(),
-                avatar_hash: r.try_get("avatar_hash").unwrap_or_default(),
-                avatar_updated_at: r.try_get("avatar_updated_at").unwrap_or_default(),
-                ip: r.try_get("ip").unwrap_or_default(),
-                port: r.try_get::<i64, _>("port").unwrap_or(0) as u16,
-                // Treat self as always online — UI uses this to render the green dot.
-                is_online: is_self == 1 || r.try_get::<bool, _>("is_online").unwrap_or(false),
-                first_seen_at: r.try_get("first_seen_at").unwrap_or_default(),
-                last_seen_at: r.try_get("last_seen_at").unwrap_or_default(),
-            }
-        }).collect();
+        let mut members: Vec<StoredPeer> = rows
+            .iter()
+            .map(|r| {
+                let is_self: i64 = r.try_get("is_self").unwrap_or(0);
+                StoredPeer {
+                    peer_id: r.get("peer_id"),
+                    username: r.try_get("username").unwrap_or_default(),
+                    department: r.try_get("department").unwrap_or_default(),
+                    software_version: r.try_get("software_version").unwrap_or_default(),
+                    mac_address: r.try_get("mac_address").unwrap_or_default(),
+                    avatar_path: r.try_get("avatar_path").unwrap_or_default(),
+                    avatar_hash: r.try_get("avatar_hash").unwrap_or_default(),
+                    avatar_updated_at: r.try_get("avatar_updated_at").unwrap_or_default(),
+                    ip: r.try_get("ip").unwrap_or_default(),
+                    port: r.try_get::<i64, _>("port").unwrap_or(0) as u16,
+                    // Treat self as always online — UI uses this to render the green dot.
+                    is_online: is_self == 1 || r.try_get::<bool, _>("is_online").unwrap_or(false),
+                    first_seen_at: r.try_get("first_seen_at").unwrap_or_default(),
+                    last_seen_at: r.try_get("last_seen_at").unwrap_or_default(),
+                }
+            })
+            .collect();
 
         members.sort_by(|a, b| {
             let a_key = if !a.username.is_empty() {
@@ -981,7 +1107,8 @@ impl Database {
             } else {
                 b.peer_id.clone()
             };
-            a_key.cmp(&b_key)
+            a_key
+                .cmp(&b_key)
                 .then_with(|| b.is_online.cmp(&a.is_online))
                 .then_with(|| b.last_seen_at.cmp(&a.last_seen_at))
         });
@@ -998,7 +1125,10 @@ impl Database {
 
     pub async fn rename_group(&self, group_id: &str, new_name: &str) -> Result<()> {
         sqlx::query("UPDATE groups SET name = ? WHERE group_id = ?")
-            .bind(new_name).bind(group_id).execute(&self.pool).await
+            .bind(new_name)
+            .bind(group_id)
+            .execute(&self.pool)
+            .await
             .context("Failed to rename group")?;
         Ok(())
     }
@@ -1014,22 +1144,120 @@ impl Database {
 
     pub async fn remove_group_member(&self, group_id: &str, peer_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM group_members WHERE group_id = ? AND peer_id = ?")
-            .bind(group_id).bind(peer_id).execute(&self.pool).await
+            .bind(group_id)
+            .bind(peer_id)
+            .execute(&self.pool)
+            .await
             .context("Failed to remove group member")?;
         Ok(())
     }
 
     pub async fn dissolve_group(&self, group_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM group_members WHERE group_id = ?").bind(group_id).execute(&self.pool).await.ok();
-        sqlx::query("DELETE FROM groups WHERE group_id = ?").bind(group_id).execute(&self.pool).await
+        sqlx::query("DELETE FROM group_members WHERE group_id = ?")
+            .bind(group_id)
+            .execute(&self.pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM groups WHERE group_id = ?")
+            .bind(group_id)
+            .execute(&self.pool)
+            .await
             .context("Failed to dissolve group")?;
         Ok(())
     }
 
+    pub async fn find_message_by_client_msg_id(
+        &self,
+        sender_id: &str,
+        group_id: Option<&str>,
+        client_msg_id: Option<&str>,
+    ) -> Result<Option<ChatMessage>> {
+        let Some(client_msg_id) = client_msg_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let row = if let Some(group_id) = group_id {
+            sqlx::query(
+                "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+                 FROM messages
+                 WHERE sender_id = ? AND group_id = ? AND client_msg_id = ?
+                 ORDER BY id ASC
+                 LIMIT 1",
+            )
+            .bind(sender_id)
+            .bind(group_id)
+            .bind(client_msg_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to find group message by client_msg_id")?
+        } else {
+            sqlx::query(
+                "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+                 FROM messages
+                 WHERE sender_id = ? AND (group_id IS NULL OR group_id = '') AND client_msg_id = ?
+                 ORDER BY id ASC
+                 LIMIT 1",
+            )
+            .bind(sender_id)
+            .bind(client_msg_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to find message by client_msg_id")?
+        };
+
+        Ok(row.as_ref().map(chat_message_from_row))
+    }
+
+    pub async fn save_group_message_dedup(
+        &self,
+        group_id: &str,
+        sender_id: &str,
+        sender_name: &str,
+        content: &str,
+        msg_type: &str,
+        file_path: Option<&str>,
+        file_name: Option<&str>,
+        file_size: Option<i64>,
+        is_read: bool,
+        client_msg_id: Option<&str>,
+    ) -> Result<ChatMessage> {
+        if let Some(existing) = self
+            .find_message_by_client_msg_id(sender_id, Some(group_id), client_msg_id)
+            .await?
+        {
+            return Ok(existing);
+        }
+
+        self.save_group_message(
+            group_id,
+            sender_id,
+            sender_name,
+            content,
+            msg_type,
+            file_path,
+            file_name,
+            file_size,
+            is_read,
+            client_msg_id,
+        )
+        .await
+    }
+
     pub async fn save_group_message(
-        &self, group_id: &str, sender_id: &str, sender_name: &str,
-        content: &str, msg_type: &str, file_path: Option<&str>, file_name: Option<&str>, file_size: Option<i64>,
-        is_read: bool, client_msg_id: Option<&str>,
+        &self,
+        group_id: &str,
+        sender_id: &str,
+        sender_name: &str,
+        content: &str,
+        msg_type: &str,
+        file_path: Option<&str>,
+        file_name: Option<&str>,
+        file_size: Option<i64>,
+        is_read: bool,
+        client_msg_id: Option<&str>,
     ) -> Result<ChatMessage> {
         let timestamp = Utc::now().to_rfc3339();
         let id = sqlx::query(
@@ -1040,10 +1268,18 @@ impl Database {
          .bind(if is_read { 1 } else { 0 }).bind(group_id).bind(client_msg_id)
          .execute(&self.pool).await.context("Failed to save group message")?.last_insert_rowid();
         Ok(ChatMessage {
-            id, sender_id: sender_id.to_string(), sender_name: sender_name.to_string(),
-            receiver_id: String::new(), content: content.to_string(), msg_type: msg_type.to_string(),
-            file_path: file_path.map(|s| s.to_string()), file_name: file_name.map(|s| s.to_string()),
-            file_size, timestamp, is_read, client_msg_id: client_msg_id.map(|s| s.to_string()),
+            id,
+            sender_id: sender_id.to_string(),
+            sender_name: sender_name.to_string(),
+            receiver_id: String::new(),
+            content: content.to_string(),
+            msg_type: msg_type.to_string(),
+            file_path: file_path.map(|s| s.to_string()),
+            file_name: file_name.map(|s| s.to_string()),
+            file_size,
+            timestamp,
+            is_read,
+            client_msg_id: client_msg_id.map(|s| s.to_string()),
         })
     }
 
@@ -1051,22 +1287,36 @@ impl Database {
         let rows = sqlx::query(
             "SELECT group_id, COUNT(*) as cnt FROM messages
              WHERE group_id IS NOT NULL AND group_id <> '' AND sender_id <> ? AND is_read = 0
-             GROUP BY group_id"
-        ).bind(my_id).fetch_all(&self.pool).await.context("Failed to get group unread counts")?;
-        Ok(rows.iter().map(|r| GroupUnread {
-            group_id: r.get("group_id"),
-            count: r.get::<i64, _>("cnt") as u32,
-        }).collect())
+             GROUP BY group_id",
+        )
+        .bind(my_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to get group unread counts")?;
+        Ok(rows
+            .iter()
+            .map(|r| GroupUnread {
+                group_id: r.get("group_id"),
+                count: r.get::<i64, _>("cnt") as u32,
+            })
+            .collect())
     }
 
     pub async fn mark_group_read(&self, group_id: &str, my_id: &str) -> Result<()> {
         sqlx::query("UPDATE messages SET is_read = 1 WHERE group_id = ? AND sender_id <> ?")
-            .bind(group_id).bind(my_id)
-            .execute(&self.pool).await.context("Failed to mark group read")?;
+            .bind(group_id)
+            .bind(my_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to mark group read")?;
         Ok(())
     }
 
-    pub async fn get_group_messages(&self, group_id: &str, limit: Option<i64>) -> Result<Vec<ChatMessage>> {
+    pub async fn get_group_messages(
+        &self,
+        group_id: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<ChatMessage>> {
         let limit = normalize_message_limit(limit);
         let rows = sqlx::query(
             "SELECT id, sender_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
@@ -1076,13 +1326,23 @@ impl Database {
              ) AS recent_messages
              ORDER BY id ASC"
         ).bind(group_id).bind(limit).fetch_all(&self.pool).await.context("Failed to get group messages")?;
-        Ok(rows.iter().map(|r| ChatMessage {
-            id: r.get("id"), sender_id: r.get("sender_id"), sender_name: r.get("sender_name"),
-            receiver_id: String::new(), content: r.get("content"), msg_type: r.get("msg_type"),
-            file_path: r.get("file_path"), file_name: r.get("file_name"),
-            file_size: r.get("file_size"), timestamp: r.get("timestamp"),
-            is_read: r.get::<bool, _>("is_read"), client_msg_id: r.try_get("client_msg_id").ok(),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| ChatMessage {
+                id: r.get("id"),
+                sender_id: r.get("sender_id"),
+                sender_name: r.get("sender_name"),
+                receiver_id: String::new(),
+                content: r.get("content"),
+                msg_type: r.get("msg_type"),
+                file_path: r.get("file_path"),
+                file_name: r.get("file_name"),
+                file_size: r.get("file_size"),
+                timestamp: r.get("timestamp"),
+                is_read: r.get::<bool, _>("is_read"),
+                client_msg_id: r.try_get("client_msg_id").ok(),
+            })
+            .collect())
     }
 
     pub async fn get_departments(&self) -> Result<Vec<String>> {
@@ -1161,13 +1421,14 @@ impl Database {
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
 
-        let endpoint_duplicates = sqlx::query("SELECT peer_id FROM peers WHERE ip = ? AND port = ? AND peer_id <> ?")
-            .bind(ip)
-            .bind(port as i64)
-            .bind(peer_id)
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to load stale peer endpoints")?;
+        let endpoint_duplicates =
+            sqlx::query("SELECT peer_id FROM peers WHERE ip = ? AND port = ? AND peer_id <> ?")
+                .bind(ip)
+                .bind(port as i64)
+                .bind(peer_id)
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to load stale peer endpoints")?;
         for row in endpoint_duplicates {
             let old_peer_id: String = row.get("peer_id");
             self.migrate_peer_references(&old_peer_id, peer_id).await?;
@@ -1185,13 +1446,15 @@ impl Database {
         // Cleanup by identity (same name+dept under a different peer_id, e.g. peer IP changed)
         // only when username is known — otherwise we'd nuke other unnamed peers indiscriminately.
         if !username.is_empty() {
-            let identity_duplicates = sqlx::query("SELECT peer_id FROM peers WHERE username = ? AND department = ? AND peer_id <> ?")
-                .bind(username)
-                .bind(department)
-                .bind(peer_id)
-                .fetch_all(&self.pool)
-                .await
-                .context("Failed to load duplicate identity")?;
+            let identity_duplicates = sqlx::query(
+                "SELECT peer_id FROM peers WHERE username = ? AND department = ? AND peer_id <> ?",
+            )
+            .bind(username)
+            .bind(department)
+            .bind(peer_id)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to load duplicate identity")?;
             for row in identity_duplicates {
                 let old_peer_id: String = row.get("peer_id");
                 self.migrate_peer_references(&old_peer_id, peer_id).await?;
@@ -1407,7 +1670,11 @@ impl Database {
         }))
     }
 
-    pub async fn find_peer_by_identity(&self, username: &str, department: &str) -> Result<Option<StoredPeer>> {
+    pub async fn find_peer_by_identity(
+        &self,
+        username: &str,
+        department: &str,
+    ) -> Result<Option<StoredPeer>> {
         let row = sqlx::query(
             "SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at
              FROM peers
@@ -1436,6 +1703,39 @@ impl Database {
             first_seen_at: row.get("first_seen_at"),
             last_seen_at: row.get("last_seen_at"),
         }))
+    }
+
+    pub async fn save_message_dedup(
+        &self,
+        sender_id: &str,
+        sender_name: &str,
+        receiver_id: &str,
+        content: &str,
+        msg_type: &str,
+        file_path: Option<&str>,
+        file_name: Option<&str>,
+        file_size: Option<i64>,
+        client_msg_id: Option<&str>,
+    ) -> Result<ChatMessage> {
+        if let Some(existing) = self
+            .find_message_by_client_msg_id(sender_id, None, client_msg_id)
+            .await?
+        {
+            return Ok(existing);
+        }
+
+        self.save_message(
+            sender_id,
+            sender_name,
+            receiver_id,
+            content,
+            msg_type,
+            file_path,
+            file_name,
+            file_size,
+            client_msg_id,
+        )
+        .await
     }
 
     pub async fn save_message(
@@ -1486,7 +1786,12 @@ impl Database {
         })
     }
 
-    pub async fn get_conversation(&self, peer_id: &str, my_id: &str, limit: Option<i64>) -> Result<Vec<ChatMessage>> {
+    pub async fn get_conversation(
+        &self,
+        peer_id: &str,
+        my_id: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<ChatMessage>> {
         let limit = normalize_message_limit(limit);
         log::info!("get_conversation: peer_id={}, my_id={}", peer_id, my_id);
         let rows = sqlx::query(
@@ -1540,7 +1845,11 @@ impl Database {
         day_end: Option<&str>,
     ) -> Result<Vec<ChatMessage>> {
         let limit = normalize_message_limit(limit);
-        let before_clause = if before_id.is_some() { "AND id < ?" } else { "" };
+        let before_clause = if before_id.is_some() {
+            "AND id < ?"
+        } else {
+            ""
+        };
         let filter_clause = message_filter_clause(filter);
         let day_clause = if day_start.is_some() && day_end.is_some() {
             "AND timestamp >= ? AND timestamp < ?"
@@ -1590,7 +1899,11 @@ impl Database {
         day_end: Option<&str>,
     ) -> Result<Vec<ChatMessage>> {
         let limit = normalize_message_limit(limit);
-        let before_clause = if before_id.is_some() { "AND id < ?" } else { "" };
+        let before_clause = if before_id.is_some() {
+            "AND id < ?"
+        } else {
+            ""
+        };
         let filter_clause = message_filter_clause(filter);
         let day_clause = if day_start.is_some() && day_end.is_some() {
             "AND timestamp >= ? AND timestamp < ?"
@@ -1770,12 +2083,12 @@ impl Database {
                     )
                )",
         )
-            .bind(receiver_id)
-            .bind(sender_id)
-            .bind(sender_id)
-            .execute(&self.pool)
-            .await
-            .context("Failed to mark messages as read")?;
+        .bind(receiver_id)
+        .bind(sender_id)
+        .bind(sender_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to mark messages as read")?;
         Ok(())
     }
 
@@ -1808,13 +2121,18 @@ impl Database {
 mod tests {
     use super::Database;
 
-    #[tokio::test]
-    async fn initializes_fresh_database_with_group_message_index() {
-        let db_path = std::env::temp_dir().join(format!(
-            "echo-fresh-db-{}-{}.sqlite",
+    fn temp_db_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "echo-{}-{}-{}.sqlite",
+            label,
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
+        ))
+    }
+
+    #[tokio::test]
+    async fn initializes_fresh_database_with_group_message_index() {
+        let db_path = temp_db_path("fresh-db");
         let db_path_str = db_path.to_string_lossy().to_string();
 
         let db = Database::new(&db_path_str)
@@ -1822,6 +2140,84 @@ mod tests {
             .expect("fresh database should initialize");
         drop(db);
 
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn deduplicates_messages_by_sender_group_and_client_msg_id() {
+        let db_path = temp_db_path("dedupe");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+
+        let first = db
+            .save_message_dedup(
+                "sender",
+                "Sender",
+                "receiver",
+                "hello",
+                "text",
+                None,
+                None,
+                None,
+                Some("client-1"),
+            )
+            .await
+            .expect("first private message should save");
+        let duplicate = db
+            .save_message_dedup(
+                "sender",
+                "Sender",
+                "receiver",
+                "hello again",
+                "text",
+                None,
+                None,
+                None,
+                Some("client-1"),
+            )
+            .await
+            .expect("duplicate private message should resolve");
+
+        assert_eq!(first.id, duplicate.id);
+        assert_eq!(first.content, duplicate.content);
+
+        let group_first = db
+            .save_group_message_dedup(
+                "group-1",
+                "sender",
+                "Sender",
+                "group hello",
+                "text",
+                None,
+                None,
+                None,
+                false,
+                Some("client-2"),
+            )
+            .await
+            .expect("first group message should save");
+        let group_duplicate = db
+            .save_group_message_dedup(
+                "group-1",
+                "sender",
+                "Sender",
+                "group hello again",
+                "text",
+                None,
+                None,
+                None,
+                false,
+                Some("client-2"),
+            )
+            .await
+            .expect("duplicate group message should resolve");
+
+        assert_eq!(group_first.id, group_duplicate.id);
+        assert_eq!(group_first.content, group_duplicate.content);
+
+        drop(db);
         let _ = std::fs::remove_file(db_path);
     }
 }

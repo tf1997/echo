@@ -427,7 +427,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
 
       return !exists; // 如果已存在，移除 pending
     }));
-  }, [messages]);
+  }, [messages, setPendingMessages]);
 
   // Load custom emojis
   useEffect(() => {
@@ -645,27 +645,6 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages, pendingMessages]);
-
-  // Remove pending bubbles when the real message arrives to avoid duplicates
-  useEffect(() => {
-    setPendingMessages((prev) => prev.filter((p) => {
-      if (p.status === "failed") return true;
-      return !messages.some((m) => {
-        if (m.sender_id !== myId || m.msg_type !== p.msg_type) return false;
-        if (p.msg_type === "file" || p.msg_type === "sticker") {
-          if (p.createdAt) {
-            const messageTime = new Date(m.timestamp).getTime();
-            if (!Number.isNaN(messageTime) && messageTime + 500 < p.createdAt) return false;
-          }
-          return (
-            (p.file_path && m.file_path && p.file_path === m.file_path) ||
-            (p.file_name && m.file_name && p.file_name === m.file_name)
-          );
-        }
-        return m.content === p.content;
-      });
-    }));
-  }, [messages, myId]);
 
   useEffect(() => {
     if (!showEmoji) return;
