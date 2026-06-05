@@ -802,16 +802,26 @@ pub async fn get_peers(state: State<'_, AppState>) -> Result<Vec<Peer>, String> 
 
 #[tauri::command]
 pub async fn send_message(
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
     peer_id: String,
     content: String,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_message_typed(state, peer_id, content, "text".to_string(), client_msg_id).await
+    send_message_typed(
+        app_handle,
+        state,
+        peer_id,
+        content,
+        "text".to_string(),
+        client_msg_id,
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn send_message_typed(
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
     peer_id: String,
     content: String,
@@ -850,10 +860,14 @@ pub async fn send_message_typed(
     };
     drop(discovery);
 
-    let chat = runtime.chat.lock().await;
-    chat.send_message_typed(&peer, &content, &msg_type, Some(client_msg_id.as_str()))
-        .await
-        .map_err(|e| e.to_string())
+    let saved = {
+        let chat = runtime.chat.lock().await;
+        chat.send_message_typed(&peer, &content, &msg_type, Some(client_msg_id.as_str()))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    crate::chat::emit_contact_message_updated(&app_handle, &peer.id, saved.clone());
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -2193,16 +2207,26 @@ pub async fn list_groups(state: State<'_, AppState>) -> Result<Vec<crate::db::Gr
 
 #[tauri::command]
 pub async fn send_group_message(
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
     group_id: String,
     content: String,
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    send_group_message_typed(state, group_id, content, "text".to_string(), client_msg_id).await
+    send_group_message_typed(
+        app_handle,
+        state,
+        group_id,
+        content,
+        "text".to_string(),
+        client_msg_id,
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn send_group_message_typed(
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
     group_id: String,
     content: String,
@@ -2278,6 +2302,7 @@ pub async fn send_group_message_typed(
         .await
         .map_err(|e| e.to_string())?;
 
+    crate::chat::emit_group_message_updated(&app_handle, &group_id, msg.clone());
     Ok(msg)
 }
 

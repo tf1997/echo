@@ -44,7 +44,7 @@ interface ChatWindowProps {
   peers?: Peer[];
   groups?: GroupInfo[];
   onSendMessage: (content: string, clientMsgId?: string) => Promise<ChatMessage>;
-  onSendFile: (filePath: string, clientMsgId?: string) => Promise<void | ChatMessage>;
+  onSendFile: (filePath: string, clientMsgId?: string, fileName?: string | null) => Promise<void | ChatMessage>;
   onSendSticker: (filePath: string, clientMsgId?: string) => Promise<ChatMessage>;
   onGroupUpdated?: () => void;
   onLoadHistoryContext?: (messageId: number) => Promise<void>;
@@ -688,7 +688,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     updatePendingMessagesForKey(conversationKey, (prev) => prev.filter((p) => p.id !== pending.id));
     const newClientMsgId = generateClientMsgId();
     try {
-      await onSendFile(pending.file_path, newClientMsgId);
+      await onSendFile(pending.file_path, newClientMsgId, pending.file_name);
     } catch {
       updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
         ...pending,
@@ -866,6 +866,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       content: `📎 ${file.name}`,
       msg_type: "file",
       file_name: file.name,
+      file_size: file.size,
       status: "sending",
     };
     updatePendingMessagesForKey(conversationKey, (prev) => [...prev, temp]);
@@ -876,7 +877,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       if (filePath) {
         // attach the real path so retries can use it and so pending matches final message
         updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) => p.id === tempId ? { ...p, file_path: filePath } : p));
-        onSendFile(filePath, clientMsgId).catch((e) => {
+        onSendFile(filePath, clientMsgId, file.name).catch((e) => {
           updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
             p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
           ));
@@ -889,10 +890,8 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
 
     try {
       const savedPath = await readFileAndSave(file);
-      // Update pending entry to use the saved temp filename (it has a timestamp prefix)
-      const savedName = savedPath.replace(/\\/g, "/").split("/").pop() || file.name;
-      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) => p.id === tempId ? { ...p, file_name: savedName, file_path: savedPath, file_size: file.size } : p));
-      onSendFile(savedPath, clientMsgId).catch((e) => {
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) => p.id === tempId ? { ...p, file_path: savedPath, file_size: file.size } : p));
+      onSendFile(savedPath, clientMsgId, file.name).catch((e) => {
         updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
           p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
         ));
@@ -945,7 +944,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
           updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
             id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, file_path: filePath, status: "sending",
           }]);
-          onSendFile(filePath, clientMsgId).catch((e) => {
+          onSendFile(filePath, clientMsgId, name).catch((e) => {
             updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
               p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
             ));
@@ -974,7 +973,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
         id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, file_path: filePath, status: "sending",
       }]);
-      onSendFile(filePath, clientMsgId).catch((e) => {
+      onSendFile(filePath, clientMsgId, name).catch((e) => {
         updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
           p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
         ));

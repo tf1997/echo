@@ -228,7 +228,11 @@ async fn create_received_file(filename: &str) -> Result<(tokio::fs::File, String
     tokio::fs::create_dir_all(&files_dir).await?;
 
     let timestamp = chrono::Utc::now().timestamp_millis();
-    let file_path = files_dir.join(format!("{}_{}", timestamp, filename));
+    let file_path = files_dir.join(format!(
+        "{}_{}",
+        timestamp,
+        safe_received_file_name(filename)
+    ));
     let file = tokio::fs::File::create(&file_path).await?;
     Ok((file, file_path.to_string_lossy().to_string()))
 }
@@ -236,7 +240,8 @@ async fn create_received_file(filename: &str) -> Result<(tokio::fs::File, String
 async fn start_incoming_file(msg: &WireMessage) -> Result<IncomingFileState> {
     let file_name = msg
         .file_name
-        .clone()
+        .as_deref()
+        .map(safe_received_file_name)
         .unwrap_or_else(|| "unknown".to_string());
     let (file, path) = create_received_file(&file_name).await?;
     Ok(IncomingFileState {
@@ -260,6 +265,17 @@ async fn remove_incomplete_incoming_file(file_state: IncomingFileState) {
             path, error
         );
     }
+}
+
+fn safe_received_file_name(filename: &str) -> String {
+    let normalized = filename.trim().replace('\\', "/");
+    std::path::Path::new(&normalized)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 async fn connect_peer_with_timeout(peer: &Peer) -> Result<TcpStream> {
@@ -1105,8 +1121,11 @@ impl ChatServer {
                                 format!("Failed to flush incoming file: {}", file_state.file_name)
                             })?;
 
-                            let file_name_display =
-                                msg.file_name.as_deref().unwrap_or(&file_state.file_name);
+                            let file_name_display = msg
+                                .file_name
+                                .as_deref()
+                                .map(safe_received_file_name)
+                                .unwrap_or_else(|| file_state.file_name.clone());
                             let saved_path = file_state.path.clone();
 
                             let sender_id = file_state.sender_id.as_str();
@@ -1132,7 +1151,7 @@ impl ChatServer {
                                         &display_content,
                                         msg_kind,
                                         Some(&saved_path),
-                                        Some(file_name_display),
+                                        Some(&file_name_display),
                                         msg.file_size.map(|s| s as i64),
                                         false,
                                         client_msg_id,
@@ -1168,7 +1187,7 @@ impl ChatServer {
                                         &display_content,
                                         msg_kind,
                                         Some(&saved_path),
-                                        Some(file_name_display),
+                                        Some(&file_name_display),
                                         msg.file_size.map(|s| s as i64),
                                         client_msg_id,
                                     )
@@ -1200,7 +1219,7 @@ impl ChatServer {
                                 sender_name: sender_name.to_string(),
                                 content: display_content,
                                 msg_type: msg_kind.to_string(),
-                                file_name: Some(file_name_display.to_string()),
+                                file_name: Some(file_name_display),
                                 file_size: msg.file_size,
                                 timestamp: chrono::Utc::now().to_rfc3339(),
                             });
@@ -2076,7 +2095,7 @@ async fn send_file_in_background_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_self_peer, Peer};
+    use super::{is_self_peer, safe_received_file_name, Peer};
 
     #[test]
     fn self_peer_matches_identity() {
@@ -2102,5 +2121,15 @@ mod tests {
         );
 
         assert!(is_self_peer(&peer, "192.168.1.8:9527", 9527));
+    }
+
+    #[test]
+    fn received_file_name_uses_basename_for_legacy_paths() {
+        assert_eq!(safe_received_file_name("/tmp/report.png"), "report.png");
+        assert_eq!(
+            safe_received_file_name("C:\\Users\\Echo\\photo.jpg"),
+            "photo.jpg"
+        );
+        assert_eq!(safe_received_file_name(""), "unknown");
     }
 }

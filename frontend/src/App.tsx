@@ -791,12 +791,12 @@ function App() {
     return msg;
   }, []);
 
-  const handleSendFile = useCallback(async (filePath: string, clientMsgId?: string) => {
+  const handleSendFile = useCallback(async (filePath: string, clientMsgId?: string, fileName?: string | null) => {
     if (selectedGroupId) {
-      return await sendGroupFile(selectedGroupId, filePath, clientMsgId);
+      return await sendGroupFile(selectedGroupId, filePath, clientMsgId, fileName);
     }
     if (!selectedPeer) throw new Error("未选择联系人");
-    return await sendFile(selectedPeer.id, filePath, clientMsgId);
+    return await sendFile(selectedPeer.id, filePath, clientMsgId, fileName);
   }, [selectedPeer, selectedGroupId]);
 
   const handleSendSticker = useCallback(async (filePath: string, clientMsgId?: string) => {
