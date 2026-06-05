@@ -6,6 +6,7 @@ import { HistorySearchView } from "./HistorySearchView";
 import { Avatar } from "./Avatar";
 import { AvatarPreviewTrigger } from "./AvatarPreview";
 import { formatDateLabel, makeSearchHitId } from "./messageUtils";
+import { DEFAULT_EMOJIS, decodeEchoEmojiTokens, emojiAssetId, emojiAssetSrc, splitInlineEmojis } from "./emojiCatalog";
 import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, sendMessage, sendMessageTyped, sendFile, sendSticker, sendGroupMessage, sendGroupMessageTyped, sendGroupFile, sendGroupSticker, renameGroup, leaveGroup, dissolveGroup, inviteToGroup, readFileBase64, pauseFileTransfer, resumeFileTransfer, cancelFileTransfer } from "../api";
 import type { ForwardCardData } from "./MessageBubble";
 import { ask, message as showDialogMessage, open } from "@tauri-apps/api/dialog";
@@ -104,22 +105,6 @@ function isImageFileName(name?: string | null): boolean {
   return IMAGE_FILE_EXTENSIONS.has(ext);
 }
 
-const EMOJIS = [
-  "😀","😃","😄","😁","😆","😂","🤣","😅","😊","🙂",
-  "🙃","😉","😍","🥰","😘","😋","😜","🤪","😎","🤩",
-  "🥳","🤭","🤫","🤔","🫡","😏","🙄","😬","😐","😑",
-  "😶","🫥","🫣","🫢","😳","😮","😲","😵","😵‍💫","🤯",
-  "🥺","😢","😭","😤","😡","🤬","😒","😔","😪","😴",
-  "🥱","🤤","😷","🤒","🤧","🤮","😇","😈","🤡","🫠",
-  "🤦","🙈","🙉","🙊","👍","👎","👌","🤌","👏","🙌",
-  "🙏","🤝","💪","👊","✌️","🤟","👋","🤲","💅","👀",
-  "🎉","🔥","❤️","🧡","💛","💚","💙","💜","💔","💯",
-  "✅","❌","⭐","🌟","💡","🎵","🌹","☕","🍕","🚀",
-  "🐶","🐕","🦮","🐾","🦴","🐱","🐭","🐹","🐰","🦊",
-  "🐼","🐻","🐨","🐯","🦁","🐸","🐵","🐧","🐔","🐟",
-  "📎","📁","🎂","🏆","🥇","💩"
-];
-
 function EmojiThumb({ path }: { path: string }) {
   const [failedPath, setFailedPath] = useState<string | null>(null);
   const src = convertFileSrc(path);
@@ -127,6 +112,211 @@ function EmojiThumb({ path }: { path: string }) {
 
   if (failed) return <div className="w-full h-full bg-gray-700 rounded" />;
   return <img src={src} alt="" className="w-full h-full object-contain" onError={() => setFailedPath(path)} />;
+}
+
+function InlineEmojiText({ text }: { text: string }) {
+  return (
+    <>
+      {splitInlineEmojis(text).map((segment, index) => (
+        segment.type === "text" ? segment.text : (
+          <img
+            key={`${segment.id}-${index}`}
+            className="inline-emoji"
+            src={emojiAssetSrc(segment.id)}
+            alt={segment.emoji}
+            title={segment.emoji}
+            draggable={false}
+          />
+        )
+      ))}
+    </>
+  );
+}
+
+const COMPOSER_BLOCK_TAGS = new Set(["DIV", "P", "LI"]);
+
+function getComposerEmojiText(element: Element): string {
+  return element.getAttribute("data-emoji") || element.getAttribute("alt") || "";
+}
+
+function getComposerNodeTextLength(node: Node): number {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return (node.textContent ?? "").length;
+  }
+  if (node.nodeType !== Node.ELEMENT_NODE) return 0;
+
+  const element = node as HTMLElement;
+  if (element.tagName === "IMG") return getComposerEmojiText(element).length;
+  if (element.tagName === "BR") return 1;
+
+  let length = 0;
+  element.childNodes.forEach((child) => {
+    length += getComposerNodeTextLength(child);
+  });
+  if (COMPOSER_BLOCK_TAGS.has(element.tagName)) length += 1;
+  return length;
+}
+
+function readComposerText(root: HTMLElement): string {
+  let text = "";
+  const appendNode = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      text += (node.textContent ?? "").replace(/\u00a0/g, " ");
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+    const element = node as HTMLElement;
+    if (element.tagName === "IMG") {
+      text += getComposerEmojiText(element);
+      return;
+    }
+    if (element.tagName === "BR") {
+      text += "\n";
+      return;
+    }
+
+    element.childNodes.forEach(appendNode);
+    if (COMPOSER_BLOCK_TAGS.has(element.tagName)) text += "\n";
+  };
+
+  root.childNodes.forEach(appendNode);
+  return text.endsWith("\n") ? text.slice(0, -1) : text;
+}
+
+function renderComposerText(root: HTMLElement, text: string) {
+  const fragment = document.createDocumentFragment();
+  for (const segment of splitInlineEmojis(text)) {
+    if (segment.type === "text") {
+      if (segment.text) fragment.appendChild(document.createTextNode(segment.text));
+      continue;
+    }
+
+    const img = document.createElement("img");
+    img.className = "inline-emoji composer-inline-emoji";
+    img.src = emojiAssetSrc(segment.id);
+    img.alt = segment.emoji;
+    img.title = segment.emoji;
+    img.draggable = false;
+    img.contentEditable = "false";
+    img.setAttribute("data-emoji", segment.emoji);
+    fragment.appendChild(img);
+  }
+  root.replaceChildren(fragment);
+}
+
+function selectionBelongsToComposer(root: HTMLElement, selection: Selection | null): selection is Selection {
+  if (!selection || selection.rangeCount === 0 || !selection.anchorNode || !selection.focusNode) return false;
+  return root.contains(selection.anchorNode) && root.contains(selection.focusNode);
+}
+
+function getComposerCaretOffset(root: HTMLElement): number {
+  const selection = document.getSelection();
+  if (!selectionBelongsToComposer(root, selection)) return readComposerText(root).length;
+
+  const focusNode = selection.focusNode;
+  const focusOffset = selection.focusOffset;
+  let offset = 0;
+  let found = false;
+
+  const walk = (node: Node) => {
+    if (found) return;
+    if (node === focusNode) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        offset += Math.min(focusOffset, (node.textContent ?? "").length);
+      } else {
+        const children = Array.from(node.childNodes).slice(0, focusOffset);
+        for (const child of children) offset += getComposerNodeTextLength(child);
+      }
+      found = true;
+      return;
+    }
+
+    if (node.nodeType === Node.TEXT_NODE) {
+      offset += (node.textContent ?? "").length;
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+    const element = node as HTMLElement;
+    if (element.tagName === "IMG" || element.tagName === "BR") {
+      offset += getComposerNodeTextLength(element);
+      return;
+    }
+    element.childNodes.forEach(walk);
+    if (!found && COMPOSER_BLOCK_TAGS.has(element.tagName)) offset += 1;
+  };
+
+  walk(root);
+  return found ? offset : readComposerText(root).length;
+}
+
+function setComposerCaretOffset(root: HTMLElement, offset: number) {
+  const selection = document.getSelection();
+  if (!selection) return;
+
+  const range = document.createRange();
+  let remaining = Math.max(0, offset);
+  let placed = false;
+
+  const walk = (node: Node) => {
+    if (placed) return;
+    if (node.nodeType === Node.TEXT_NODE) {
+      const length = (node.textContent ?? "").length;
+      if (remaining <= length) {
+        range.setStart(node, remaining);
+        placed = true;
+      } else {
+        remaining -= length;
+      }
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+    const element = node as HTMLElement;
+    if (element.tagName === "IMG" || element.tagName === "BR") {
+      const length = getComposerNodeTextLength(element);
+      if (remaining <= length) {
+        if (remaining === 0) {
+          range.setStartBefore(element);
+        } else {
+          range.setStartAfter(element);
+        }
+        placed = true;
+      } else {
+        remaining -= length;
+      }
+      return;
+    }
+
+    element.childNodes.forEach(walk);
+    if (!placed && COMPOSER_BLOCK_TAGS.has(element.tagName)) {
+      if (remaining <= 1) {
+        range.setStartAfter(element);
+        placed = true;
+      } else {
+        remaining -= 1;
+      }
+    }
+  };
+
+  root.childNodes.forEach(walk);
+  if (!placed) {
+    range.selectNodeContents(root);
+    range.collapse(false);
+  }
+  range.collapse(true);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+function composerShouldRenderInlineEmoji(root: HTMLElement, text: string): boolean {
+  return root.querySelector("img.inline-emoji") !== null || splitInlineEmojis(text).some((segment) => segment.type === "emoji");
+}
+
+function resizeComposerInput(root: HTMLElement) {
+  root.style.height = "auto";
+  root.style.height = `${Math.min(root.scrollHeight, 120)}px`;
 }
 
 function formatSpeed(bytesPerSec: number | undefined): string {
@@ -516,11 +706,14 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   }, [removePendingMessagesEverywhere, updatePendingMessagesEverywhere]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const inputRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const emojiPopoverRef = useRef<HTMLDivElement>(null);
   const dragResetTimerRef = useRef<number | null>(null);
   const nearBottomRef = useRef(true);
+  const composerCaretOffsetRef = useRef(0);
+  const composerRenderingRef = useRef(false);
+  const composerComposingRef = useRef(false);
 
   const pendingScrollRef = useRef(false);
 
@@ -665,6 +858,81 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     return () => document.removeEventListener("mousedown", handlePointerDown);
   }, [showEmoji]);
 
+  const syncComposerDom = useCallback((text: string, caretOffset: number | null = null) => {
+    const el = inputRef.current;
+    if (!el) return;
+
+    composerRenderingRef.current = true;
+    renderComposerText(el, text);
+    resizeComposerInput(el);
+    if (caretOffset !== null) {
+      const nextOffset = Math.max(0, Math.min(caretOffset, text.length));
+      setComposerCaretOffset(el, nextOffset);
+      composerCaretOffsetRef.current = nextOffset;
+    }
+    composerRenderingRef.current = false;
+  }, []);
+
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el || composerComposingRef.current) return;
+
+    const currentText = decodeEchoEmojiTokens(readComposerText(el));
+    if (currentText === inputText) {
+      resizeComposerInput(el);
+      return;
+    }
+
+    const shouldRestoreCaret = document.activeElement === el;
+    const caretOffset = shouldRestoreCaret ? composerCaretOffsetRef.current : null;
+    syncComposerDom(inputText, caretOffset);
+  }, [inputText, syncComposerDom]);
+
+  const updateComposerFromDom = useCallback((forceRender = false) => {
+    const el = inputRef.current;
+    if (!el || composerRenderingRef.current) return;
+
+    const text = decodeEchoEmojiTokens(readComposerText(el));
+    const caretOffset = Math.min(getComposerCaretOffset(el), text.length);
+    composerCaretOffsetRef.current = caretOffset;
+    setInputText(text);
+    resizeComposerInput(el);
+
+    if (!composerComposingRef.current && (forceRender || composerShouldRenderInlineEmoji(el, text))) {
+      syncComposerDom(text, caretOffset);
+    }
+  }, [syncComposerDom]);
+
+  const rememberComposerCaret = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    composerCaretOffsetRef.current = Math.min(getComposerCaretOffset(el), readComposerText(el).length);
+  }, []);
+
+  const insertTextIntoComposer = useCallback((text: string) => {
+    const el = inputRef.current;
+    const normalizedText = text.replace(/\r\n?/g, "\n");
+    if (!el || !normalizedText) return;
+
+    el.focus();
+    if (!selectionBelongsToComposer(el, document.getSelection())) {
+      setComposerCaretOffset(el, Math.min(composerCaretOffsetRef.current, readComposerText(el).length));
+    }
+
+    const selection = document.getSelection();
+    if (!selection) return;
+
+    const range = selection.rangeCount > 0 ? selection.getRangeAt(0) : document.createRange();
+    range.deleteContents();
+    const textNode = document.createTextNode(normalizedText);
+    range.insertNode(textNode);
+    range.setStart(textNode, normalizedText.length);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    updateComposerFromDom(true);
+  }, [updateComposerFromDom]);
+
   const retryText = useCallback(async (pending: PendingMessage) => {
     const conversationKey = pendingConversationKeyRef.current;
     updatePendingMessagesForKey(conversationKey, (prev) => prev.filter((p) => p.id !== pending.id));
@@ -807,12 +1075,13 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   }, [peer, isGroup, onSendSticker, updatePendingMessagesForKey]);
 
   const sendText = useCallback(async () => {
-    const trimmed = inputText.trim();
+    const currentText = inputRef.current ? decodeEchoEmojiTokens(readComposerText(inputRef.current)) : inputText;
+    const trimmed = currentText.trim();
     if (!trimmed || !peer) return;
     setInputText("");
     nearBottomRef.current = true;
     if (inputRef.current) {
-      inputRef.current.style.height = "auto";
+      syncComposerDom("", 0);
     }
     const conversationKey = pendingConversationKeyRef.current;
 
@@ -836,20 +1105,17 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
       ));
     }
-  }, [inputText, peer, onSendMessage, updatePendingMessagesForKey]);
+  }, [inputText, peer, onSendMessage, syncComposerDom, updatePendingMessagesForKey]);
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "Enter" || composerComposingRef.current || e.nativeEvent.isComposing) return;
+    if (!e.shiftKey) {
       e.preventDefault();
       sendText();
+      return;
     }
-  };
-
-  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setInputText(e.target.value);
-    const el = e.target;
-    el.style.height = "auto";
-    el.style.height = Math.min(el.scrollHeight, 120) + "px";
+    e.preventDefault();
+    insertTextIntoComposer("\n");
   };
 
   const sendFileToPeer = useCallback(async (file: File) => {
@@ -903,7 +1169,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     }
   }, [peer, onSendFile, updatePendingMessagesForKey]);
 
-  const handlePaste = useCallback(async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+  const handlePaste = useCallback((e: React.ClipboardEvent<HTMLDivElement>) => {
     const items = e.clipboardData.items;
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
@@ -914,7 +1180,13 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         return;
       }
     }
-  }, [sendFileToPeer]);
+
+    const text = e.clipboardData.getData("text/plain");
+    if (text) {
+      e.preventDefault();
+      insertTextIntoComposer(text);
+    }
+  }, [insertTextIntoComposer, sendFileToPeer]);
 
   // Tauri native file-drop events (HTML5 dataTransfer.files is empty in Tauri webview)
   useEffect(() => {
@@ -1352,7 +1624,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                           <p className="message-file-name truncate" title={item.file_name || "文件"}>{item.file_name || "文件"}</p>
                         </div>
                       ) : (
-                        <p className="message-text">{item.content}</p>
+                        <p className="message-text"><InlineEmojiText text={item.content} /></p>
                       )}
                     </div>
                     {item.msg_type === "file" && (item.status === "sending" || item.status === "paused") && item.progress !== undefined && (
@@ -1498,29 +1770,27 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                     </>
                   ) : (
                     <div className="grid grid-cols-10 gap-1 max-h-56 overflow-y-auto">
-                      {EMOJIS.map((emoji) => (
-                      <button
-                        key={emoji}
-                        onClick={() => {
-                          const el = inputRef.current;
-                          if (el) {
-                            const start = el.selectionStart ?? el.value.length;
-                            const end = el.selectionEnd ?? el.value.length;
-                            const before = el.value.slice(0, start);
-                            const after = el.value.slice(end);
-                            setInputText(before + emoji + after);
-                            requestAnimationFrame(() => {
-                              el.selectionStart = el.selectionEnd = start + emoji.length;
-                              el.focus();
-                            });
-                          }
-                          setShowEmoji(false);
-                        }}
-                        className="w-7 h-7 flex items-center justify-center text-base hover:bg-gray-600 rounded"
-                      >
-                        {emoji}
-                      </button>
-                      ))}
+                      {DEFAULT_EMOJIS.map((emoji) => {
+                        const assetId = emojiAssetId(emoji);
+                        return (
+                          <button
+                            key={assetId}
+                            onClick={() => {
+                              insertTextIntoComposer(emoji);
+                              setShowEmoji(false);
+                            }}
+                            className="w-7 h-7 flex items-center justify-center hover:bg-gray-600 rounded"
+                            title={emoji}
+                          >
+                            <img
+                              src={emojiAssetSrc(assetId)}
+                              alt={emoji}
+                              className="emoji-picker-icon"
+                              draggable={false}
+                            />
+                          </button>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -1547,10 +1817,33 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
             </svg>
           </button>
           <input ref={fileInputRef} type="file" onChange={handleFileChange} style={{ position: "absolute", left: "-9999px", top: "-9999px" }} multiple />
-          <textarea ref={inputRef} value={inputText} onChange={handleInputChange} onKeyDown={handleKeyDown} onPaste={handlePaste}
-            placeholder={peer.online ? `发送消息给 ${peer.username}...` : "对方离线，消息将在上线后发送"}
-            rows={1} className="flex-1 bg-gray-700 text-white text-sm rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-indigo-500 placeholder-gray-400 resize-none max-h-[120px]"
-          />
+          <div className="relative flex-1">
+            {!inputText && (
+              <div className="composer-placeholder pointer-events-none absolute left-4 top-2.5 text-sm text-gray-400">
+                {peer.online ? `发送消息给 ${peer.username}...` : "对方离线，消息将在上线后发送"}
+              </div>
+            )}
+            <div
+              ref={inputRef}
+              contentEditable
+              suppressContentEditableWarning
+              role="textbox"
+              aria-multiline="true"
+              aria-label={peer.online ? `发送消息给 ${peer.username}` : "对方离线，消息将在上线后发送"}
+              onInput={() => updateComposerFromDom()}
+              onKeyDown={handleKeyDown}
+              onPaste={handlePaste}
+              onBlur={rememberComposerCaret}
+              onMouseUp={rememberComposerCaret}
+              onKeyUp={rememberComposerCaret}
+              onCompositionStart={() => { composerComposingRef.current = true; }}
+              onCompositionEnd={() => {
+                composerComposingRef.current = false;
+                updateComposerFromDom(true);
+              }}
+              className="composer-input flex-1 bg-gray-700 text-white text-sm rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </div>
           <button onClick={sendText} disabled={!inputText.trim()}
             className="flex-shrink-0 w-10 h-10 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:hover:bg-indigo-600 transition-colors flex items-center justify-center"
           >

@@ -5,6 +5,7 @@ import { openFile, openFolder, saveTempFile } from "../api";
 import { WebviewWindow } from "@tauri-apps/api/window";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
 import { makeSearchHitId } from "./messageUtils";
+import { decodeEchoEmojiTokens, emojiAssetSrc, splitInlineEmojis } from "./emojiCatalog";
 
 const MAX_PREVIEW_BYTES = 20 * 1024 * 1024;
 const COLLAPSED_TEXT_CHARS = 520;
@@ -67,7 +68,7 @@ function isImageFile(name: string | null): boolean {
 }
 
 function getCopyableBubbleText(message: ChatMessage): string {
-  return message.msg_type === "text" ? message.content : "";
+  return message.msg_type === "text" ? decodeEchoEmojiTokens(message.content) : "";
 }
 
 function getFileExtension(name: string | null): string {
@@ -115,7 +116,9 @@ function renderTextWithLinks(text: string): ReactNode {
   let match = pattern.exec(text);
 
   while (match) {
-    if (match.index > cursor) parts.push(text.slice(cursor, match.index));
+    if (match.index > cursor) {
+      parts.push(...renderInlineEmojis(text.slice(cursor, match.index), `text-${cursor}`));
+    }
     parts.push(
       <span key={`url-${index++}`} className="message-url">
         {match[0]}
@@ -125,13 +128,32 @@ function renderTextWithLinks(text: string): ReactNode {
     match = pattern.exec(text);
   }
 
-  if (cursor < text.length) parts.push(text.slice(cursor));
+  if (cursor < text.length) {
+    parts.push(...renderInlineEmojis(text.slice(cursor), `text-${cursor}`));
+  }
   return parts.length > 0 ? parts : text;
+}
+
+function renderInlineEmojis(text: string, keyPrefix: string): ReactNode[] {
+  const segments = splitInlineEmojis(text);
+  return segments.map((segment, index) => {
+    if (segment.type === "text") return segment.text;
+    return (
+      <img
+        key={`${keyPrefix}-emoji-${segment.id}-${index}`}
+        className="inline-emoji"
+        src={emojiAssetSrc(segment.id)}
+        alt={segment.emoji}
+        title={segment.emoji}
+        draggable={false}
+      />
+    );
+  });
 }
 
 function renderTextWithSearchHighlights(text: string, query: string, messageId: number, activeSearchHitId?: string): ReactNode {
   const needle = query.trim();
-  if (!needle) return text;
+  if (!needle) return renderInlineEmojis(text, "search-empty");
 
   const lowerText = text.toLowerCase();
   const lowerNeedle = needle.toLowerCase();
@@ -142,7 +164,7 @@ function renderTextWithSearchHighlights(text: string, query: string, messageId: 
 
   while (matchIndex !== -1) {
     if (matchIndex > cursor) {
-      parts.push(text.slice(cursor, matchIndex));
+      parts.push(...renderInlineEmojis(text.slice(cursor, matchIndex), `search-${cursor}`));
     }
     const endIndex = matchIndex + needle.length;
     const hitId = makeSearchHitId(messageId, occurrenceIndex);
@@ -152,7 +174,7 @@ function renderTextWithSearchHighlights(text: string, query: string, messageId: 
         className={`message-search-hit ${hitId === activeSearchHitId ? "message-search-hit-current" : ""}`}
         data-search-hit-id={hitId}
       >
-        {text.slice(matchIndex, endIndex)}
+        {renderInlineEmojis(text.slice(matchIndex, endIndex), `hit-${hitId}`)}
       </mark>
     );
     occurrenceIndex += 1;
@@ -161,7 +183,7 @@ function renderTextWithSearchHighlights(text: string, query: string, messageId: 
   }
 
   if (cursor < text.length) {
-    parts.push(text.slice(cursor));
+    parts.push(...renderInlineEmojis(text.slice(cursor), `search-${cursor}`));
   }
 
   return parts.length > 0 ? parts : text;
@@ -179,7 +201,7 @@ function getForwardItemText(item: ForwardCardItem): string {
   if (item.msg_type === "file") return item.file_name ? `📎 ${item.file_name}` : "[文件]";
   if (item.msg_type === "sticker") return item.file_name ? `[图片] ${item.file_name}` : "[图片]";
   if (item.msg_type === "forward_card") return "[聊天记录]";
-  return item.content;
+  return decodeEchoEmojiTokens(item.content);
 }
 
 function isForwardAttachment(item: ForwardCardItem): boolean {
@@ -297,7 +319,7 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
         {preview.map((item, i) => (
           <p key={i} className="text-xs opacity-70 truncate leading-5">
             <span className="font-medium">{item.sender}：</span>
-            {getForwardItemText(item)}
+            {renderInlineEmojis(getForwardItemText(item), `forward-preview-${i}`)}
           </p>
         ))}
         {data.items.length > 3 && <p className="text-xs opacity-50 mt-0.5">…</p>}
@@ -357,7 +379,7 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
                     </div>
                   ) : (
                     <p className="text-sm text-gray-200 whitespace-pre-wrap break-words">
-                      {getForwardItemText(item)}
+                      {renderInlineEmojis(getForwardItemText(item), `forward-item-${i}`)}
                     </p>
                   )}
                 </div>
