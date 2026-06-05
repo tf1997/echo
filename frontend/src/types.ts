@@ -61,6 +61,8 @@ export interface AppInfo {
 export interface SaveProfilePayload {
   username: string;
   department: string;
+  avatar_source_path?: string | null;
+  clear_avatar?: boolean;
 }
 
 export interface AvatarInfo {

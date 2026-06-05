@@ -336,16 +336,26 @@ pub fn run() {
                     let runtime_opt = { state.runtime.read().await.clone() };
                     if let Some(runtime) = runtime_opt.as_ref() {
                         let disc = runtime.discovery.write().await;
+                        let now = chrono::Utc::now().timestamp();
                         for sp in &stored {
                             if let Ok(ip) = sp.ip.parse::<IpAddr>() {
-                                let peer = Peer::new_with_profile(
+                                let last_seen = chrono::DateTime::parse_from_rfc3339(&sp.last_seen_at)
+                                    .map(|value| value.timestamp())
+                                    .unwrap_or(0);
+                                let recently_seen = last_seen > 0 && now - last_seen <= 15;
+                                let peer = Peer::with_online_avatar(
                                     sp.peer_id.clone(),
                                     sp.username.clone(),
                                     sp.department.clone(),
                                     sp.software_version.clone(),
                                     sp.mac_address.clone(),
+                                    sp.avatar_path.clone(),
+                                    sp.avatar_hash.clone(),
+                                    sp.avatar_updated_at,
                                     ip,
                                     sp.port,
+                                    sp.is_online && recently_seen,
+                                    last_seen,
                                 );
                                 disc.register_peer(peer);
                             }

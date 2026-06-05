@@ -35,6 +35,10 @@ pub struct AppInfo {
 pub struct SaveProfilePayload {
     pub username: String,
     pub department: String,
+    #[serde(default)]
+    pub avatar_source_path: Option<String>,
+    #[serde(default)]
+    pub clear_avatar: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +132,23 @@ pub async fn save_profile(
         return Err("部门不能为空".to_string());
     }
 
+    let avatar_update = if let Some(source_path) = payload
+        .avatar_source_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        Some(prepare_avatar_info(source_path)?)
+    } else if payload.clear_avatar {
+        Some(AvatarInfo {
+            avatar_path: String::new(),
+            avatar_hash: String::new(),
+            avatar_updated_at: now_millis(),
+        })
+    } else {
+        None
+    };
+
     let existing_peer_id = state
         .profile
         .lock()
@@ -141,14 +162,16 @@ pub async fn save_profile(
         .lock()
         .await
         .as_ref()
-        .map(|profile| {
-            (
-                profile.avatar_path.clone(),
-                profile.avatar_hash.clone(),
-                profile.avatar_updated_at,
-            )
+        .map(|profile| AvatarInfo {
+            avatar_path: profile.avatar_path.clone(),
+            avatar_hash: profile.avatar_hash.clone(),
+            avatar_updated_at: profile.avatar_updated_at,
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| AvatarInfo {
+            avatar_path: String::new(),
+            avatar_hash: String::new(),
+            avatar_updated_at: 0,
+        });
 
     state
         .db
@@ -162,15 +185,24 @@ pub async fn save_profile(
         .await
         .map_err(|e| e.to_string())?;
 
+    if let Some(avatar) = avatar_update.as_ref() {
+        state
+            .db
+            .update_user_avatar(&avatar.avatar_path, &avatar.avatar_hash, avatar.avatar_updated_at)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let final_avatar = avatar_update.unwrap_or(existing_avatar);
     let profile = UserProfile {
         peer_id: existing_peer_id,
         username: username.to_string(),
         department: department.to_string(),
         software_version: crate::profile_metadata::software_version(),
         mac_address: crate::profile_metadata::mac_address(),
-        avatar_path: existing_avatar.0,
-        avatar_hash: existing_avatar.1,
-        avatar_updated_at: existing_avatar.2,
+        avatar_path: final_avatar.avatar_path,
+        avatar_hash: final_avatar.avatar_hash,
+        avatar_updated_at: final_avatar.avatar_updated_at,
     };
 
     *state.profile.lock().await = Some(profile.clone());
@@ -182,50 +214,7 @@ pub async fn save_profile(
             .await
             .map_err(|e| e.to_string())?;
 
-        // Notify peers we know about so their cached username/department updates.
-        // This includes online + stored peers, deduped. Offline peers get the
-        // change via the same pending_notifications queue used for group msgs.
-        let listen_port = runtime.listen_port;
-        let my_id = runtime.my_id.clone();
-        let online_peers = runtime.discovery.read().await.get_peers();
-
-        let stored = state.db.list_stored_peers().await.unwrap_or_default();
-        let mut targets: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for p in &online_peers {
-            targets.insert(p.id.clone());
-        }
-        for sp in &stored {
-            targets.insert(sp.peer_id.clone());
-        }
-        targets.remove(&my_id);
-        let target_ids: Vec<String> = targets.into_iter().collect();
-
-        let payload = serde_json::json!({
-            "username": username,
-            "department": department,
-            "software_version": profile.software_version,
-            "mac_address": profile.mac_address,
-            "avatar_hash": profile.avatar_hash,
-            "avatar_updated_at": profile.avatar_updated_at,
-        })
-        .to_string();
-
-        let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
-        send_or_queue_notification(
-            &state.db,
-            &online_peers,
-            &target_ids,
-            &my_id,
-            username,
-            department,
-            listen_port,
-            &payload,
-            "profile_updated",
-            None,
-            None,
-            &empty_dir,
-        )
-        .await;
+        spawn_profile_updated_notification(&state, profile).await;
     } else {
         let listen_port = std::env::var("ECHO_PORT")
             .ok()
@@ -329,16 +318,50 @@ fn write_avatar_file(
     Ok(dest.to_string_lossy().to_string())
 }
 
-async fn notify_profile_updated_to_peers(state: &AppState, profile: &UserProfile) {
+fn prepare_avatar_info(source_path: &str) -> Result<AvatarInfo, String> {
+    let ext = avatar_extension(source_path)?;
+    let metadata = std::fs::metadata(source_path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("请选择头像图片文件".to_string());
+    }
+    if metadata.len() > AVATAR_MAX_BYTES {
+        return Err("头像不能超过 5MB".to_string());
+    }
+    let bytes = std::fs::read(source_path).map_err(|e| e.to_string())?;
+    validate_avatar_bytes(&ext, &bytes)?;
+
+    let avatar_hash = hash_avatar_bytes(&bytes);
+    let avatar_path = write_avatar_file(avatar_root_dir().join("self"), &avatar_hash, &ext, &bytes)?;
+    let avatar_updated_at = now_millis();
+
+    Ok(AvatarInfo {
+        avatar_path,
+        avatar_hash,
+        avatar_updated_at,
+    })
+}
+
+async fn spawn_profile_updated_notification(state: &AppState, profile: UserProfile) {
     let runtime_opt = { state.runtime.read().await.clone() };
-    let Some(runtime) = runtime_opt.as_ref() else {
+    let Some(runtime) = runtime_opt else {
         return;
     };
+    let db = Arc::clone(&state.db);
 
+    tauri::async_runtime::spawn(async move {
+        notify_profile_updated_to_peers(db, runtime, profile).await;
+    });
+}
+
+async fn notify_profile_updated_to_peers(
+    db: Arc<crate::db::Database>,
+    runtime: Arc<RuntimeServices>,
+    profile: UserProfile,
+) {
     let listen_port = runtime.listen_port;
     let my_id = runtime.my_id.clone();
     let online_peers = runtime.discovery.read().await.get_peers();
-    let stored = state.db.list_stored_peers().await.unwrap_or_default();
+    let stored = db.list_stored_peers().await.unwrap_or_default();
     let mut targets: std::collections::HashSet<String> = std::collections::HashSet::new();
     for p in &online_peers {
         targets.insert(p.id.clone());
@@ -361,7 +384,7 @@ async fn notify_profile_updated_to_peers(state: &AppState, profile: &UserProfile
 
     let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
     send_or_queue_notification(
-        &state.db,
+        db.as_ref(),
         &online_peers,
         &target_ids,
         &my_id,
@@ -377,29 +400,49 @@ async fn notify_profile_updated_to_peers(state: &AppState, profile: &UserProfile
     .await;
 }
 
+fn spawn_send_or_queue_notification(
+    db: Arc<crate::db::Database>,
+    online_peers: Vec<Peer>,
+    target_peer_ids: Vec<String>,
+    self_id: String,
+    self_name: String,
+    self_department: String,
+    self_port: u16,
+    content: String,
+    kind: String,
+    group_id: Option<String>,
+    file_name: Option<String>,
+    known_peers: Vec<crate::discovery::PeerEntry>,
+) {
+    tauri::async_runtime::spawn(async move {
+        send_or_queue_notification(
+            db.as_ref(),
+            &online_peers,
+            &target_peer_ids,
+            &self_id,
+            &self_name,
+            &self_department,
+            self_port,
+            &content,
+            &kind,
+            group_id.as_deref(),
+            file_name.as_deref(),
+            &known_peers,
+        )
+        .await;
+    });
+}
+
 #[tauri::command]
 pub async fn set_profile_avatar(
     state: State<'_, AppState>,
     source_path: String,
 ) -> Result<AvatarInfo, String> {
-    let ext = avatar_extension(&source_path)?;
-    let metadata = std::fs::metadata(&source_path).map_err(|e| e.to_string())?;
-    if !metadata.is_file() {
-        return Err("请选择头像图片文件".to_string());
-    }
-    if metadata.len() > AVATAR_MAX_BYTES {
-        return Err("头像不能超过 5MB".to_string());
-    }
-    let bytes = std::fs::read(&source_path).map_err(|e| e.to_string())?;
-    validate_avatar_bytes(&ext, &bytes)?;
-
-    let avatar_hash = hash_avatar_bytes(&bytes);
-    let avatar_path = write_avatar_file(avatar_root_dir().join("self"), &avatar_hash, &ext, &bytes)?;
-    let avatar_updated_at = now_millis();
+    let avatar = prepare_avatar_info(&source_path)?;
 
     state
         .db
-        .update_user_avatar(&avatar_path, &avatar_hash, avatar_updated_at)
+        .update_user_avatar(&avatar.avatar_path, &avatar.avatar_hash, avatar.avatar_updated_at)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -408,19 +451,15 @@ pub async fn set_profile_avatar(
         let Some(profile) = guard.as_mut() else {
             return Err("应用尚未初始化用户信息".to_string());
         };
-        profile.avatar_path = avatar_path.clone();
-        profile.avatar_hash = avatar_hash.clone();
-        profile.avatar_updated_at = avatar_updated_at;
+        profile.avatar_path = avatar.avatar_path.clone();
+        profile.avatar_hash = avatar.avatar_hash.clone();
+        profile.avatar_updated_at = avatar.avatar_updated_at;
         profile.clone()
     };
 
-    notify_profile_updated_to_peers(&state, &updated_profile).await;
+    spawn_profile_updated_notification(&state, updated_profile).await;
 
-    Ok(AvatarInfo {
-        avatar_path,
-        avatar_hash,
-        avatar_updated_at,
-    })
+    Ok(avatar)
 }
 
 #[tauri::command]
@@ -443,7 +482,7 @@ pub async fn clear_profile_avatar(state: State<'_, AppState>) -> Result<AvatarIn
         profile.clone()
     };
 
-    notify_profile_updated_to_peers(&state, &updated_profile).await;
+    spawn_profile_updated_notification(&state, updated_profile).await;
 
     Ok(AvatarInfo {
         avatar_path: String::new(),
@@ -2063,23 +2102,21 @@ pub async fn create_group(
         listen_port,
     )
     .await;
-    let content = serde_json::json!({"name": payload.name, "member_ids": all_members}).to_string();
-
-    send_or_queue_notification(
-        &state.db,
-        &online_peers,
-        &all_members,
-        &my_id,
-        &my_name,
-        &my_department,
+    let content = serde_json::json!({"name": payload.name, "member_ids": all_members.clone()}).to_string();
+    spawn_send_or_queue_notification(
+        state.db.clone(),
+        online_peers,
+        all_members,
+        my_id.clone(),
+        my_name,
+        my_department,
         listen_port,
-        &content,
-        "group_created",
-        Some(&gid),
+        content,
+        "group_created".to_string(),
+        Some(gid.clone()),
         None,
-        &directory,
-    )
-    .await;
+        directory,
+    );
 
     Ok(crate::db::GroupInfo {
         group_id: gid,
@@ -2183,21 +2220,20 @@ pub async fn send_group_message_typed(
 
     let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
     let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
-    send_or_queue_notification(
-        &state.db,
-        &online_peers,
-        &target_ids,
-        &my_id,
-        &my_name,
-        &my_department,
+    spawn_send_or_queue_notification(
+        state.db.clone(),
+        online_peers,
+        target_ids,
+        my_id,
+        my_name,
+        my_department,
         listen_port,
-        &content,
-        &msg_type,
-        Some(&group_id),
+        content,
+        msg_type,
+        Some(group_id),
         None,
-        &empty_dir,
-    )
-    .await;
+        empty_dir,
+    );
 
     Ok(msg)
 }
@@ -2250,21 +2286,20 @@ pub async fn rename_group(
 
     let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
     let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
-    send_or_queue_notification(
-        &state.db,
-        &online_peers,
-        &target_ids,
-        &my_id,
-        &my_name,
-        &my_department,
+    spawn_send_or_queue_notification(
+        state.db.clone(),
+        online_peers,
+        target_ids,
+        my_id,
+        my_name,
+        my_department,
         listen_port,
-        &format!("群名已修改为「{}」", new_name),
-        "group_renamed",
-        Some(&group_id),
-        Some(&new_name),
-        &empty_dir,
-    )
-    .await;
+        format!("群名已修改为「{}」", new_name),
+        "group_renamed".to_string(),
+        Some(group_id),
+        Some(new_name),
+        empty_dir,
+    );
     Ok(())
 }
 
@@ -2325,23 +2360,21 @@ pub async fn invite_to_group(
         listen_port,
     )
     .await;
-    let content = serde_json::json!({"name": group.name, "member_ids": all_member_ids}).to_string();
-
-    send_or_queue_notification(
-        &state.db,
-        &online_peers,
-        &all_member_ids,
-        &my_id,
-        &my_name,
-        &my_department,
+    let content = serde_json::json!({"name": group.name, "member_ids": all_member_ids.clone()}).to_string();
+    spawn_send_or_queue_notification(
+        state.db.clone(),
+        online_peers,
+        all_member_ids,
+        my_id,
+        my_name,
+        my_department,
         listen_port,
-        &content,
-        "group_created",
-        Some(&group_id),
+        content,
+        "group_created".to_string(),
+        Some(group_id),
         None,
-        &directory,
-    )
-    .await;
+        directory,
+    );
     Ok(())
 }
 
@@ -2378,21 +2411,20 @@ pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result
 
     let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
     let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
-    send_or_queue_notification(
-        &state.db,
-        &online_peers,
-        &target_ids,
-        &my_id,
-        &my_name,
-        &my_department,
+    spawn_send_or_queue_notification(
+        state.db.clone(),
+        online_peers,
+        target_ids,
+        my_id.clone(),
+        my_name,
+        my_department,
         listen_port,
-        "",
-        "group_member_left",
-        Some(&group_id),
+        String::new(),
+        "group_member_left".to_string(),
+        Some(group_id.clone()),
         None,
-        &empty_dir,
-    )
-    .await;
+        empty_dir,
+    );
 
     state
         .db
@@ -2429,21 +2461,20 @@ pub async fn dissolve_group(state: State<'_, AppState>, group_id: String) -> Res
 
     let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
     let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
-    send_or_queue_notification(
-        &state.db,
-        &online_peers,
-        &target_ids,
-        &my_id,
-        &my_name,
-        &my_department,
+    spawn_send_or_queue_notification(
+        state.db.clone(),
+        online_peers,
+        target_ids,
+        my_id,
+        my_name,
+        my_department,
         listen_port,
-        "群组已解散",
-        "group_dissolved",
-        Some(&group_id),
+        "群组已解散".to_string(),
+        "group_dissolved".to_string(),
+        Some(group_id),
         None,
-        &empty_dir,
-    )
-    .await;
+        empty_dir,
+    );
     Ok(())
 }
 
@@ -2562,7 +2593,6 @@ async fn send_group_file_with_kind(
 
     register_outgoing_file_transfer(client_msg_id.as_deref()).await;
 
-    // Get online peer snapshot once
     let online_peers = {
         let runtime_opt = { state.runtime.read().await.clone() };
         match runtime_opt.as_ref() {
@@ -2571,202 +2601,219 @@ async fn send_group_file_with_kind(
         }
     };
 
-    for member in members {
-        if member.peer_id == my_id {
-            continue;
-        }
-        if let Err(e) = wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await {
-            clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
-            let _ = app_handle.emit_all(
-                "file-error",
-                serde_json::json!({
-                    "fileName": file_name.as_str(),
-                    "clientMsgId": client_msg_id.as_deref(),
-                    "error": e.to_string(),
-                }),
-            );
-            return Err(e.to_string());
-        }
-        let bg_path = file_path.clone();
-        let bg_name = file_name.clone();
-        let bg_my_id = my_id.clone();
-        let bg_my_name = my_name.clone();
-        let bg_my_dep = my_department.clone();
-        let bg_db = db.clone();
-        let bg_handle = app_handle.clone();
-        let bg_error_handle = app_handle.clone();
-        let bg_gid = group_id.clone();
-        let bg_pending_cache = pending_cache.clone();
-        let bg_kind = msg_kind.to_string();
-        let mut target_id = member.peer_id.clone();
-        let target_name = member.username.clone();
-        let target_department = member.department.clone();
-        let mut resolved_addr = resolve_peer_addr(&target_id, &db, &online_peers).await;
-        if resolved_addr.is_none() && !target_name.is_empty() {
-            if let Ok(Some(latest_peer)) = db
-                .find_peer_by_identity(&target_name, &target_department)
-                .await
-            {
-                if latest_peer.peer_id != target_id {
-                    log::info!(
-                        "Group file target {} resolved by identity to latest peer_id {}",
-                        target_id,
-                        latest_peer.peer_id
-                    );
-                    target_id = latest_peer.peer_id.clone();
-                    resolved_addr = resolve_peer_addr(&target_id, &db, &online_peers).await;
-                }
+    let bg_handle = app_handle.clone();
+    let bg_error_handle = app_handle.clone();
+    let bg_db = db.clone();
+    let bg_members = members;
+    let bg_online_peers = online_peers;
+    let bg_my_id = my_id.clone();
+    let bg_my_name = my_name.clone();
+    let bg_my_department = my_department.clone();
+    let bg_group_id = group_id.clone();
+    let bg_file_path = file_path.clone();
+    let bg_file_name = file_name.clone();
+    let bg_msg_kind = msg_kind.to_string();
+    let bg_content = content.clone();
+    let bg_client_msg_id = client_msg_id.clone();
+    let bg_pending_cache = pending_cache.clone();
+
+    tauri::async_runtime::spawn(async move {
+        for member in bg_members {
+            if member.peer_id == bg_my_id {
+                continue;
             }
-        }
-        if let Some((ip, port)) = resolved_addr {
-            let peer = crate::discovery::Peer::new(
-                target_id.clone(),
-                target_name,
-                target_department,
-                ip,
-                port,
-            );
-            match send_group_file_to_peer_with_progress(
-                &bg_path,
-                &bg_name,
-                file_size,
-                &peer,
-                &bg_my_id,
-                &bg_my_name,
-                &bg_my_dep,
-                listen_port,
-                &bg_gid,
-                &bg_kind,
-                client_msg_id.as_deref(),
-                &bg_handle,
-            )
-            .await
-            {
-                Ok(_) => log::info!("Group file sent to {}", peer.id),
-                Err(e) if e == FILE_TRANSFER_CANCELLED_MESSAGE => {
-                    clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
-                    let _ = bg_error_handle.emit_all(
-                        "file-error",
-                        serde_json::json!({
-                            "fileName": bg_name,
-                            "clientMsgId": client_msg_id.as_deref(),
-                            "error": e,
-                        }),
-                    );
-                    return Err(e);
-                }
-                Err(e) => {
-                    log::error!("Group file send failed to {}: {}", peer.id, e);
-                    if let Err(queue_err) = queue_group_file_for_peer(
-                        &bg_db,
-                        &bg_path,
-                        &bg_name,
-                        file_size,
-                        bg_pending_cache,
-                        &peer.id,
-                        &bg_my_id,
-                        &bg_my_name,
-                        &bg_my_dep,
-                        listen_port,
-                        &bg_gid,
-                        &bg_kind,
-                    )
-                    .await
-                    {
-                        log::error!("Failed to queue group file for {}: {}", peer.id, queue_err);
-                        let _ = bg_error_handle.emit_all(
-                            "file-error",
-                            serde_json::json!({
-                                "fileName": bg_name,
-                                "clientMsgId": client_msg_id.as_deref(),
-                                "error": queue_err,
-                            }),
-                        );
-                    }
-                }
-            }
-        } else {
-            if let Err(e) = queue_group_file_for_peer(
-                &bg_db,
-                &bg_path,
-                &bg_name,
-                file_size,
-                bg_pending_cache,
-                &target_id,
-                &bg_my_id,
-                &bg_my_name,
-                &bg_my_dep,
-                listen_port,
-                &bg_gid,
-                &bg_kind,
-            )
-            .await
-            {
-                log::error!("Failed to queue group file for {}: {}", target_id, e);
+            if let Err(e) = wait_for_outgoing_file_transfer(bg_client_msg_id.as_deref()).await {
+                clear_outgoing_file_transfer(bg_client_msg_id.as_deref()).await;
                 let _ = bg_error_handle.emit_all(
                     "file-error",
                     serde_json::json!({
-                        "fileName": bg_name,
-                        "clientMsgId": client_msg_id.as_deref(),
-                        "error": e,
+                        "fileName": bg_file_name.as_str(),
+                        "clientMsgId": bg_client_msg_id.as_deref(),
+                        "error": e.to_string(),
                     }),
                 );
+                return;
+            }
+
+            let mut target_id = member.peer_id.clone();
+            let target_name = member.username.clone();
+            let target_department = member.department.clone();
+            let mut resolved_addr = resolve_peer_addr(&target_id, bg_db.as_ref(), &bg_online_peers).await;
+            if resolved_addr.is_none() && !target_name.is_empty() {
+                if let Ok(Some(latest_peer)) = bg_db
+                    .find_peer_by_identity(&target_name, &target_department)
+                    .await
+                {
+                    if latest_peer.peer_id != target_id {
+                        log::info!(
+                            "Group file target {} resolved by identity to latest peer_id {}",
+                            target_id,
+                            latest_peer.peer_id
+                        );
+                        target_id = latest_peer.peer_id.clone();
+                        resolved_addr = resolve_peer_addr(&target_id, bg_db.as_ref(), &bg_online_peers).await;
+                    }
+                }
+            }
+
+            if let Some((ip, port)) = resolved_addr {
+                let peer = crate::discovery::Peer::new(
+                    target_id.clone(),
+                    target_name,
+                    target_department,
+                    ip,
+                    port,
+                );
+                match send_group_file_to_peer_with_progress(
+                    &bg_file_path,
+                    &bg_file_name,
+                    file_size,
+                    &peer,
+                    &bg_my_id,
+                    &bg_my_name,
+                    &bg_my_department,
+                    listen_port,
+                    &bg_group_id,
+                    &bg_msg_kind,
+                    bg_client_msg_id.as_deref(),
+                    &bg_handle,
+                )
+                .await
+                {
+                    Ok(_) => log::info!("Group file sent to {}", peer.id),
+                    Err(e) if e == FILE_TRANSFER_CANCELLED_MESSAGE => {
+                        clear_outgoing_file_transfer(bg_client_msg_id.as_deref()).await;
+                        let _ = bg_error_handle.emit_all(
+                            "file-error",
+                            serde_json::json!({
+                                "fileName": bg_file_name.as_str(),
+                                "clientMsgId": bg_client_msg_id.as_deref(),
+                                "error": e,
+                            }),
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        log::error!("Group file send failed to {}: {}", peer.id, e);
+                        if let Err(queue_err) = queue_group_file_for_peer(
+                            bg_db.as_ref(),
+                            &bg_file_path,
+                            &bg_file_name,
+                            file_size,
+                            bg_pending_cache.clone(),
+                            &peer.id,
+                            &bg_my_id,
+                            &bg_my_name,
+                            &bg_my_department,
+                            listen_port,
+                            &bg_group_id,
+                            &bg_msg_kind,
+                        )
+                        .await
+                        {
+                            log::error!("Failed to queue group file for {}: {}", peer.id, queue_err);
+                            let _ = bg_error_handle.emit_all(
+                                "file-error",
+                                serde_json::json!({
+                                    "fileName": bg_file_name.as_str(),
+                                    "clientMsgId": bg_client_msg_id.as_deref(),
+                                    "error": queue_err,
+                                }),
+                            );
+                        }
+                    }
+                }
             } else {
-                log::info!("Queued group file for offline member {}", target_id);
+                if let Err(e) = queue_group_file_for_peer(
+                    bg_db.as_ref(),
+                    &bg_file_path,
+                    &bg_file_name,
+                    file_size,
+                    bg_pending_cache.clone(),
+                    &target_id,
+                    &bg_my_id,
+                    &bg_my_name,
+                    &bg_my_department,
+                    listen_port,
+                    &bg_group_id,
+                    &bg_msg_kind,
+                )
+                .await
+                {
+                    log::error!("Failed to queue group file for {}: {}", target_id, e);
+                    let _ = bg_error_handle.emit_all(
+                        "file-error",
+                        serde_json::json!({
+                            "fileName": bg_file_name.as_str(),
+                            "clientMsgId": bg_client_msg_id.as_deref(),
+                            "error": e,
+                        }),
+                    );
+                } else {
+                    log::info!("Queued group file for offline member {}", target_id);
+                }
             }
         }
-    }
 
-    if let Err(e) = wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await {
-        clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
-        let _ = app_handle.emit_all(
-            "file-error",
+        if let Err(e) = wait_for_outgoing_file_transfer(bg_client_msg_id.as_deref()).await {
+            clear_outgoing_file_transfer(bg_client_msg_id.as_deref()).await;
+            let _ = bg_error_handle.emit_all(
+                "file-error",
+                serde_json::json!({
+                    "fileName": bg_file_name.as_str(),
+                    "clientMsgId": bg_client_msg_id.as_deref(),
+                    "error": e.to_string(),
+                }),
+            );
+            return;
+        }
+
+        let saved = match bg_db
+            .save_group_message(
+                &bg_group_id,
+                &bg_my_id,
+                &bg_my_name,
+                &bg_content,
+                &bg_msg_kind,
+                Some(&bg_file_path),
+                Some(&bg_file_name),
+                Some(file_size),
+                true,
+                bg_client_msg_id.as_deref(),
+            )
+            .await
+        {
+            Ok(saved) => saved,
+            Err(error) => {
+                clear_outgoing_file_transfer(bg_client_msg_id.as_deref()).await;
+                let _ = bg_error_handle.emit_all(
+                    "file-error",
+                    serde_json::json!({
+                        "fileName": bg_file_name.as_str(),
+                        "clientMsgId": bg_client_msg_id.as_deref(),
+                        "error": error.to_string(),
+                    }),
+                );
+                return;
+            }
+        };
+        crate::chat::emit_group_message_updated(&bg_handle, &bg_group_id, saved);
+
+        let _ = bg_handle.emit_all(
+            "file-progress",
             serde_json::json!({
-                "fileName": file_name.as_str(),
-                "clientMsgId": client_msg_id.as_deref(),
-                "error": e.to_string(),
+                "fileName": bg_file_name.as_str(),
+                "clientMsgId": bg_client_msg_id.as_deref(),
+                "sent": file_size,
+                "total": file_size,
+                "speed": 0,
             }),
         );
-        return Err(e.to_string());
-    }
-
-    let saved = match db
-        .save_group_message(
-            &group_id,
-            &my_id,
-            &my_name,
-            &content,
-            msg_kind,
-            Some(&file_path),
-            Some(&file_name),
-            Some(file_size),
-            true,
-            client_msg_id.as_deref(),
-        )
-        .await
-    {
-        Ok(saved) => saved,
-        Err(error) => {
-            clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
-            return Err(error.to_string());
-        }
-    };
-    crate::chat::emit_group_message_updated(&app_handle, &group_id, saved.clone());
-
-    let _ = app_handle.emit_all(
-        "file-progress",
-        serde_json::json!({
-            "fileName": file_name,
-            "clientMsgId": client_msg_id.as_deref(),
-            "sent": file_size,
-            "total": file_size,
-            "speed": 0,
-        }),
-    );
-    clear_outgoing_file_transfer(client_msg_id.as_deref()).await;
+        clear_outgoing_file_transfer(bg_client_msg_id.as_deref()).await;
+    });
 
     Ok(ChatMessage {
-        id: saved.id,
+        id: 0,
         sender_id: my_id,
         sender_name: my_name,
         receiver_id: String::new(),
@@ -2777,7 +2824,7 @@ async fn send_group_file_with_kind(
         file_size: Some(file_size),
         timestamp: Utc::now().to_rfc3339(),
         is_read: true,
-        client_msg_id: saved.client_msg_id,
+        client_msg_id,
     })
 }
 
@@ -3312,6 +3359,20 @@ async fn deliver_pending_payloads_over_tcp(
     delivered
 }
 
+fn stored_peer_recently_online(peer: &StoredPeer) -> bool {
+    const ONLINE_GRACE_SECS: i64 = 15;
+
+    if !peer.is_online {
+        return false;
+    }
+
+    let Ok(last_seen) = chrono::DateTime::parse_from_rfc3339(&peer.last_seen_at) else {
+        return false;
+    };
+
+    chrono::Utc::now().timestamp() - last_seen.timestamp() <= ONLINE_GRACE_SECS
+}
+
 /// Generic "fan-out a notification to a set of peers, queue if offline".
 ///
 /// `kind` is the logical type used for offline queueing (matches the wire
@@ -3387,11 +3448,15 @@ async fn resolve_peer_addr(
     online_peers: &[Peer],
 ) -> Option<(std::net::IpAddr, u16)> {
     if let Some(p) = online_peers.iter().find(|p| p.id == peer_id) {
-        if !p.ip.is_unspecified() && p.port != 0 {
+        if p.online && !p.ip.is_unspecified() && p.port != 0 {
             return Some((p.ip, p.port));
         }
+        return None;
     }
     if let Ok(Some(sp)) = db.get_stored_peer(peer_id).await {
+        if !stored_peer_recently_online(&sp) {
+            return None;
+        }
         if let Ok(ip) = sp.ip.parse::<std::net::IpAddr>() {
             if !ip.is_unspecified() && sp.port != 0 {
                 return Some((ip, sp.port));

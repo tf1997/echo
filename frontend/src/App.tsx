@@ -21,8 +21,6 @@ import {
   checkPeerOnline,
   getDepartments,
   saveProfile,
-  setProfileAvatar,
-  clearProfileAvatar,
   requestPeerAvatar,
   listStoredPeers,
   getUnreadCounts,
@@ -804,7 +802,9 @@ function App() {
   const handleSendSticker = useCallback(async (filePath: string, clientMsgId?: string) => {
     if (selectedGroupId) {
       const sent = await sendGroupSticker(selectedGroupId, filePath, clientMsgId);
-      setMessages((prev) => mergeMessageIntoList(prev, sent));
+      if (sent.id > 0) {
+        setMessages((prev) => mergeMessageIntoList(prev, sent));
+      }
       listGroups().then(setGroups).catch(console.error);
       return sent;
     }
@@ -842,12 +842,12 @@ function App() {
     setSavingProfile(true);
     setProfileError("");
     try {
-      await saveProfile({ username: trimmedUser, department: trimmedDepartment });
-      if (profileAvatarSourcePath) {
-        await setProfileAvatar(profileAvatarSourcePath);
-      } else if (profileAvatarClearRequested) {
-        await clearProfileAvatar();
-      }
+      await saveProfile({
+        username: trimmedUser,
+        department: trimmedDepartment,
+        avatar_source_path: profileAvatarSourcePath,
+        clear_avatar: profileAvatarClearRequested,
+      });
       await loadMainData();
       setEditingProfile(false);
     } catch (err) {
