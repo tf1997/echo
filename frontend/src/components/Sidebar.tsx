@@ -410,7 +410,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
 
   return (
     <div className="app-sidebar relative flex flex-col w-72 bg-gray-900 text-white h-full border-r border-gray-700">
-      <div className="p-4 border-b border-gray-700 relative">
+      <div className="sidebar-profile p-4 border-b border-gray-700 relative">
         <div className="flex items-center gap-3">
           <AvatarPreviewTrigger
             name={myName}
@@ -430,14 +430,14 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
           </button>
           <button
             onClick={onEditProfile}
-            className="text-xs px-2 py-1 rounded bg-gray-700 hover:bg-gray-600"
+            className="sidebar-secondary-action text-xs px-2 py-1 rounded bg-gray-700 hover:bg-gray-600"
           >
             编辑
           </button>
         </div>
 
         {showProfile && (
-          <div className="absolute top-full left-2 right-2 mt-1 z-50 bg-gray-800 border border-gray-600 rounded-xl p-4 shadow-2xl">
+          <div className="peer-profile-popover absolute top-full left-2 right-2 mt-1 z-50 bg-gray-800 border border-gray-600 rounded-xl p-4 shadow-2xl">
             <div className="flex items-center gap-3 mb-3">
               <AvatarPreviewTrigger name={myName} src={myAvatarPath} size="xl" fallbackClassName="bg-indigo-500" />
               <div>
@@ -507,12 +507,12 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                 value={subnetInput}
                 onChange={(e) => setSubnetInput(e.target.value)}
                 placeholder="例: 10.100.0, 10.101.0"
-                className="w-full bg-gray-900 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500"
+                className="sidebar-control-input w-full bg-gray-900 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500"
               />
               <button
                 onClick={handleSaveSubnets}
                 disabled={savingSubnets}
-                className="mt-2 w-full text-center text-xs py-1 rounded bg-indigo-600 hover:bg-indigo-500 transition-colors disabled:opacity-50"
+                className="sidebar-primary-action mt-2 w-full text-center text-xs py-1 rounded bg-indigo-600 hover:bg-indigo-500 transition-colors disabled:opacity-50"
               >
                 {savingSubnets ? "保存中..." : "保存网段"}
               </button>
@@ -542,7 +542,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
             </div>
             <button
               onClick={() => setShowProfile(false)}
-              className="mt-1 w-full text-center text-xs py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 transition-colors"
+              className="sidebar-secondary-action mt-1 w-full text-center text-xs py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 transition-colors"
             >
               关闭
             </button>
@@ -552,7 +552,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
       </div>
 
       {/* Search input */}
-      <div className="px-4 py-3">
+      <div className="sidebar-search px-4 py-3">
         <div className="relative">
           <svg className="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
@@ -563,7 +563,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
             onChange={(e) => handleSearchChange(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Escape") clearGlobalSearch(); }}
             placeholder="搜索聊天记录..."
-            className="w-full bg-gray-800 text-sm text-gray-200 rounded-lg pl-8 pr-8 py-2 outline-none focus:ring-2 focus:ring-indigo-500 placeholder-gray-500"
+            className="sidebar-control-input w-full bg-gray-800 text-sm text-gray-200 rounded-lg pl-8 pr-8 py-2 outline-none focus:ring-2 focus:ring-indigo-500 placeholder-gray-500"
           />
           {searchQuery ? (
             <button
@@ -579,7 +579,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
       </div>
 
       {/* Manual IP search */}
-      <div className="px-4 pb-2">
+      <div className="sidebar-ip-search px-4 pb-2">
         <div className="grid grid-cols-[minmax(0,1fr)_4.25rem_auto] gap-2">
           <input
             type="text"
@@ -590,7 +590,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
               setIpSearchStatus("idle");
             }}
             placeholder="IP 地址"
-            className="min-w-0 bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
+            className="sidebar-control-input min-w-0 bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
             onKeyDown={(e) => { if (e.key === "Enter") handleDiscoverIp(); }}
           />
           <input
@@ -602,13 +602,13 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
               setIpSearchStatus("idle");
             }}
             placeholder="9527"
-            className="min-w-0 bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
+            className="sidebar-control-input min-w-0 bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
             onKeyDown={(e) => { if (e.key === "Enter") handleDiscoverIp(); }}
           />
           <button
             onClick={handleDiscoverIp}
             disabled={searchingIp}
-            className="px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 whitespace-nowrap"
+            className="sidebar-primary-action px-3 py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 whitespace-nowrap"
           >
             {searchingIp ? "..." : "查找"}
           </button>
@@ -620,7 +620,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
 
       {showSearch ? (
         <div className="flex-1 overflow-y-auto">
-          <p className="px-4 py-2 text-xs text-gray-400 font-medium uppercase tracking-wider">搜索结果</p>
+          <p className="sidebar-section-label px-4 py-2 text-xs text-gray-400 font-medium uppercase tracking-wider">搜索结果</p>
           {searching ? (
             <SidebarEmptyState title="正在搜索" detail="正在匹配联系人、群聊和聊天记录。" />
           ) : searchError ? (
@@ -633,7 +633,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                 <div key={result.peer_id} className="mb-1">
                   <button
                     onClick={() => handleJumpToHit(result.peer_id)}
-                    className="w-full text-left px-4 py-2 hover:bg-gray-800"
+                    className="sidebar-search-result w-full text-left px-4 py-2 hover:bg-gray-800"
                   >
                     <p className="text-xs font-medium text-indigo-400 truncate">{result.peer_name}</p>
                   </button>
@@ -641,7 +641,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                     <button
                       key={hit.id}
                       onClick={() => handleJumpToHit(result.peer_id, hit.id)}
-                      className="w-full text-left px-4 py-1.5 pl-6 hover:bg-gray-800"
+                      className="sidebar-search-result w-full text-left px-4 py-1.5 pl-6 hover:bg-gray-800"
                     >
                       <p className="text-xs text-gray-300 truncate">
                         {getSearchHitPreview(hit)}
@@ -657,7 +657,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                 <div key={result.group.group_id} className="mb-1">
                   <button
                     onClick={() => handleJumpToGroupHit(result.group.group_id)}
-                    className="w-full text-left px-4 py-2 hover:bg-gray-800"
+                    className="sidebar-search-result w-full text-left px-4 py-2 hover:bg-gray-800"
                   >
                     <p className="text-xs font-medium text-indigo-400 truncate">群聊 · {result.group.name}</p>
                   </button>
@@ -665,7 +665,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                     <button
                       key={hit.id}
                       onClick={() => handleJumpToGroupHit(result.group.group_id, hit.id)}
-                      className="w-full text-left px-4 py-1.5 pl-6 hover:bg-gray-800"
+                      className="sidebar-search-result w-full text-left px-4 py-1.5 pl-6 hover:bg-gray-800"
                     >
                       <p className="text-xs text-gray-300 truncate">
                         {getSearchHitPreview(hit)}
@@ -683,15 +683,15 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
       ) : (
         <div className="flex-1 flex flex-col min-h-0">
           {/* Tabs */}
-          <div className="flex border-b border-gray-700">
-            <button onClick={() => { setTab("recent"); listRecentContacts().then(setRecentContacts).catch(() => {}); }} className={`flex-1 py-2 text-xs font-medium relative ${tab === "recent" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>
+          <div className="sidebar-tabs flex border-b border-gray-700">
+            <button onClick={() => { setTab("recent"); listRecentContacts().then(setRecentContacts).catch(() => {}); }} className={`sidebar-tab flex-1 py-2 text-xs font-medium relative ${tab === "recent" ? "sidebar-tab-active text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>
               最近
               {recentTotalUnread > 0 && (
                 <span className="absolute top-1 right-2 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center">{recentTotalUnread > 99 ? "99+" : recentTotalUnread}</span>
               )}
             </button>
-            <button onClick={() => setTab("contacts")} className={`flex-1 py-2 text-xs font-medium ${tab === "contacts" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>联系人</button>
-            <button onClick={() => setTab("groups")} className={`flex-1 py-2 text-xs font-medium relative ${tab === "groups" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>
+            <button onClick={() => setTab("contacts")} className={`sidebar-tab flex-1 py-2 text-xs font-medium ${tab === "contacts" ? "sidebar-tab-active text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>联系人</button>
+            <button onClick={() => setTab("groups")} className={`sidebar-tab flex-1 py-2 text-xs font-medium relative ${tab === "groups" ? "sidebar-tab-active text-indigo-400 border-b-2 border-indigo-400" : "text-gray-500 hover:text-gray-300"}`}>
               群组
               {groupsTotalUnread > 0 && (
                 <span className="absolute top-1 right-2 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center">{groupsTotalUnread > 99 ? "99+" : groupsTotalUnread}</span>
@@ -713,7 +713,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                 <>
                   {recentGroups.length > 0 ? (
                     <div className="pb-1">
-                      <p className="px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">最近群聊</p>
+                      <p className="sidebar-section-label px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">最近群聊</p>
                       {recentGroups.map((group) => (
                         <GroupItem
                           key={group.group_id}
@@ -726,7 +726,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                   ) : null}
                   {recentContacts.length > 0 ? (
                     <div className="pb-1">
-                      <p className="px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">最近联系人</p>
+                      <p className="sidebar-section-label px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">最近联系人</p>
                       {recentContacts.map(r => {
                         const livePeer = peerById.get(r.peer_id);
                         const endpointPeer = peerByEndpoint.get(storedPeerEndpointKey(r));
@@ -757,7 +757,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                         return (
                           <div key={r.peer_id} className="group relative">
                             <PeerItem peer={peer} isSelected={isPeerSelected(peer, r.peer_id)} unread={unreadMap.get(r.peer_id) ?? unreadMap.get(peer.id) ?? 0} onClick={() => onSelectPeer(peer)} onAvatarClick={() => setProfilePeer(peer)} />
-                            <button onClick={(e) => { e.stopPropagation(); handleRemoveRecent(r.peer_id); }} className="absolute right-2 top-3 hidden group-hover:flex w-5 h-5 rounded-full bg-gray-600 hover:bg-red-600 items-center justify-center text-[10px]" title="移除">×</button>
+                            <button onClick={(e) => { e.stopPropagation(); handleRemoveRecent(r.peer_id); }} className="sidebar-remove-action absolute right-2 top-3 hidden group-hover:flex w-5 h-5 rounded-full bg-gray-600 hover:bg-red-600 items-center justify-center text-[10px]" title="移除">×</button>
                           </div>
                         );
                       })}
@@ -768,7 +768,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
             ) : tab === "groups" ? (
               <>
                 <div className="px-4 py-2">
-                  <button onClick={() => setShowCreateGroup(true)} className="w-full py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500">+ 创建群组</button>
+                  <button onClick={() => setShowCreateGroup(true)} className="sidebar-primary-action w-full py-1.5 text-xs rounded bg-indigo-600 hover:bg-indigo-500">+ 创建群组</button>
                 </div>
                 {groups.length === 0 ? (
                   <SidebarEmptyState
@@ -790,7 +790,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
               </>
             ) : (
               <>
-                <div className="sticky top-0 z-10 border-b border-gray-700 bg-gray-900 px-4 py-2">
+                <div className="sidebar-contact-filter sticky top-0 z-10 border-b border-gray-700 bg-gray-900 px-4 py-2">
                   <div className="relative">
                     <svg className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
@@ -801,7 +801,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                       onChange={(e) => setContactQuery(e.target.value)}
                       onKeyDown={(e) => { if (e.key === "Escape") setContactQuery(""); }}
                       placeholder="搜索联系人..."
-                      className="w-full bg-gray-800 text-xs text-gray-200 rounded-lg pl-8 pr-8 py-2 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
+                      className="sidebar-control-input w-full bg-gray-800 text-xs text-gray-200 rounded-lg pl-8 pr-8 py-2 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-500"
                     />
                     {contactQuery ? (
                       <button
@@ -823,7 +823,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                     <div key={dept}>
                       <button
                         onClick={() => { if (!contactFilter) toggleDept(dept); }}
-                        className="w-full flex items-center gap-2 px-4 py-2 text-xs text-gray-400 font-medium hover:bg-gray-800 transition-colors"
+                        className="sidebar-dept-button w-full flex items-center gap-2 px-4 py-2 text-xs text-gray-400 font-medium hover:bg-gray-800 transition-colors"
                       >
                         <svg
                           className={`w-3 h-3 text-gray-500 transition-transform flex-shrink-0 ${expanded ? "rotate-90" : ""}`}
@@ -866,8 +866,8 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
 
       {/* Create group dialog */}
       {showCreateGroup && (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="bg-gray-800 border border-gray-600 rounded-xl p-5 w-96 shadow-2xl">
+        <div className="sidebar-overlay absolute inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="create-group-dialog bg-gray-800 border border-gray-600 rounded-xl p-5 w-96 shadow-2xl">
             <h3 className="text-base font-semibold mb-4">创建群组</h3>
 
             <div className="mb-4">
@@ -882,7 +882,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                 }}
                 placeholder="请输入群组名称"
                 maxLength={50}
-                className={`w-full bg-gray-900 border ${groupNameError ? "border-red-500" : "border-gray-600"} rounded px-3 py-2 text-sm text-gray-200 outline-none focus:border-indigo-500 transition-colors`}
+                className={`sidebar-control-input w-full bg-gray-900 border ${groupNameError ? "border-red-500" : "border-gray-600"} rounded px-3 py-2 text-sm text-gray-200 outline-none focus:border-indigo-500 transition-colors`}
                 autoFocus
               />
               {groupNameError && (
@@ -904,7 +904,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                   value={newGroupMemberQuery}
                   onChange={(e) => setNewGroupMemberQuery(e.target.value)}
                   placeholder="搜索成员..."
-                  className="w-full bg-gray-900 border border-gray-600 rounded px-8 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500"
+                  className="sidebar-control-input w-full bg-gray-900 border border-gray-600 rounded px-8 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500"
                 />
                 {newGroupMemberQuery ? (
                   <button
@@ -917,14 +917,14 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                   </button>
                 ) : null}
               </div>
-              <div className="max-h-40 overflow-y-auto bg-gray-900 border border-gray-600 rounded p-2">
+              <div className="sidebar-member-picker max-h-40 overflow-y-auto bg-gray-900 border border-gray-600 rounded p-2">
                 {peers.length === 0 ? (
                   <p className="text-xs text-gray-500 text-center py-4">暂无可选成员</p>
                 ) : selectableGroupPeers.length === 0 ? (
                   <p className="text-xs text-gray-500 text-center py-4">无匹配成员</p>
                 ) : (
                   selectableGroupPeers.map((p) => (
-                    <label key={p.id} className="flex items-center gap-2 py-1.5 px-2 hover:bg-gray-800 rounded cursor-pointer transition-colors">
+                    <label key={p.id} className="sidebar-member-option flex items-center gap-2 py-1.5 px-2 hover:bg-gray-800 rounded cursor-pointer transition-colors">
                       <input
                         type="checkbox"
                         checked={newGroupMembers.includes(p.id)}
@@ -952,7 +952,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
               <button
                 onClick={handleCreateGroup}
                 disabled={!newGroupName.trim() || newGroupMembers.length === 0}
-                className="create-group-submit flex-1 py-2.5 text-sm font-medium rounded border border-transparent bg-indigo-600 hover:bg-indigo-500 disabled:cursor-not-allowed transition-colors"
+                className="sidebar-primary-action create-group-submit flex-1 py-2.5 text-sm font-medium rounded border border-transparent bg-indigo-600 hover:bg-indigo-500 disabled:cursor-not-allowed transition-colors"
               >
                 创建群组
               </button>
@@ -964,7 +964,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                   setNewGroupMemberQuery("");
                   setGroupNameError("");
                 }}
-                className="flex-1 py-2.5 text-sm font-medium rounded bg-gray-700 hover:bg-gray-600 transition-colors"
+                className="sidebar-secondary-action flex-1 py-2.5 text-sm font-medium rounded bg-gray-700 hover:bg-gray-600 transition-colors"
               >
                 取消
               </button>
@@ -973,7 +973,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
         </div>
       )}
 
-      <div className="relative p-3 border-t border-gray-700 text-xs text-gray-500 text-center">
+      <div className="sidebar-footer relative p-3 border-t border-gray-700 text-xs text-gray-500 text-center">
         Echo P2P Chat · 局域网通信
         <div ref={themeMenuRef} className="absolute right-2 top-1/2 -translate-y-1/2">
           <button
@@ -1036,8 +1036,8 @@ function SidebarEmptyState({
   const iconClass = tone === "error" ? "text-red-400 bg-red-500/10 border-red-500/30" : "text-gray-500 bg-gray-800/70 border-gray-700";
 
   return (
-    <div className="px-5 py-10 text-center">
-      <div className={`mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg border ${iconClass}`}>
+    <div className="sidebar-empty-state px-5 py-10 text-center">
+      <div className={`sidebar-empty-icon mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg border ${iconClass}`}>
         {tone === "error" ? (
           <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
@@ -1054,7 +1054,7 @@ function SidebarEmptyState({
         <button
           type="button"
           onClick={onAction}
-          className="mt-4 rounded-lg bg-gray-700 px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-600"
+          className="sidebar-secondary-action mt-4 rounded-lg bg-gray-700 px-3 py-1.5 text-xs text-gray-200 hover:bg-gray-600"
         >
           {actionLabel}
         </button>
@@ -1087,14 +1087,14 @@ function PeerItem({ peer, isSelected, unread, onClick, onAvatarClick }: { peer: 
         onClick={onClick}
         className="flex-1 min-w-0 text-left"
       >
-        <p className="text-sm font-medium truncate">{peer.username}</p>
-        <p className="text-xs text-gray-400 truncate">{peer.department}</p>
-        <p className="text-[10px] text-gray-500 truncate">
+        <p className="sidebar-item-title text-sm font-medium truncate">{peer.username}</p>
+        <p className="sidebar-item-subtitle text-xs text-gray-400 truncate">{peer.department}</p>
+        <p className="sidebar-item-meta text-[10px] text-gray-500 truncate">
           {peer.ip && peer.port ? `${peer.online ? "在线" : "离线"} · ${peer.ip}:${peer.port}` : (peer.online ? "在线" : "离线")}
         </p>
       </button>
       {unread > 0 && !isSelected && (
-        <div className="flex-shrink-0 w-5 h-5 rounded-full bg-red-500 flex items-center justify-center text-[10px] font-bold">
+        <div className="sidebar-unread-badge flex-shrink-0 w-5 h-5 rounded-full bg-red-500 flex items-center justify-center text-[10px] font-bold">
           {unread > 99 ? "99+" : unread}
         </div>
       )}
@@ -1126,8 +1126,8 @@ function PeerProfileCard({ peer, copied, refreshing, onCopy, onClose }: { peer: 
   ];
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/50 px-4">
-      <div className="w-full rounded-xl border border-gray-600 bg-gray-800 p-4 shadow-2xl">
+    <div className="sidebar-overlay absolute inset-0 z-50 flex items-center justify-center bg-black/50 px-4">
+      <div className="peer-profile-card w-full rounded-xl border border-gray-600 bg-gray-800 p-4 shadow-2xl">
         <div className="mb-4 flex items-center gap-3">
           <AvatarPreviewTrigger name={peer.username} src={peer.avatar_path} size="xl" online={peer.online} />
           <div className="min-w-0 flex-1">
@@ -1137,7 +1137,7 @@ function PeerProfileCard({ peer, copied, refreshing, onCopy, onClose }: { peer: 
           <button
             type="button"
             onClick={onClose}
-            className="flex-shrink-0 w-7 h-7 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 flex items-center justify-center"
+            className="sidebar-secondary-action flex-shrink-0 w-7 h-7 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 flex items-center justify-center"
             aria-label="关闭"
           >
             ×
@@ -1186,21 +1186,21 @@ function GroupItem({ group, isSelected, onSelect }: { group: GroupInfo; isSelect
     <div className={`sidebar-list-item flex items-stretch ${isSelected ? "sidebar-list-item-active bg-indigo-600/20 border-l-2 border-indigo-400" : "border-l-2 border-transparent hover:bg-gray-800"}`}>
       <button onClick={onSelect} className="flex-1 min-w-0 text-left px-4 py-3 flex items-center gap-3">
         <div className="relative flex-shrink-0">
-          <div className="w-9 h-9 rounded-full bg-indigo-700 flex items-center justify-center text-base">👥</div>
+          <div className="sidebar-group-avatar w-9 h-9 rounded-full bg-indigo-700 flex items-center justify-center text-base">👥</div>
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <p className="text-sm font-medium truncate flex-1">{group.name}</p>
-            <span className="text-[10px] text-gray-500 flex-shrink-0">{time}</span>
+            <p className="sidebar-item-title text-sm font-medium truncate flex-1">{group.name}</p>
+            <span className="sidebar-item-meta text-[10px] text-gray-500 flex-shrink-0">{time}</span>
           </div>
-          <p className="text-xs text-gray-400 truncate">
-            {sender ? <span className="text-gray-500">{sender}: </span> : null}
+          <p className="sidebar-item-subtitle text-xs text-gray-400 truncate">
+            {sender ? <span className="sidebar-item-meta text-gray-500">{sender}: </span> : null}
             {preview}
           </p>
-          <p className="text-[10px] text-gray-500 truncate">{group.members?.length || 0} 人</p>
+          <p className="sidebar-item-meta text-[10px] text-gray-500 truncate">{group.members?.length || 0} 人</p>
         </div>
         {unread > 0 && !isSelected && (
-          <div className="flex-shrink-0 w-5 h-5 rounded-full bg-red-500 flex items-center justify-center text-[10px] font-bold text-white">
+          <div className="sidebar-unread-badge flex-shrink-0 w-5 h-5 rounded-full bg-red-500 flex items-center justify-center text-[10px] font-bold text-white">
             {unread > 99 ? "99+" : unread}
           </div>
         )}

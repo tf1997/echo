@@ -9,11 +9,11 @@ export interface ThemeOption {
 
 export const THEMES: ThemeOption[] = [
   { id: "midnight", name: "星夜", preview: ["#101624", "#1f2937", "#6366f1"] },
-  { id: "daylight", name: "晨光", preview: ["#f3f7f8", "#ffffff", "#2f7f8a"] },
-  { id: "wechat", name: "微信", preview: ["#f8f9f8", "#d3d8d4", "#95e66a"] },
+  { id: "daylight", name: "晨光", preview: ["#f4f6f6", "#ffffff", "#53777d"] },
+  { id: "wechat", name: "微信", preview: ["#f7f8f7", "#ffffff", "#95e66a"] },
   { id: "aurora", name: "极光", preview: ["#071113", "#122224", "#5d918b"] },
   { id: "carbon", name: "曜石", preview: ["#0b0d10", "#20242a", "#9b7a4d"] },
-  { id: "plum", name: "梅影", preview: ["#101012", "#202023", "#d46a82"] },
+  { id: "plum", name: "梅影", preview: ["#101011", "#1f1f22", "#a96b78"] },
 ];
 
 const STORAGE_KEY = "echo.theme";

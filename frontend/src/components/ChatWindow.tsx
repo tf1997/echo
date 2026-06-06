@@ -1825,7 +1825,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
             setSearchIndex(0);
             setShowHistory(true);
           }}
-          className={`flex-shrink-0 h-8 px-2.5 rounded-lg flex items-center gap-1.5 text-xs hover:bg-gray-700 ${showHistory ? "bg-gray-700 text-white" : "text-gray-400 hover:text-white"}`}
+          className={`chat-header-action flex-shrink-0 h-8 px-2.5 rounded-lg flex items-center gap-1.5 text-xs hover:bg-gray-700 ${showHistory ? "chat-header-action-active bg-gray-700 text-white" : "text-gray-400 hover:text-white"}`}
           title="聊天记录"
         >
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1835,7 +1835,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         </button>
         <button
           onClick={() => { setShowHistory(false); setShowSearch((v) => !v); setSearchQuery(""); setSearchIndex(0); }}
-          className="flex-shrink-0 w-8 h-8 rounded-lg hover:bg-gray-700 flex items-center justify-center text-gray-400 hover:text-white"
+          className="chat-header-action flex-shrink-0 w-8 h-8 rounded-lg hover:bg-gray-700 flex items-center justify-center text-gray-400 hover:text-white"
           title="搜索消息"
         >
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1856,7 +1856,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                 return next;
               });
             }}
-            className={`flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-gray-700 ${showGroupPanel ? "bg-gray-700 text-white" : ""}`}
+            className={`chat-header-action flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-gray-700 ${showGroupPanel ? "chat-header-action-active bg-gray-700 text-white" : ""}`}
             title="群信息"
           >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1880,7 +1880,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       <>
       {showSearch && (() => {
         return (
-          <div className="flex items-center gap-2 px-4 py-2 bg-gray-900/60 border-b border-gray-700">
+          <div className="chat-search-bar flex items-center gap-2 px-4 py-2 bg-gray-900/60 border-b border-gray-700">
             <input
               autoFocus
               value={searchQuery}
@@ -1896,7 +1896,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                 if (e.key === "Escape") { setShowSearch(false); setSearchQuery(""); }
               }}
               placeholder="搜索消息..."
-              className="flex-1 bg-gray-700 text-white text-sm rounded-lg px-3 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-400"
+              className="chat-control-input flex-1 bg-gray-700 text-white text-sm rounded-lg px-3 py-1.5 outline-none focus:ring-1 focus:ring-indigo-500 placeholder-gray-400"
             />
             {searchQuery && (
               <span className="text-xs text-gray-400 flex-shrink-0">{totalSearchHits > 0 ? `${clampedSearchIndex + 1}/${totalSearchHits}` : "无结果"}</span>
@@ -1911,7 +1911,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         );
       })()}
 
-      <div ref={messagesContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto py-4">
+      <div ref={messagesContainerRef} onScroll={handleScroll} className="chat-message-list flex-1 overflow-y-auto py-4">
         {loadingMessages ? (
           <div className="flex flex-col items-center justify-center h-full text-gray-500">
             <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin mb-3" />
@@ -2030,18 +2030,18 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         <div ref={messagesEndRef} />
       </div>
       {selectMode && (
-        <div className="flex items-center gap-2 px-4 py-2.5 bg-gray-900 border-t border-gray-700">
+        <div className="chat-selection-bar flex items-center gap-2 px-4 py-2.5 bg-gray-900 border-t border-gray-700">
           <span className="text-sm text-gray-300 flex-1">已选 {selectedIds.size} 条</span>
           <button onClick={exitSelectMode} className="px-3 py-1.5 text-sm text-gray-400 hover:text-white rounded-lg hover:bg-gray-700">取消</button>
           <button
             disabled={selectedIds.size === 0}
             onClick={() => openForwardModal("individual")}
-            className="px-3 py-1.5 text-sm bg-gray-700 hover:bg-gray-600 text-white rounded-lg disabled:opacity-40"
+            className="sidebar-secondary-action px-3 py-1.5 text-sm bg-gray-700 hover:bg-gray-600 text-white rounded-lg disabled:opacity-40"
           >逐条转发</button>
           <button
             disabled={selectedIds.size === 0}
             onClick={() => openForwardModal("merged")}
-            className="px-3 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg disabled:opacity-40"
+            className="sidebar-primary-action px-3 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg disabled:opacity-40"
           >合并转发</button>
         </div>
       )}
@@ -2058,8 +2058,8 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
 
       <div className="chat-composer px-4 py-3 border-t border-gray-700 bg-gray-900/50">
         {screenshotDraft && (
-          <div className="mb-2 flex items-center gap-2">
-            <div className="relative w-24 h-16 rounded-lg border border-gray-600 bg-gray-800 overflow-hidden">
+          <div className="composer-preview mb-2 flex items-center gap-2">
+            <div className="composer-preview-thumb relative w-24 h-16 rounded-lg border border-gray-600 bg-gray-800 overflow-hidden">
               <img src={screenshotDraft.url} alt="截图" className="w-full h-full object-contain" />
               <button
                 type="button"
@@ -2098,7 +2098,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                 </svg>
               </button>
             {showEmoji && (
-              <div className="absolute bottom-full left-0 mb-2 bg-gray-800 border border-gray-600 rounded-xl shadow-2xl z-50 w-80 overflow-hidden">
+              <div className="composer-popover composer-emoji-popover absolute bottom-full left-0 mb-2 bg-gray-800 border border-gray-600 rounded-xl shadow-2xl z-50 w-80 overflow-hidden">
                 <div className="p-3">
                   {emojiTab === "custom" ? (
                     <>
@@ -2324,8 +2324,8 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     </div>
     {/* Group info panel */}
     {isGroup && showGroupPanel && groupInfo && (
-      <div className="w-72 flex-shrink-0 bg-gray-900 border-l border-gray-700 flex flex-col h-full overflow-y-auto">
-        <div className="px-4 py-3 border-b border-gray-700 flex items-center justify-between">
+      <div className="group-panel w-72 flex-shrink-0 bg-gray-900 border-l border-gray-700 flex flex-col h-full overflow-y-auto">
+        <div className="group-panel-header px-4 py-3 border-b border-gray-700 flex items-center justify-between">
           <span className="text-sm font-semibold text-white">群信息</span>
           <button onClick={() => setShowGroupPanel(false)} className="text-gray-500 hover:text-gray-300 text-lg leading-none">×</button>
         </div>
@@ -2347,12 +2347,12 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                   setGroupNameEdit(e.target.value);
                   if (groupPanelError) setGroupPanelError("");
                 }}
-                className="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200 outline-none focus:border-indigo-500"
+                className="chat-control-input flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200 outline-none focus:border-indigo-500"
               />
               <button
                 onClick={handleRenameGroup}
                 disabled={!!groupActionBusy || !groupNameEdit.trim() || groupNameEdit.trim() === groupInfo.name}
-                className="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 rounded text-white"
+                className="sidebar-primary-action px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 rounded text-white"
               >{groupActionBusy === "rename" ? "保存中" : "保存"}</button>
             </div>
             <p className="mt-1 text-[10px] text-gray-500">{groupNameEdit.length}/50</p>
@@ -2379,14 +2379,14 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                 value={groupMemberQuery}
                 onChange={(e) => setGroupMemberQuery(e.target.value)}
                 placeholder="搜索成员、部门或状态"
-                className="w-full bg-gray-800 border border-gray-600 rounded-lg pl-8 pr-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500 placeholder-gray-500"
+                className="chat-control-input w-full bg-gray-800 border border-gray-600 rounded-lg pl-8 pr-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500 placeholder-gray-500"
               />
             </div>
             <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
               {visibleGroupMembers.map((m) => {
                 const displayName = m.peer_id === myId ? (myName || m.username || "我") : (m.username || m.peer_id);
                 return (
-                  <div key={m.peer_id} className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-gray-800/70">
+                  <div key={m.peer_id} className="group-panel-row flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-gray-800/70">
                     <AvatarPreviewTrigger name={displayName} src={m.avatar_path} size="xs" online={m.peer_id === myId || m.is_online} />
                     <div className="flex-1 min-w-0">
                       <p className="text-xs text-gray-200 truncate" title={displayName}>{displayName}{m.peer_id === myId ? " (我)" : ""}</p>
@@ -2419,7 +2419,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                 onChange={(e) => setGroupInviteQuery(e.target.value)}
                 disabled={!!groupActionBusy || inviteCandidates.length === 0}
                 placeholder={inviteCandidates.length === 0 ? "没有可邀请联系人" : "搜索联系人、部门或地址"}
-                className="w-full bg-gray-800 border border-gray-600 rounded-lg pl-8 pr-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500 placeholder-gray-500 disabled:opacity-50"
+                className="chat-control-input w-full bg-gray-800 border border-gray-600 rounded-lg pl-8 pr-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500 placeholder-gray-500 disabled:opacity-50"
               />
             </div>
             <div className="max-h-44 overflow-y-auto space-y-1 pr-1">
@@ -2429,7 +2429,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                   type="button"
                   onClick={() => handleInviteMember(candidate.id)}
                   disabled={!!groupActionBusy}
-                  className="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-gray-800 disabled:opacity-50"
+                  className="group-panel-row w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-gray-800 disabled:opacity-50"
                 >
                   <Avatar name={candidate.username} src={candidate.avatar_path} size="xs" online={candidate.online} />
                   <div className="flex-1 min-w-0">
