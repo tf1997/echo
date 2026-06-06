@@ -614,6 +614,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const [emojiTab, setEmojiTab] = useState<"default" | "custom">("default");
   const [customEmojis, setCustomEmojis] = useState<string[]>([]);
   const [deletingEmoji, setDeletingEmoji] = useState<string | null>(null);
+  const [showScreenshotOptions, setShowScreenshotOptions] = useState(false);
   const [capturingScreenshot, setCapturingScreenshot] = useState(false);
   const [hideWindowForScreenshot, setHideWindowForScreenshot] = useState(getInitialHideWindowForScreenshot);
   const [screenshotDraft, setScreenshotDraft] = useState<ScreenshotDraft | null>(null);
@@ -645,6 +646,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const pendingJumpMessageIdRef = useRef<number | null>(null);
   const contextHighlightTimerRef = useRef<number | null>(null);
   const captureScreenshotRef = useRef<(() => void) | null>(null);
+  const screenshotOptionsRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     return () => {
@@ -790,6 +792,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const dragResetTimerRef = useRef<number | null>(null);
   const nudgeTimerRef = useRef<number | null>(null);
   const nudgeCooldownUntilRef = useRef(new Map<string, number>());
+  const nudgeSendingRef = useRef(false);
   const rpsSendingRef = useRef(false);
   const nearBottomRef = useRef(true);
   const composerCaretOffsetRef = useRef(0);
@@ -968,6 +971,17 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     document.addEventListener("mousedown", handlePointerDown);
     return () => document.removeEventListener("mousedown", handlePointerDown);
   }, [showEmoji]);
+
+  useEffect(() => {
+    if (!showScreenshotOptions) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!screenshotOptionsRef.current?.contains(event.target as Node)) {
+        setShowScreenshotOptions(false);
+      }
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [showScreenshotOptions]);
 
   useEffect(() => {
     if (!nudgeSignal) return;
@@ -1194,7 +1208,15 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   }, [peer, isGroup, onSendSticker, updatePendingMessagesForKey]);
 
   const sendNudge = useCallback(async () => {
-    if (!peer || nudgeSending) return;
+    if (!peer || nudgeSendingRef.current) return;
+    if (!isGroup && !peer.online) {
+      await showDialogMessage("对方离线，不能发送抖一抖", {
+        title: "抖一抖不可用",
+        type: "info",
+        okLabel: "确定",
+      }).catch(() => {});
+      return;
+    }
     const now = Date.now();
     const cooldownUntil = nudgeCooldownUntilRef.current.get(pendingConversationKey) ?? 0;
     if (cooldownUntil > now) {
@@ -1202,23 +1224,28 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       return;
     }
 
+    nudgeSendingRef.current = true;
     setNudgeSending(true);
     nearBottomRef.current = true;
+    playNudgeAnimation();
+    const nextCooldownUntil = now + NUDGE_COOLDOWN_MS;
+    nudgeCooldownUntilRef.current.set(pendingConversationKey, nextCooldownUntil);
+    setNudgeCooldownRemainingMs(NUDGE_COOLDOWN_MS);
     try {
       await onSendNudge();
-      const nextCooldownUntil = Date.now() + NUDGE_COOLDOWN_MS;
-      nudgeCooldownUntilRef.current.set(pendingConversationKey, nextCooldownUntil);
-      setNudgeCooldownRemainingMs(NUDGE_COOLDOWN_MS);
     } catch (error) {
+      nudgeCooldownUntilRef.current.delete(pendingConversationKey);
+      setNudgeCooldownRemainingMs(0);
       await showDialogMessage(String(error || "抖一抖发送失败"), {
         title: "抖一抖失败",
         type: "error",
         okLabel: "确定",
       }).catch(() => {});
     } finally {
+      nudgeSendingRef.current = false;
       setNudgeSending(false);
     }
-  }, [nudgeSending, onSendNudge, peer, pendingConversationKey]);
+  }, [isGroup, onSendNudge, peer, pendingConversationKey, playNudgeAnimation]);
 
   const sendRps = useCallback(async (move: RpsMove) => {
     if (!peer || isGroup || rpsSendingRef.current) return;
@@ -1739,8 +1766,13 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     ? `group:${groupId ?? peer.id}`
     : `contact:${peer.ip && peer.port ? `${peer.ip}:${peer.port}` : peer.id}`;
   const nudgeCooldownSeconds = Math.ceil(nudgeCooldownRemainingMs / 1000);
-  const nudgeDisabled = nudgeSending || nudgeCooldownSeconds > 0;
-  const nudgeTitle = nudgeCooldownSeconds > 0 ? `抖一抖冷却中（${nudgeCooldownSeconds} 秒）` : "抖一抖";
+  const nudgeUnavailableOffline = !isGroup && !peer.online;
+  const nudgeDisabled = nudgeUnavailableOffline || nudgeSending || nudgeCooldownSeconds > 0;
+  const nudgeTitle = nudgeUnavailableOffline
+    ? "对方离线，不能发送抖一抖"
+    : nudgeCooldownSeconds > 0
+      ? `抖一抖冷却中（${nudgeCooldownSeconds} 秒）`
+      : "抖一抖";
 
   return (
     <div className="flex-1 flex h-full min-w-0">
@@ -2047,13 +2079,26 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
             </div>
           </div>
         )}
-        <div className="flex items-end gap-2">
-          <div ref={emojiPopoverRef} className="relative flex-shrink-0">
-            <button onClick={() => setShowEmoji(!showEmoji)} className="w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center" title="表情">
-              <span className="text-lg">😀</span>
-            </button>
+        <div className="composer-toolbar mb-2 flex items-center">
+          <div className="flex items-center gap-1.5">
+            <div ref={emojiPopoverRef} className="relative flex-shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowScreenshotOptions(false);
+                  setShowEmoji(!showEmoji);
+                }}
+                className="composer-tool-button h-8 w-8 rounded-md transition-colors flex items-center justify-center"
+                title="表情"
+                aria-label="表情"
+              >
+                <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <circle cx="12" cy="12" r="9" strokeWidth={1.8} />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M8.5 10h.01M15.5 10h.01M8.8 14.3a4.6 4.6 0 006.4 0" />
+                </svg>
+              </button>
             {showEmoji && (
-              <div className="absolute bottom-full right-0 mb-2 bg-gray-800 border border-gray-600 rounded-xl shadow-2xl z-50 w-80 overflow-hidden">
+              <div className="absolute bottom-full left-0 mb-2 bg-gray-800 border border-gray-600 rounded-xl shadow-2xl z-50 w-80 overflow-hidden">
                 <div className="p-3">
                   {emojiTab === "custom" ? (
                     <>
@@ -2141,123 +2186,138 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                 </div>
               </div>
             )}
-          </div>
-          <button
-            type="button"
-            onClick={sendNudge}
-            disabled={nudgeDisabled}
-            className="composer-tool-button relative flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:hover:bg-gray-700 transition-colors flex items-center justify-center"
-            title={nudgeTitle}
-            aria-label="抖一抖"
-          >
-            <svg className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M9 4h6a2 2 0 012 2v12a2 2 0 01-2 2H9a2 2 0 01-2-2V6a2 2 0 012-2z" />
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M4 8l-2 2 2 2M20 8l2 2-2 2M4 14l-2 2 2 2M20 14l2 2-2 2" />
-            </svg>
-            {nudgeCooldownSeconds > 0 ? (
-              <span className="absolute -right-1 -top-1 min-w-4 h-4 px-1 rounded-full border border-gray-600 bg-gray-900 text-[10px] leading-4 text-gray-300">
-                {nudgeCooldownSeconds}
-              </span>
-            ) : null}
-          </button>
-          {!isGroup && (
+            </div>
             <button
               type="button"
-              onClick={() => {
-                setShowEmoji(false);
-                sendRandomRps();
-              }}
-              disabled={rpsSending}
-              className="composer-tool-button flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:hover:bg-gray-700 transition-colors flex items-center justify-center"
-              title="猜拳"
-              aria-label="猜拳"
+              onClick={handlePickFile}
+              className="composer-tool-button h-8 w-8 rounded-md transition-colors flex items-center justify-center"
+              title="发送文件"
+              aria-label="发送文件"
             >
-              <svg className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M8 8h8M7 12h10M9 16h6" />
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M5 5a7 7 0 0114 0M5 19a7 7 0 0014 0" />
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M4.5 7.5h6l1.5 2h7.5v7.5a2 2 0 01-2 2h-13a2 2 0 01-2-2v-7.5a2 2 0 012-2z" />
               </svg>
             </button>
-          )}
-          <div className="relative flex flex-shrink-0 items-center">
+            <div ref={screenshotOptionsRef} className="relative flex-shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowEmoji(false);
+                  void captureScreenshot();
+                }}
+                disabled={capturingScreenshot}
+                className="composer-tool-button h-8 w-8 rounded-md transition-colors flex items-center justify-center disabled:opacity-50"
+                title={screenshotButtonTitle}
+                aria-label={screenshotButtonTitle}
+              >
+                <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M4 5l16 14M8 9.5l-3.2 3.2a2 2 0 103 2.6l3.2-3.2M16 14.5l3.2-3.2a2 2 0 10-3-2.6L12.9 12" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setShowEmoji(false);
+                  setShowScreenshotOptions((prev) => !prev);
+                }}
+                className={`composer-tool-caret ${hideWindowForScreenshot ? "screenshot-hide-toggle-active" : ""}`}
+                title={screenshotHideButtonTitle}
+                aria-label="截图设置"
+                aria-expanded={showScreenshotOptions}
+              >
+                <svg className="h-2.5 w-2.5" fill="none" viewBox="0 0 12 12" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M3 5l3 3 3-3" />
+                </svg>
+              </button>
+              {showScreenshotOptions && (
+                <div className="composer-popover absolute bottom-full left-0 z-50 mb-2 w-56 rounded-lg border p-2 shadow-2xl">
+                  <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={hideWindowForScreenshot}
+                      onChange={(event) => setHideWindowForScreenshot(event.target.checked)}
+                      className="h-3.5 w-3.5"
+                    />
+                    <span className="flex-1">截图时隐藏当前窗口</span>
+                  </label>
+                  <div className="px-2 pt-1 text-[10px] text-gray-500">{SCREENSHOT_SHORTCUT}</div>
+                </div>
+              )}
+            </div>
             <button
               type="button"
-              onClick={captureScreenshot}
-              disabled={capturingScreenshot}
-              className="composer-tool-button flex-shrink-0 w-10 h-10 rounded-xl rounded-r-none bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:hover:bg-gray-700 transition-colors flex items-center justify-center"
-              title={screenshotButtonTitle}
-              aria-label={screenshotButtonTitle}
+              onClick={sendNudge}
+              disabled={nudgeDisabled}
+              className="composer-tool-button relative h-8 w-8 rounded-md transition-colors flex items-center justify-center disabled:opacity-50"
+              title={nudgeTitle}
+              aria-label={nudgeTitle}
             >
-              <svg className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M5 7a2 2 0 012-2h10a2 2 0 012 2v7a2 2 0 01-2 2H7a2 2 0 01-2-2V7z" />
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M9 20h6M12 16v4M8 9h3M8 12h2" />
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M9 4h6a2 2 0 012 2v12a2 2 0 01-2 2H9a2 2 0 01-2-2V6a2 2 0 012-2z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M4 8l-2 2 2 2M20 8l2 2-2 2M4 14l-2 2 2 2M20 14l2 2-2 2" />
               </svg>
+              {nudgeCooldownSeconds > 0 ? (
+                <span className="absolute -right-1 -top-1 min-w-4 h-4 px-1 rounded-full border border-gray-600 bg-gray-900 text-[10px] leading-4 text-gray-300">
+                  {nudgeCooldownSeconds}
+                </span>
+              ) : null}
             </button>
-            <button
-              type="button"
-              onClick={() => setHideWindowForScreenshot((prev) => !prev)}
-              className={`composer-tool-button screenshot-hide-toggle flex-shrink-0 h-10 w-7 rounded-xl rounded-l-none border-l border-gray-600 bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center ${hideWindowForScreenshot ? "screenshot-hide-toggle-active" : ""}`}
-              title={screenshotHideButtonTitle}
-              aria-label={screenshotHideButtonTitle}
-              aria-pressed={hideWindowForScreenshot}
-            >
-              <svg className="w-4 h-4 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                {hideWindowForScreenshot ? (
-                  <>
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M3 3l18 18" />
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M10.6 10.7a2 2 0 002.7 2.7" />
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M9.4 5.3A9.8 9.8 0 0112 5c5 0 8.7 4.2 10 7a13 13 0 01-2.1 3.1M6.5 6.9C4.4 8.2 2.9 10.2 2 12c1.3 2.8 5 7 10 7 1.1 0 2.1-.2 3.1-.5" />
-                  </>
-                ) : (
-                  <>
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M2 12c1.3-2.8 5-7 10-7s8.7 4.2 10 7c-1.3 2.8-5 7-10 7s-8.7-4.2-10-7z" />
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12 9a3 3 0 100 6 3 3 0 000-6z" />
-                  </>
-                )}
-              </svg>
-            </button>
-          </div>
-          <button onClick={handlePickFile} className="composer-tool-button flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center" title="发送文件">
-            <svg className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
-            </svg>
-          </button>
-          <input ref={fileInputRef} type="file" onChange={handleFileChange} style={{ position: "absolute", left: "-9999px", top: "-9999px" }} multiple />
-          <div className="relative flex-1">
-            {!inputText && (
-              <div className="composer-placeholder pointer-events-none absolute left-4 top-2.5 text-sm text-gray-400">
-                {peer.online ? `发送消息给 ${peer.username}...` : "对方离线，消息将在上线后发送"}
-              </div>
+            {!isGroup && (
+              <button
+                type="button"
+                onClick={() => {
+                  setShowEmoji(false);
+                  sendRandomRps();
+                }}
+                disabled={rpsSending}
+                className="composer-tool-button h-8 w-8 rounded-md transition-colors flex items-center justify-center disabled:opacity-50"
+                title="猜拳"
+                aria-label="猜拳"
+              >
+                <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M8 8h8M7 12h10M9 16h6" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M5 5a7 7 0 0114 0M5 19a7 7 0 0014 0" />
+                </svg>
+              </button>
             )}
-            <div
-              ref={inputRef}
-              contentEditable
-              suppressContentEditableWarning
-              role="textbox"
-              aria-multiline="true"
-              aria-label={peer.online ? `发送消息给 ${peer.username}` : "对方离线，消息将在上线后发送"}
-              onInput={() => updateComposerFromDom()}
-              onKeyDown={handleKeyDown}
-              onPaste={handlePaste}
-              onBlur={rememberComposerCaret}
-              onMouseUp={rememberComposerCaret}
-              onKeyUp={rememberComposerCaret}
-              onCompositionStart={() => { composerComposingRef.current = true; }}
-              onCompositionEnd={() => {
-                composerComposingRef.current = false;
-                updateComposerFromDom(true);
-              }}
-              className="composer-input flex-1 bg-gray-700 text-white text-sm rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-indigo-500"
-            />
           </div>
-          <button onClick={sendText} disabled={!inputText.trim() && !screenshotDraft}
-            className="flex-shrink-0 w-10 h-10 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:hover:bg-indigo-600 transition-colors flex items-center justify-center"
+        </div>
+        <div className="composer-editor relative">
+          <input ref={fileInputRef} type="file" onChange={handleFileChange} style={{ position: "absolute", left: "-9999px", top: "-9999px" }} multiple />
+          {!inputText && (
+            <div className="composer-placeholder pointer-events-none absolute left-0 top-1 text-sm text-gray-400">
+              {peer.online ? `发送消息给 ${peer.username}...` : "对方离线，消息将在上线后发送"}
+            </div>
+          )}
+          <div
+            ref={inputRef}
+            contentEditable
+            suppressContentEditableWarning
+            role="textbox"
+            aria-multiline="true"
+            aria-label={peer.online ? `发送消息给 ${peer.username}` : "对方离线，消息将在上线后发送"}
+            onInput={() => updateComposerFromDom()}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+            onBlur={rememberComposerCaret}
+            onMouseUp={rememberComposerCaret}
+            onKeyUp={rememberComposerCaret}
+            onCompositionStart={() => { composerComposingRef.current = true; }}
+            onCompositionEnd={() => {
+              composerComposingRef.current = false;
+              updateComposerFromDom(true);
+            }}
+            className="composer-input w-full bg-transparent text-white text-sm outline-none"
+          />
+          <button
+            onClick={sendText}
+            disabled={!inputText.trim() && !screenshotDraft}
+            className="composer-send-button absolute bottom-0 right-0 rounded-md bg-indigo-600 px-5 py-1.5 text-sm text-white hover:bg-indigo-500 disabled:opacity-40 disabled:hover:bg-indigo-600 transition-colors"
           >
-            <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-            </svg>
+            发送(S)
           </button>
         </div>
-        <p className="text-[10px] text-gray-600 mt-1.5 ml-1">Enter 发送 · Shift+Enter 换行 · Ctrl+V 粘贴图片 · 拖拽/📎 发送文件</p>
       </div>
       </>
       )}

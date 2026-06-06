@@ -835,7 +835,16 @@ pub async fn send_message_typed(
     };
 
     let discovery = runtime.discovery.read().await;
-    let peer = if let Some(peer) = discovery.get_peer(&peer_id) {
+    let discovered_peer = discovery.get_peer(&peer_id);
+    if msg_type == "nudge"
+        && !discovered_peer
+            .as_ref()
+            .map(|peer| peer.online)
+            .unwrap_or(false)
+    {
+        return Err("对方离线，不能发送抖一抖".to_string());
+    }
+    let peer = if let Some(peer) = discovered_peer {
         peer
     } else if let Some(stored_peer) = state
         .db
@@ -1694,7 +1703,7 @@ fn capture_screenshot_impl() -> Result<ScreenshotData, String> {
     use std::mem::{size_of, zeroed};
     use windows_sys::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-        GetDIBits, ReleaseDC, SelectObject, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
         HGDIOBJ, SRCCOPY,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -1819,7 +1828,160 @@ fn capture_screenshot_impl() -> Result<ScreenshotData, String> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn capture_screenshot_impl() -> Result<ScreenshotData, String> {
+    let path = screenshot_temp_path("png");
+    let output = std::process::Command::new("screencapture")
+        .args(["-x", "-t", "png"])
+        .arg(&path)
+        .output()
+        .map_err(|e| format!("无法启动 macOS 截图命令 screencapture：{e}"))?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&path);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            "请确认已在系统设置中授予 Echo 屏幕录制权限".to_string()
+        } else {
+            stderr
+        };
+        return Err(format!("macOS 截图失败：{detail}"));
+    }
+
+    read_png_screenshot_file(&path, 0, 0)
+}
+
+#[cfg(target_os = "linux")]
+fn capture_screenshot_impl() -> Result<ScreenshotData, String> {
+    struct ScreenshotCommand {
+        program: &'static str,
+        args_before_path: &'static [&'static str],
+    }
+
+    const COMMANDS: &[ScreenshotCommand] = &[
+        ScreenshotCommand {
+            program: "grim",
+            args_before_path: &[],
+        },
+        ScreenshotCommand {
+            program: "gnome-screenshot",
+            args_before_path: &["-f"],
+        },
+        ScreenshotCommand {
+            program: "spectacle",
+            args_before_path: &["-b", "-n", "-o"],
+        },
+        ScreenshotCommand {
+            program: "maim",
+            args_before_path: &[],
+        },
+        ScreenshotCommand {
+            program: "scrot",
+            args_before_path: &[],
+        },
+        ScreenshotCommand {
+            program: "import",
+            args_before_path: &["-window", "root"],
+        },
+        ScreenshotCommand {
+            program: "flameshot",
+            args_before_path: &["full", "-p"],
+        },
+    ];
+
+    let path = screenshot_temp_path("png");
+    let mut failures = Vec::new();
+
+    for command in COMMANDS {
+        let _ = std::fs::remove_file(&path);
+        let output = std::process::Command::new(command.program)
+            .args(command.args_before_path)
+            .arg(&path)
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => match read_png_screenshot_file(&path, 0, 0) {
+                Ok(screenshot) => return Ok(screenshot),
+                Err(err) => failures.push(format!("{} 输出无效：{}", command.program, err)),
+            },
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if stderr.is_empty() {
+                    failures.push(format!(
+                        "{} 退出码 {:?}",
+                        command.program,
+                        output.status.code()
+                    ));
+                } else {
+                    failures.push(format!("{}：{}", command.program, stderr));
+                }
+            }
+            Err(err) => failures.push(format!("{}：{}", command.program, err)),
+        }
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".to_string());
+    Err(format!(
+        "Linux 截图失败。当前会话：{session_type}。请安装 grim、gnome-screenshot、spectacle、maim、scrot、ImageMagick import 或 flameshot 之一；Wayland 环境可能还需要桌面门户授权。尝试结果：{}",
+        failures.join("；")
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn screenshot_temp_path(ext: &str) -> std::path::PathBuf {
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    std::env::temp_dir().join(format!(
+        "echo-screenshot-{}-{}.{}",
+        std::process::id(),
+        timestamp,
+        ext
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn read_png_screenshot_file(path: &Path, x: i32, y: i32) -> Result<ScreenshotData, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("无法读取截图文件：{e}"))?;
+    let _ = std::fs::remove_file(path);
+    let (width, height) = png_dimensions(&bytes)?;
+    Ok(ScreenshotData {
+        base64: base64_encode_std(&bytes),
+        mime: "image/png".to_string(),
+        width,
+        height,
+        x,
+        y,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn png_dimensions(bytes: &[u8]) -> Result<(i32, i32), String> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 24 || !bytes.starts_with(PNG_SIGNATURE) {
+        return Err("截图文件不是有效 PNG".to_string());
+    }
+
+    let width = u32::from_be_bytes(
+        bytes[16..20]
+            .try_into()
+            .map_err(|_| "无法读取 PNG 宽度".to_string())?,
+    );
+    let height = u32::from_be_bytes(
+        bytes[20..24]
+            .try_into()
+            .map_err(|_| "无法读取 PNG 高度".to_string())?,
+    );
+
+    if width == 0 || height == 0 {
+        return Err("截图尺寸无效".to_string());
+    }
+
+    let width = i32::try_from(width).map_err(|_| "截图宽度过大".to_string())?;
+    let height = i32::try_from(height).map_err(|_| "截图高度过大".to_string())?;
+    Ok((width, height))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 fn capture_screenshot_impl() -> Result<ScreenshotData, String> {
     Err("当前平台暂不支持直接截取整个屏幕".to_string())
 }

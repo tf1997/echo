@@ -885,17 +885,16 @@ function App() {
     if (selectedGroupId) {
       const msg = await sendGroupMessageTyped(selectedGroupId, NUDGE_MESSAGE_CONTENT, MESSAGE_TYPE_NUDGE, clientMsgId);
       setMessages((prev) => mergeMessageIntoList(prev, msg));
-      triggerNudge("group", selectedGroupId);
       listGroups().then(setGroups).catch(console.error);
       return msg;
     }
     if (!selectedPeer) throw new Error("未选择联系人");
+    if (!selectedPeer.online) throw new Error("对方离线，不能发送抖一抖");
     const sent = await sendMessageTyped(selectedPeer.id, NUDGE_MESSAGE_CONTENT, MESSAGE_TYPE_NUDGE, clientMsgId);
     setMessages((prev) => mergeMessageIntoList(prev, sent));
-    triggerNudge("contact", selectedPeer.id);
     setRecentRefreshKey((key) => key + 1);
     return sent;
-  }, [selectedGroupId, selectedPeer, triggerNudge]);
+  }, [selectedGroupId, selectedPeer]);
 
   const handleSendRps = useCallback(async (move: RpsMove, clientMsgId?: string) => {
     if (selectedGroupId) throw new Error("群聊暂不支持猜拳");

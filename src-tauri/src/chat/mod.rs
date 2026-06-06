@@ -1410,6 +1410,9 @@ impl ChatServer {
         let delivered = match self.send_wire_message(peer, &msg).await {
             Ok(()) => true,
             Err(err) => {
+                if msg_type == "nudge" {
+                    return Err(anyhow::anyhow!("对方离线，不能发送抖一抖"));
+                }
                 warn!(
                     "Direct message delivery to {} failed, queueing for later: {}",
                     peer.id, err
