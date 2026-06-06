@@ -1,6 +1,6 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { emit } from "@tauri-apps/api/event";
-import { WebviewWindow, appWindow, LogicalPosition, LogicalSize } from "@tauri-apps/api/window";
+import { WebviewWindow, appWindow, PhysicalPosition, PhysicalSize } from "@tauri-apps/api/window";
 import { captureScreenshotNative } from "../api";
 
 const ANNOTATION_COLOR = "#ef4444";
@@ -196,6 +196,7 @@ export function ScreenshotOverlay() {
   const surfaceRef = useRef<HTMLDivElement>(null);
   const textInputRef = useRef<HTMLInputElement>(null);
   const startedRef = useRef(false);
+  const selectionDragMovedRef = useRef(false);
 
   useEffect(() => {
     if (startedRef.current) return;
@@ -212,8 +213,19 @@ export function ScreenshotOverlay() {
         await appWindow.setDecorations(false);
         await appWindow.setAlwaysOnTop(true);
         await appWindow.setResizable(false);
-        await appWindow.setSize(new LogicalSize(screenshot.width, screenshot.height));
-        await appWindow.setPosition(new LogicalPosition(screenshot.x, screenshot.y));
+        await appWindow.setSize(new PhysicalSize(screenshot.width, screenshot.height));
+        await appWindow.setPosition(new PhysicalPosition(screenshot.x, screenshot.y));
+        const scaleFactor = await appWindow.scaleFactor().catch(() => window.devicePixelRatio || 1);
+        const screenWidth = Math.round(window.screen.width * scaleFactor);
+        const screenHeight = Math.round(window.screen.height * scaleFactor);
+        const matchesPrimaryScreen =
+          screenshot.x === 0 &&
+          screenshot.y === 0 &&
+          Math.abs(screenshot.width - screenWidth) <= 3 &&
+          Math.abs(screenshot.height - screenHeight) <= 3;
+        if (matchesPrimaryScreen) {
+          await appWindow.setFullscreen(true).catch(() => {});
+        }
         await appWindow.show();
         await appWindow.setFocus();
 
@@ -222,7 +234,12 @@ export function ScreenshotOverlay() {
           imageUrl: objectUrl,
           naturalWidth: screenshot.width || 1,
           naturalHeight: screenshot.height || 1,
-          selection: null,
+          selection: {
+            x: 0,
+            y: 0,
+            width: screenshot.width || 1,
+            height: screenshot.height || 1,
+          },
           dragging: false,
           startX: 0,
           startY: 0,
@@ -320,6 +337,7 @@ export function ScreenshotOverlay() {
     const point = getPoint(event);
     if (!point) return;
     event.currentTarget.setPointerCapture(event.pointerId);
+    selectionDragMovedRef.current = false;
 
     if (canAnnotate) {
       const clamped = clampToSelection(point);
@@ -345,9 +363,8 @@ export function ScreenshotOverlay() {
       dragging: true,
       startX: point.x,
       startY: point.y,
-      selection: { x: point.x, y: point.y, width: 0, height: 0 },
+      selection: prev.selection ?? { x: point.x, y: point.y, width: 0, height: 0 },
     } : prev);
-    setAnnotations([]);
     setDraftAnnotation(null);
     setToolMode("select");
   }, [canAnnotate, clampToSelection, commitTextDraft, getPoint, toolMode]);
@@ -377,13 +394,21 @@ export function ScreenshotOverlay() {
 
     setCrop((prev) => {
       if (!prev?.dragging) return prev;
+      const width = Math.abs(point.x - prev.startX);
+      const height = Math.abs(point.y - prev.startY);
+      if (width < 2 || height < 2) return prev;
+      if (!selectionDragMovedRef.current) {
+        selectionDragMovedRef.current = true;
+        setAnnotations([]);
+        setTextDraft(null);
+      }
       return {
         ...prev,
         selection: {
           x: Math.min(prev.startX, point.x),
           y: Math.min(prev.startY, point.y),
-          width: Math.abs(point.x - prev.startX),
-          height: Math.abs(point.y - prev.startY),
+          width,
+          height,
         },
       };
     });
@@ -408,13 +433,19 @@ export function ScreenshotOverlay() {
       return;
     }
 
+    const selectionMoved = selectionDragMovedRef.current;
+    selectionDragMovedRef.current = false;
     setCrop((prev) => prev ? { ...prev, dragging: false } : prev);
-    setToolMode((prev) => prev === "select" ? "pen" : prev);
+    if (selectionMoved) {
+      setToolMode((prev) => prev === "select" ? "pen" : prev);
+    }
   }, [draftAnnotation, drawing]);
 
   const confirmSelection = useCallback(async () => {
-    if (!crop?.selection || !hasSelection) return;
-    const selection = crop.selection;
+    if (!crop) return;
+    const selection = crop.selection && hasSelection
+      ? crop.selection
+      : { x: 0, y: 0, width: crop.naturalWidth, height: crop.naturalHeight };
     const cropWidth = Math.max(1, Math.round(selection.width));
     const cropHeight = Math.max(1, Math.round(selection.height));
     const cropX = Math.round(selection.x);
@@ -573,6 +604,10 @@ export function ScreenshotOverlay() {
           onPointerMove={updateSelection}
           onPointerUp={endSelection}
           onPointerCancel={endSelection}
+          onDoubleClick={(event) => {
+            event.preventDefault();
+            void confirmSelection();
+          }}
         >
           <img src={crop.imageUrl} alt="" className="absolute inset-0 h-full w-full pointer-events-none" draggable={false} />
           {selectionStyle && (

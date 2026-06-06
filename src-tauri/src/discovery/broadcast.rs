@@ -1,3 +1,4 @@
+use chrono::{Local, Timelike};
 use log::{debug, info, warn};
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -13,14 +14,53 @@ use std::time::Duration;
 use super::peer::{Peer, PeerEntry};
 
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 42);
-const ANNOUNCE_INTERVAL_SECS: u64 = 3;
+const QUIET_START_HOUR: u32 = 21;
+const QUIET_END_HOUR: u32 = 9;
+const ANNOUNCE_BURST_COUNT: u8 = 3;
+const ANNOUNCE_BURST_DELAY_MIN_SECS: u64 = 4;
+const ANNOUNCE_BURST_DELAY_MAX_SECS: u64 = 12;
+const ANNOUNCE_INTERVAL_MIN_SECS: u64 = 8 * 60;
+const ANNOUNCE_INTERVAL_MAX_SECS: u64 = 15 * 60;
 const READ_TIMEOUT_SECS: u64 = 1;
-const SCAN_INTERVAL_SECS: u64 = 300; // 5 minutes — avoids IDS triggering
-const PROBE_DELAY_MS_MIN: u64 = 3;
-const PROBE_DELAY_MS_MAX: u64 = 15;
+const SCAN_INTERVAL_MIN_SECS: u64 = 25 * 60;
+const SCAN_INTERVAL_MAX_SECS: u64 = 45 * 60;
+const SCAN_MAX_PROBES_PER_CYCLE: usize = 96;
+const PROBE_DELAY_MS_MIN: u64 = 80;
+const PROBE_DELAY_MS_MAX: u64 = 250;
 
 fn is_zero_i64(value: &i64) -> bool {
     *value == 0
+}
+
+fn is_quiet_hours() -> bool {
+    let hour = Local::now().hour();
+    hour >= QUIET_START_HOUR || hour < QUIET_END_HOUR
+}
+
+fn random_secs(min: u64, max: u64) -> u64 {
+    rand::thread_rng().gen_range(min..=max)
+}
+
+fn sleep_cancelable(cancel: &AtomicBool, duration: Duration) -> bool {
+    let mut remaining = duration.as_secs();
+    while remaining > 0 {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        let step = remaining.min(30);
+        thread::sleep(Duration::from_secs(step));
+        remaining -= step;
+    }
+    cancel.load(Ordering::Relaxed)
+}
+
+fn sleep_while_quiet(cancel: &AtomicBool) -> bool {
+    while is_quiet_hours() {
+        if sleep_cancelable(cancel, Duration::from_secs(60)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Wire format for LAN discovery packets.
@@ -267,9 +307,13 @@ impl LanDiscovery {
         out
     }
 
-    fn build_announce_data(my_info: &AnnouncePacket, peers: &Arc<RwLock<HashMap<String, Peer>>>) -> Vec<u8> {
+    fn build_announce_data(
+        my_info: &AnnouncePacket,
+        peers: &Arc<RwLock<HashMap<String, Peer>>>,
+        include_known_peers: bool,
+    ) -> Vec<u8> {
         let mut pkt = my_info.clone();
-        {
+        if include_known_peers {
             let map = peers.read().unwrap();
             pkt.known_peers = map.values()
                 .filter(|p| p.online)
@@ -296,19 +340,29 @@ impl LanDiscovery {
     ) {
         let broadcast_target = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), discovery_port);
         let multicast_target = SocketAddr::new(IpAddr::V4(MULTICAST_ADDR), discovery_port);
+        let mut burst_remaining = ANNOUNCE_BURST_COUNT;
 
         loop {
             if cancel.load(Ordering::Relaxed) { return; }
+            if is_quiet_hours() {
+                debug!("LAN discovery announce paused during quiet hours");
+                if sleep_while_quiet(&cancel) { return; }
+                burst_remaining = ANNOUNCE_BURST_COUNT;
+                continue;
+            }
 
-            let data = Self::build_announce_data(&my_info, &peers);
+            let data = Self::build_announce_data(&my_info, &peers, false);
 
             let _ = socket.send_to(&data, broadcast_target);
             let _ = socket.send_to(&data, multicast_target);
 
-            for _ in 0..ANNOUNCE_INTERVAL_SECS {
-                if cancel.load(Ordering::Relaxed) { return; }
-                thread::sleep(Duration::from_secs(1));
-            }
+            let delay = if burst_remaining > 0 {
+                burst_remaining -= 1;
+                random_secs(ANNOUNCE_BURST_DELAY_MIN_SECS, ANNOUNCE_BURST_DELAY_MAX_SECS)
+            } else {
+                random_secs(ANNOUNCE_INTERVAL_MIN_SECS, ANNOUNCE_INTERVAL_MAX_SECS)
+            };
+            if sleep_cancelable(&cancel, Duration::from_secs(delay)) { return; }
         }
     }
 
@@ -322,15 +376,19 @@ impl LanDiscovery {
         discovery_port: u16,
     ) {
         loop {
-            // Wait before first scan
-            for _ in 0..SCAN_INTERVAL_SECS {
-                if cancel.load(Ordering::Relaxed) {
+            let delay = random_secs(SCAN_INTERVAL_MIN_SECS, SCAN_INTERVAL_MAX_SECS);
+            if sleep_cancelable(&cancel, Duration::from_secs(delay)) {
+                return;
+            }
+            if is_quiet_hours() {
+                debug!("LAN subnet scan paused during quiet hours");
+                if sleep_while_quiet(&cancel) {
                     return;
                 }
-                thread::sleep(Duration::from_secs(1));
+                continue;
             }
 
-            // Rebuild data with known peers for peer relay
+            // Rebuild lightweight probe data without known peers.
             let my_info = AnnouncePacket {
                 id: my_id.clone(),
                 username: String::new(),
@@ -343,11 +401,12 @@ impl LanDiscovery {
                 port: 0,
                 known_peers: Vec::new(),
             };
-            let base_data = Self::build_announce_data(&my_info, &peers);
+            let base_data = Self::build_announce_data(&my_info, &peers, false);
 
             let prefixes = subnets.read().unwrap().clone();
             let start = std::time::Instant::now();
             let mut sent: u32 = 0;
+            let mut targets: Vec<Ipv4Addr> = Vec::new();
 
             for prefix in &prefixes {
                 let parts: Vec<&str> = prefix.split('.').collect();
@@ -367,23 +426,24 @@ impl LanDiscovery {
                     Err(_) => continue,
                 };
 
-                // Randomize IP order to avoid sequential scan pattern
-                let mut hosts: Vec<u8> = (1..=254).collect();
-                hosts.shuffle(&mut rand::thread_rng());
+                targets.extend((1..=254).map(|host| Ipv4Addr::new(a, b, c, host)));
+            }
 
-                for host in hosts {
-                    if cancel.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let target =
-                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, host)), discovery_port);
-                    if socket.send_to(&base_data, target).is_ok() {
-                        sent += 1;
-                    }
-                    // Random jitter between probes
-                    let delay = rand::thread_rng().gen_range(PROBE_DELAY_MS_MIN..=PROBE_DELAY_MS_MAX);
-                    thread::sleep(Duration::from_millis(delay));
+            targets.shuffle(&mut rand::thread_rng());
+
+            for ip in targets.into_iter().take(SCAN_MAX_PROBES_PER_CYCLE) {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
                 }
+                if is_quiet_hours() {
+                    break;
+                }
+                let target = SocketAddr::new(IpAddr::V4(ip), discovery_port);
+                if socket.send_to(&base_data, target).is_ok() {
+                    sent += 1;
+                }
+                let delay = rand::thread_rng().gen_range(PROBE_DELAY_MS_MIN..=PROBE_DELAY_MS_MAX);
+                thread::sleep(Duration::from_millis(delay));
             }
 
             debug!(
@@ -519,7 +579,7 @@ impl LanDiscovery {
 
                         // Unicast response + our known_peers to the new peer
                         let remote_discovery_port = packet.port + 2;
-                        let response_data = Self::build_announce_data(&my_info, &peers);
+                        let response_data = Self::build_announce_data(&my_info, &peers, true);
                         let response_target = SocketAddr::new(remote_ip, remote_discovery_port);
                         info!("UDP response to {} ({} bytes)", response_target, response_data.len());
                         let _ = socket.send_to(&response_data, response_target);

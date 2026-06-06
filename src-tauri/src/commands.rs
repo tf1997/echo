@@ -1702,27 +1702,57 @@ pub fn capture_screenshot() -> Result<ScreenshotData, String> {
 fn capture_screenshot_impl() -> Result<ScreenshotData, String> {
     use std::mem::{size_of, zeroed};
     use windows_sys::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+        DESKTOPHORZRES, DESKTOPVERTRES, GetDC, GetDIBits, GetDeviceCaps, ReleaseDC,
+        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS,
         HGDIOBJ, SRCCOPY,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
         SM_YVIRTUALSCREEN,
     };
+    use windows_sys::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        SetThreadDpiAwarenessContext,
+    };
+
+    struct ThreadDpiAwarenessGuard(DPI_AWARENESS_CONTEXT);
+
+    impl Drop for ThreadDpiAwarenessGuard {
+        fn drop(&mut self) {
+            if self.0 != 0 {
+                unsafe {
+                    SetThreadDpiAwarenessContext(self.0);
+                }
+            }
+        }
+    }
+
+    let _dpi_awareness_guard = unsafe {
+        ThreadDpiAwarenessGuard(SetThreadDpiAwarenessContext(
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        ))
+    };
 
     unsafe {
-        let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        let width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        let height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        if width <= 0 || height <= 0 {
-            return Err("无法获取屏幕尺寸".to_string());
-        }
-
         let screen_dc = GetDC(0);
         if screen_dc == 0 {
             return Err("无法获取屏幕设备上下文".to_string());
+        }
+
+        let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let mut width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let mut height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        let desktop_width = GetDeviceCaps(screen_dc, DESKTOPHORZRES as i32);
+        let desktop_height = GetDeviceCaps(screen_dc, DESKTOPVERTRES as i32);
+        if x == 0 && y == 0 && desktop_width > width && desktop_height > height {
+            width = desktop_width;
+            height = desktop_height;
+        }
+        if width <= 0 || height <= 0 {
+            ReleaseDC(0, screen_dc);
+            return Err("无法获取屏幕尺寸".to_string());
         }
 
         let memory_dc = CreateCompatibleDC(screen_dc);
@@ -1739,7 +1769,7 @@ fn capture_screenshot_impl() -> Result<ScreenshotData, String> {
         }
 
         let old_object = SelectObject(memory_dc, bitmap as HGDIOBJ);
-        let copied = BitBlt(memory_dc, 0, 0, width, height, screen_dc, x, y, SRCCOPY);
+        let copied = BitBlt(memory_dc, 0, 0, width, height, screen_dc, x, y, SRCCOPY | CAPTUREBLT);
         if copied == 0 {
             if old_object != 0 {
                 SelectObject(memory_dc, old_object);
