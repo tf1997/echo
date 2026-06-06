@@ -531,6 +531,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                     className={`theme-swatch ${themeId === theme.id ? "theme-swatch-active" : ""}`}
                     title={theme.name}
                     aria-label={`切换到${theme.name}皮肤`}
+                    aria-pressed={themeId === theme.id}
                   >
                     <span style={{ background: theme.preview[0] }} />
                     <span style={{ background: theme.preview[1] }} />
@@ -978,9 +979,10 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
           <button
             type="button"
             onClick={() => setShowThemeMenu((value) => !value)}
-            className="w-7 h-7 rounded bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center"
+            className="theme-menu-trigger w-7 h-7 rounded transition-colors flex items-center justify-center"
             title="切换皮肤"
             aria-label="切换皮肤"
+            aria-expanded={showThemeMenu}
           >
             <span className="flex items-center gap-0.5">
               {currentTheme.preview.map((color) => (
@@ -989,7 +991,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
             </span>
           </button>
           {showThemeMenu && (
-            <div className="absolute bottom-full right-0 mb-2 z-50 w-44 rounded-lg bg-gray-800 border border-gray-600 p-2 shadow-2xl text-left">
+            <div className="theme-menu absolute bottom-full right-0 mb-2 z-50 w-44 rounded-lg border p-2 shadow-2xl text-left">
               {THEMES.map((theme) => (
                 <button
                   key={theme.id}
@@ -998,7 +1000,8 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                     onThemeChange(theme.id);
                     setShowThemeMenu(false);
                   }}
-                  className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs hover:bg-gray-700 ${themeId === theme.id ? "text-indigo-400" : "text-gray-300"}`}
+                  aria-pressed={themeId === theme.id}
+                  className={`theme-menu-option w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs ${themeId === theme.id ? "theme-menu-option-active" : ""}`}
                 >
                   <span className={`theme-swatch ${themeId === theme.id ? "theme-swatch-active" : ""}`}>
                     <span style={{ background: theme.preview[0] }} />

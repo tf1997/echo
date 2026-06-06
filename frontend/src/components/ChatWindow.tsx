@@ -2313,7 +2313,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
           <button
             onClick={sendText}
             disabled={!inputText.trim() && !screenshotDraft}
-            className="composer-send-button absolute bottom-0 right-0 rounded-md bg-indigo-600 px-5 py-1.5 text-sm text-white hover:bg-indigo-500 disabled:opacity-40 disabled:hover:bg-indigo-600 transition-colors"
+            className="composer-send-button absolute text-sm disabled:opacity-40 transition-colors"
           >
             发送(S)
           </button>

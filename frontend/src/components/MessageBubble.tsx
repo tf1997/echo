@@ -650,11 +650,11 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
               return <p className="text-sm px-4 py-2.5">[聊天记录]</p>;
             }
           })() : isSticker && message.file_path ? (
-            <div className="max-w-[160px]">
+            <div className="message-media-frame message-sticker-frame">
               <ImagePreview filePath={message.file_path} fileSize={message.file_size} />
             </div>
           ) : showPreview ? (
-            <div className="max-w-[160px]">
+            <div className="message-media-frame message-image-frame">
               <ImagePreview filePath={message.file_path!} fileSize={message.file_size} />
             </div>
           ) : isFile ? (
