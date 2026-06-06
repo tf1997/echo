@@ -11,7 +11,8 @@ import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, sendMessag
 import type { ForwardCardData } from "./MessageBubble";
 import { ask, message as showDialogMessage, open } from "@tauri-apps/api/dialog";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
-import { MESSAGE_TYPE_NUDGE, NUDGE_COOLDOWN_MS } from "../messageTypes";
+import { MESSAGE_TYPE_NUDGE, MESSAGE_TYPE_RPS, NUDGE_COOLDOWN_MS, RPS_MOVES } from "../messageTypes";
+import type { RpsMove } from "../messageTypes";
 
 export interface PendingMessage {
   id: number;
@@ -47,6 +48,7 @@ interface ChatWindowProps {
   groups?: GroupInfo[];
   onSendMessage: (content: string, clientMsgId?: string) => Promise<ChatMessage>;
   onSendNudge: (clientMsgId?: string) => Promise<ChatMessage>;
+  onSendRps: (move: RpsMove, clientMsgId?: string) => Promise<ChatMessage>;
   onSendFile: (filePath: string, clientMsgId?: string, fileName?: string | null) => Promise<void | ChatMessage>;
   onSendSticker: (filePath: string, clientMsgId?: string) => Promise<ChatMessage>;
   onGroupUpdated?: () => void;
@@ -362,6 +364,7 @@ function fallbackForwardText(message: ChatMessage): string {
   if (message.msg_type === "sticker") return "[表情]";
   if (message.msg_type === "forward_card") return "[聊天记录]";
   if (message.msg_type === MESSAGE_TYPE_NUDGE) return getNudgeFallbackText(message.sender_name, false);
+  if (message.msg_type === MESSAGE_TYPE_RPS) return message.content || "[猜拳]";
   return message.content;
 }
 
@@ -502,7 +505,7 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
   );
 }
 
-export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, loadingMessages = false, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendNudge, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, nudgeSignal = null, historySearchRequest = null }: ChatWindowProps) {
+export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, loadingMessages = false, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendNudge, onSendRps, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, nudgeSignal = null, historySearchRequest = null }: ChatWindowProps) {
   const peerId = peer?.id ?? null;
   const pendingConversationKey = isGroup
     ? groupId ? `group:${groupId}` : peerId ? `group:${peerId}` : ""
@@ -591,6 +594,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const [groupInviteQuery, setGroupInviteQuery] = useState("");
   const [contextHighlightId, setContextHighlightId] = useState<number | null>(null);
   const [nudgeSending, setNudgeSending] = useState(false);
+  const [rpsSending, setRpsSending] = useState(false);
   const [nudgeCooldownRemainingMs, setNudgeCooldownRemainingMs] = useState(0);
   const [nudgeAnimating, setNudgeAnimating] = useState(false);
   const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -727,6 +731,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const dragResetTimerRef = useRef<number | null>(null);
   const nudgeTimerRef = useRef<number | null>(null);
   const nudgeCooldownUntilRef = useRef(new Map<string, number>());
+  const rpsSendingRef = useRef(false);
   const nearBottomRef = useRef(true);
   const composerCaretOffsetRef = useRef(0);
   const composerRenderingRef = useRef(false);
@@ -1154,6 +1159,30 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       setNudgeSending(false);
     }
   }, [nudgeSending, onSendNudge, peer, pendingConversationKey]);
+
+  const sendRps = useCallback(async (move: RpsMove) => {
+    if (!peer || isGroup || rpsSendingRef.current) return;
+    rpsSendingRef.current = true;
+    setRpsSending(true);
+    nearBottomRef.current = true;
+    try {
+      await onSendRps(move);
+    } catch (error) {
+      await showDialogMessage(String(error || "猜拳发送失败"), {
+        title: "猜拳失败",
+        type: "error",
+        okLabel: "确定",
+      }).catch(() => {});
+    } finally {
+      rpsSendingRef.current = false;
+      setRpsSending(false);
+    }
+  }, [isGroup, onSendRps, peer]);
+
+  const sendRandomRps = useCallback(() => {
+    const move = RPS_MOVES[Math.floor(Math.random() * RPS_MOVES.length)];
+    void sendRps(move);
+  }, [sendRps]);
 
   const sendText = useCallback(async () => {
     const currentText = inputRef.current ? decodeEchoEmojiTokens(readComposerText(inputRef.current)) : inputText;
@@ -1913,6 +1942,24 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
               </span>
             ) : null}
           </button>
+          {!isGroup && (
+            <button
+              type="button"
+              onClick={() => {
+                setShowEmoji(false);
+                sendRandomRps();
+              }}
+              disabled={rpsSending}
+              className="flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:hover:bg-gray-700 transition-colors flex items-center justify-center"
+              title="猜拳"
+              aria-label="猜拳"
+            >
+              <svg className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M8 8h8M7 12h10M9 16h6" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M5 5a7 7 0 0114 0M5 19a7 7 0 0014 0" />
+              </svg>
+            </button>
+          )}
           <button onClick={handlePickFile} className="flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center" title="发送文件">
             <svg className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />

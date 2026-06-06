@@ -6,7 +6,8 @@ import { WebviewWindow } from "@tauri-apps/api/window";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
 import { makeSearchHitId } from "./messageUtils";
 import { decodeEchoEmojiTokens, emojiAssetSrc, splitInlineEmojis } from "./emojiCatalog";
-import { MESSAGE_TYPE_NUDGE } from "../messageTypes";
+import { MESSAGE_TYPE_NUDGE, MESSAGE_TYPE_RPS, getRpsMoveLabel, parseRpsMoveFromContent } from "../messageTypes";
+import type { RpsMove } from "../messageTypes";
 
 const MAX_PREVIEW_BYTES = 20 * 1024 * 1024;
 const COLLAPSED_TEXT_CHARS = 520;
@@ -74,6 +75,62 @@ function getCopyableBubbleText(message: ChatMessage): string {
 
 function getNudgeDisplayText(message: ChatMessage, isOwn: boolean): string {
   return isOwn ? "你发送了一个抖一抖" : `${message.sender_name || "对方"} 发送了一个抖一抖`;
+}
+
+function RpsHandGesture({ move }: { move: RpsMove }) {
+  return (
+    <svg className="rps-sticker-hand" viewBox="0 0 96 96" aria-hidden="true">
+      {move === "rock" ? (
+        <g>
+          <path className="rps-hand-cuff" d="M34 74h32c6 0 11 5 11 11v5H24v-5c0-6 4-11 10-11z" />
+          <path className="rps-hand-fill" d="M25 39c0-6 5-11 11-11h27c8 0 15 7 15 15v18c0 9-7 16-16 16H41c-10 0-18-8-18-18V44c0-2 1-4 2-5z" />
+          <rect className="rps-hand-fill" x="29" y="26" width="14" height="29" rx="7" />
+          <rect className="rps-hand-fill" x="42" y="23" width="14" height="31" rx="7" />
+          <rect className="rps-hand-fill" x="55" y="25" width="14" height="29" rx="7" />
+          <path className="rps-hand-line" d="M33 48h33M36 61h28" />
+        </g>
+      ) : move === "scissors" ? (
+        <g>
+          <path className="rps-hand-cuff" d="M36 73h28c6 0 11 5 11 11v6H27v-6c0-6 4-11 9-11z" />
+          <rect className="rps-hand-fill" x="40" y="11" width="14" height="56" rx="7" transform="rotate(-19 47 39)" />
+          <rect className="rps-hand-fill" x="57" y="14" width="14" height="53" rx="7" transform="rotate(19 64 41)" />
+          <path className="rps-hand-fill" d="M35 44c7-6 18-5 25 2l7 7c8 8 8 21 0 29l-2 2H38c-10 0-18-8-18-18v-5c0-5 6-7 9-3l7 8z" />
+          <rect className="rps-hand-fill" x="21" y="48" width="18" height="34" rx="9" transform="rotate(-33 30 65)" />
+          <path className="rps-hand-line" d="M44 54c6 3 10 8 11 16M52 43l7 8" />
+        </g>
+      ) : (
+        <g>
+          <path className="rps-hand-cuff" d="M33 73h32c6 0 11 5 11 11v6H24v-6c0-6 4-11 9-11z" />
+          <rect className="rps-hand-fill" x="23" y="17" width="12" height="51" rx="6" />
+          <rect className="rps-hand-fill" x="37" y="10" width="12" height="58" rx="6" />
+          <rect className="rps-hand-fill" x="51" y="13" width="12" height="56" rx="6" />
+          <rect className="rps-hand-fill" x="65" y="23" width="12" height="45" rx="6" />
+          <path className="rps-hand-fill" d="M27 53c0-9 7-16 16-16h18c8 0 15 7 15 15v13c0 10-8 18-18 18H42c-9 0-15-7-15-16z" />
+          <rect className="rps-hand-fill" x="17" y="47" width="17" height="34" rx="8.5" transform="rotate(-31 25.5 64)" />
+          <path className="rps-hand-line" d="M36 44v25M49 41v29M62 45v24" />
+        </g>
+      )}
+    </svg>
+  );
+}
+
+function RpsSticker({ message }: { message: ChatMessage }) {
+  const move = parseRpsMoveFromContent(message.content);
+  if (!move) {
+    return <p className="message-text">{message.content}</p>;
+  }
+
+  const label = getRpsMoveLabel(move);
+
+  return (
+    <div className="rps-sticker" role="img" aria-label={`猜拳：${label}`}>
+      <div className={`rps-sticker-face rps-sticker-${move}`}>
+        <span className="rps-sticker-spark rps-sticker-spark-left" aria-hidden="true" />
+        <span className="rps-sticker-spark rps-sticker-spark-right" aria-hidden="true" />
+        <RpsHandGesture move={move} />
+      </div>
+    </div>
+  );
 }
 
 function getFileExtension(name: string | null): string {
@@ -207,6 +264,7 @@ function getForwardItemText(item: ForwardCardItem): string {
   if (item.msg_type === "sticker") return item.file_name ? `[图片] ${item.file_name}` : "[图片]";
   if (item.msg_type === "forward_card") return "[聊天记录]";
   if (item.msg_type === MESSAGE_TYPE_NUDGE) return "[抖一抖]";
+  if (item.msg_type === MESSAGE_TYPE_RPS) return item.content || "[猜拳]";
   return decodeEchoEmojiTokens(item.content);
 }
 
@@ -400,10 +458,11 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
 
 export function MessageBubble({ message, isOwn, showSender = false, highlighted = false, searchQuery = "", activeSearchHitId, selectMode = false, selected = false, onToggleSelect, onStartForward, onAddSticker }: MessageBubbleProps) {
   const isNudge = message.msg_type === MESSAGE_TYPE_NUDGE;
+  const isRps = message.msg_type === MESSAGE_TYPE_RPS;
   const isSticker = message.msg_type === "sticker";
   const isFile = message.msg_type === "file";
   const showPreview = isFile && !!message.file_path && (isImageFile(message.file_name) || isImageFile(message.file_path));
-  const isMediaBubble = isSticker || showPreview;
+  const isMediaBubble = isSticker || showPreview || isRps;
   const [showMenu, setShowMenu] = useState(false);
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null);
   const [addingSticker, setAddingSticker] = useState(false);
@@ -611,6 +670,8 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
                 <svg className="w-3.5 h-3.5 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
               </button>
             </div>
+          ) : isRps ? (
+            <RpsSticker message={message} />
           ) : (
             <>
               <p className={messageTextClass}>

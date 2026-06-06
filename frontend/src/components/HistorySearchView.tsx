@@ -10,7 +10,7 @@ import {
 import type { HistoryFilter } from "../api";
 import { DateDivider } from "./MessageBubble";
 import { formatDateLabel } from "./messageUtils";
-import { MESSAGE_TYPE_NUDGE } from "../messageTypes";
+import { MESSAGE_TYPE_NUDGE, MESSAGE_TYPE_RPS } from "../messageTypes";
 
 const HISTORY_PAGE_LIMIT = 80;
 const HISTORY_SEARCH_LIMIT = 200;
@@ -52,6 +52,7 @@ function getResultText(message: ChatMessage): string {
   if (message.msg_type === "sticker") return message.file_name || "[表情]";
   if (message.msg_type === "forward_card") return "[聊天记录]";
   if (message.msg_type === MESSAGE_TYPE_NUDGE) return "[抖一抖]";
+  if (message.msg_type === MESSAGE_TYPE_RPS) return message.content || "[猜拳]";
   return message.content;
 }
 
@@ -60,6 +61,7 @@ function getTypeLabel(message: ChatMessage): string {
   if (message.msg_type === "sticker") return "图片";
   if (message.msg_type === "forward_card") return "聊天记录";
   if (message.msg_type === MESSAGE_TYPE_NUDGE) return "抖一抖";
+  if (message.msg_type === MESSAGE_TYPE_RPS) return "猜拳";
   return "";
 }
 

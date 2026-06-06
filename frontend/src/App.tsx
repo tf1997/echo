@@ -8,7 +8,8 @@ import { ChatWindow } from "./components/ChatWindow";
 import { AvatarPreviewTrigger } from "./components/AvatarPreview";
 import { applyTheme, getInitialTheme } from "./theme";
 import type { ThemeId } from "./theme";
-import { MESSAGE_TYPE_NUDGE, NUDGE_COOLDOWN_MS, NUDGE_MESSAGE_CONTENT } from "./messageTypes";
+import { MESSAGE_TYPE_NUDGE, MESSAGE_TYPE_RPS, NUDGE_COOLDOWN_MS, NUDGE_MESSAGE_CONTENT, getRpsMessageContent } from "./messageTypes";
+import type { RpsMove } from "./messageTypes";
 import {
   downloadUpdate,
   getAppInfo,
@@ -896,6 +897,15 @@ function App() {
     return sent;
   }, [selectedGroupId, selectedPeer, triggerNudge]);
 
+  const handleSendRps = useCallback(async (move: RpsMove, clientMsgId?: string) => {
+    if (selectedGroupId) throw new Error("群聊暂不支持猜拳");
+    if (!selectedPeer) throw new Error("未选择联系人");
+    const sent = await sendMessageTyped(selectedPeer.id, getRpsMessageContent(move), MESSAGE_TYPE_RPS, clientMsgId);
+    setMessages((prev) => mergeMessageIntoList(prev, sent));
+    setRecentRefreshKey((key) => key + 1);
+    return sent;
+  }, [selectedGroupId, selectedPeer]);
+
   const handleSendFile = useCallback(async (filePath: string, clientMsgId?: string, fileName?: string | null) => {
     if (selectedGroupId) {
       return await sendGroupFile(selectedGroupId, filePath, clientMsgId, fileName);
@@ -1207,6 +1217,7 @@ function App() {
         groups={groups}
         onSendMessage={selectedGroupId ? ((content: string, clientMsgId?: string) => handleSendGroupMsg(selectedGroupId!, content, clientMsgId)) : handleSendMessage}
         onSendNudge={handleSendNudge}
+        onSendRps={handleSendRps}
         onSendFile={handleSendFile}
         onSendSticker={handleSendSticker}
         nudgeSignal={nudgeSignal}

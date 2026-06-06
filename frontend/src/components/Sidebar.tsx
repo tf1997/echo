@@ -6,7 +6,7 @@ import type { ThemeId } from "../theme";
 import type { GroupInfo, SearchResult } from "../api";
 import { Avatar } from "./Avatar";
 import { AvatarPreviewTrigger } from "./AvatarPreview";
-import { MESSAGE_TYPE_NUDGE } from "../messageTypes";
+import { MESSAGE_TYPE_NUDGE, MESSAGE_TYPE_RPS } from "../messageTypes";
 
 interface SidebarProps {
   peers: Peer[];
@@ -39,6 +39,7 @@ function getSearchHitPreview(hit: { msg_type: string; file_name?: string | null;
   if (hit.msg_type === "file") return `📎 ${hit.file_name || "文件"}`;
   if (hit.msg_type === "sticker") return "[表情]";
   if (hit.msg_type === MESSAGE_TYPE_NUDGE) return "[抖一抖]";
+  if (hit.msg_type === MESSAGE_TYPE_RPS) return hit.content || "[猜拳]";
   return hit.content.slice(0, 60);
 }
 
