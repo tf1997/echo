@@ -180,6 +180,88 @@ body {
   margin: 0;
 }
 
+.composer-tool-button,
+.screenshot-tool-button {
+  color: var(--echo-text-soft);
+}
+
+.composer-tool-button svg,
+.screenshot-tool-button svg {
+  color: currentColor !important;
+}
+
+.screenshot-toolbar {
+  background: rgb(15 23 42 / 0.86);
+  border-color: rgb(255 255 255 / 0.14);
+  color: #f8fafc;
+  backdrop-filter: blur(10px);
+}
+
+.screenshot-tool-button {
+  background: rgb(31 41 55 / 0.92);
+  border-color: rgb(255 255 255 / 0.12);
+}
+
+.screenshot-tool-button:hover {
+  background: rgb(55 65 81 / 0.96);
+}
+
+.screenshot-tool-button-active {
+  background: var(--echo-accent) !important;
+  border-color: var(--echo-accent-hover) !important;
+  color: #ffffff !important;
+}
+
+.screenshot-tool-button-success {
+  background: var(--echo-success) !important;
+  border-color: color-mix(in srgb, var(--echo-success) 80%, white) !important;
+  color: #ffffff !important;
+}
+
+.screenshot-tool-button-danger {
+  background: rgb(31 41 55 / 0.92);
+}
+
+:root[data-theme="daylight"] .composer-tool-button,
+:root[data-theme="wechat"] .composer-tool-button {
+  background: var(--echo-control) !important;
+  border-color: var(--echo-border) !important;
+  color: var(--echo-text-soft) !important;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.58), 0 1px 2px var(--echo-shadow);
+}
+
+:root[data-theme="daylight"] .composer-tool-button:hover,
+:root[data-theme="wechat"] .composer-tool-button:hover {
+  background: var(--echo-control-hover) !important;
+  color: var(--echo-text) !important;
+}
+
+:root[data-theme="daylight"] .screenshot-hide-toggle-active,
+:root[data-theme="wechat"] .screenshot-hide-toggle-active {
+  color: var(--echo-accent) !important;
+}
+
+:root[data-theme="daylight"] .screenshot-toolbar,
+:root[data-theme="wechat"] .screenshot-toolbar {
+  background: rgb(255 255 255 / 0.94);
+  border-color: var(--echo-border);
+  color: var(--echo-text-soft);
+  box-shadow: 0 14px 32px var(--echo-shadow);
+}
+
+:root[data-theme="daylight"] .screenshot-tool-button,
+:root[data-theme="wechat"] .screenshot-tool-button {
+  background: var(--echo-control);
+  border-color: var(--echo-border);
+  color: var(--echo-text-soft);
+}
+
+:root[data-theme="daylight"] .screenshot-tool-button:hover,
+:root[data-theme="wechat"] .screenshot-tool-button:hover {
+  background: var(--echo-control-hover);
+  color: var(--echo-text);
+}
+
 * {
   scrollbar-color: var(--echo-border-soft) transparent;
 }

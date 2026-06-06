@@ -8,7 +8,7 @@ tauri-build = { version = "1", features = [] }
 
 [dependencies]
 # Tauri
-tauri = { version = "1.8.3", features = ["dialog-all", "shell-open", "system-tray", "window-all", "window-data-url", "protocol-asset"] }
+tauri = { version = "1.8.3", features = ["dialog-all", "global-shortcut-all", "shell-open", "system-tray", "window-all", "window-data-url", "protocol-asset"] }
 
 # mDNS service discovery
 mdns-sd = "0.13"
@@ -61,4 +61,9 @@ rand = "0.8"
 socket2 = "0.5"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_System_EventLog"] }
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_EventLog",
+    "Win32_UI_WindowsAndMessaging",
+] }

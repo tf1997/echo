@@ -626,6 +626,7 @@ pub fn run() {
             commands::get_unread_counts,
             commands::update_tray_unread,
             commands::save_temp_file,
+            commands::capture_screenshot,
             commands::read_file_base64,
             commands::open_file,
             commands::open_folder,

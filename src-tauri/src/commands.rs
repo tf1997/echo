@@ -1675,6 +1675,156 @@ pub async fn save_temp_file(data: Vec<u8>, filename: String) -> Result<String, S
 }
 
 #[derive(Serialize)]
+pub struct ScreenshotData {
+    pub base64: String,
+    pub mime: String,
+    pub width: i32,
+    pub height: i32,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[tauri::command]
+pub fn capture_screenshot() -> Result<ScreenshotData, String> {
+    capture_screenshot_impl()
+}
+
+#[cfg(target_os = "windows")]
+fn capture_screenshot_impl() -> Result<ScreenshotData, String> {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SelectObject, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+        HGDIOBJ, SRCCOPY,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+
+    unsafe {
+        let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if width <= 0 || height <= 0 {
+            return Err("无法获取屏幕尺寸".to_string());
+        }
+
+        let screen_dc = GetDC(0);
+        if screen_dc == 0 {
+            return Err("无法获取屏幕设备上下文".to_string());
+        }
+
+        let memory_dc = CreateCompatibleDC(screen_dc);
+        if memory_dc == 0 {
+            ReleaseDC(0, screen_dc);
+            return Err("无法创建截图设备上下文".to_string());
+        }
+
+        let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
+        if bitmap == 0 {
+            DeleteDC(memory_dc);
+            ReleaseDC(0, screen_dc);
+            return Err("无法创建截图位图".to_string());
+        }
+
+        let old_object = SelectObject(memory_dc, bitmap as HGDIOBJ);
+        let copied = BitBlt(memory_dc, 0, 0, width, height, screen_dc, x, y, SRCCOPY);
+        if copied == 0 {
+            if old_object != 0 {
+                SelectObject(memory_dc, old_object);
+            }
+            DeleteObject(bitmap as HGDIOBJ);
+            DeleteDC(memory_dc);
+            ReleaseDC(0, screen_dc);
+            return Err("无法复制屏幕图像".to_string());
+        }
+
+        let row_stride = ((width as usize * 24 + 31) / 32) * 4;
+        let image_size = row_stride
+            .checked_mul(height as usize)
+            .ok_or_else(|| "截图尺寸过大".to_string())?;
+        let mut pixels = vec![0u8; image_size];
+
+        let mut bitmap_info: BITMAPINFO = zeroed();
+        bitmap_info.bmiHeader = BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: height,
+            biPlanes: 1,
+            biBitCount: 24,
+            biCompression: BI_RGB,
+            biSizeImage: image_size as u32,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+
+        let got_bits = GetDIBits(
+            memory_dc,
+            bitmap,
+            0,
+            height as u32,
+            pixels.as_mut_ptr().cast(),
+            &mut bitmap_info,
+            DIB_RGB_COLORS,
+        );
+
+        if old_object != 0 {
+            SelectObject(memory_dc, old_object);
+        }
+        DeleteObject(bitmap as HGDIOBJ);
+        DeleteDC(memory_dc);
+        ReleaseDC(0, screen_dc);
+
+        if got_bits == 0 {
+            return Err("无法读取截图像素".to_string());
+        }
+
+        let file_header_size = 14usize;
+        let info_header_size = size_of::<BITMAPINFOHEADER>();
+        let pixel_offset = file_header_size + info_header_size;
+        let file_size = pixel_offset
+            .checked_add(pixels.len())
+            .ok_or_else(|| "截图数据过大".to_string())?;
+        let mut bmp = Vec::with_capacity(file_size);
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
+        bmp.extend_from_slice(&0u16.to_le_bytes());
+        bmp.extend_from_slice(&0u16.to_le_bytes());
+        bmp.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
+        bmp.extend_from_slice(&bitmap_info.bmiHeader.biSize.to_le_bytes());
+        bmp.extend_from_slice(&bitmap_info.bmiHeader.biWidth.to_le_bytes());
+        bmp.extend_from_slice(&bitmap_info.bmiHeader.biHeight.to_le_bytes());
+        bmp.extend_from_slice(&bitmap_info.bmiHeader.biPlanes.to_le_bytes());
+        bmp.extend_from_slice(&bitmap_info.bmiHeader.biBitCount.to_le_bytes());
+        bmp.extend_from_slice(&bitmap_info.bmiHeader.biCompression.to_le_bytes());
+        bmp.extend_from_slice(&bitmap_info.bmiHeader.biSizeImage.to_le_bytes());
+        bmp.extend_from_slice(&bitmap_info.bmiHeader.biXPelsPerMeter.to_le_bytes());
+        bmp.extend_from_slice(&bitmap_info.bmiHeader.biYPelsPerMeter.to_le_bytes());
+        bmp.extend_from_slice(&bitmap_info.bmiHeader.biClrUsed.to_le_bytes());
+        bmp.extend_from_slice(&bitmap_info.bmiHeader.biClrImportant.to_le_bytes());
+        bmp.extend_from_slice(&pixels);
+
+        Ok(ScreenshotData {
+            base64: base64_encode_std(&bmp),
+            mime: "image/bmp".to_string(),
+            width,
+            height,
+            x,
+            y,
+        })
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn capture_screenshot_impl() -> Result<ScreenshotData, String> {
+    Err("当前平台暂不支持直接截取整个屏幕".to_string())
+}
+
+#[derive(Serialize)]
 pub struct FileData {
     pub base64: String,
     pub mime: String,

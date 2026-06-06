@@ -197,6 +197,19 @@ export async function saveTempFile(data: number[], filename: string): Promise<st
   return await invoke("save_temp_file", { data, filename });
 }
 
+export interface ScreenshotData {
+  base64: string;
+  mime: string;
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+}
+
+export async function captureScreenshotNative(): Promise<ScreenshotData> {
+  return await invoke("capture_screenshot");
+}
+
 interface FileData {
   base64: string;
   mime: string;

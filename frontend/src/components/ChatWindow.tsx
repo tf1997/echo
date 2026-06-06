@@ -11,6 +11,7 @@ import { saveTempFile, listEmojiFiles, addEmojiFile, deleteEmojiFile, sendMessag
 import type { ForwardCardData } from "./MessageBubble";
 import { ask, message as showDialogMessage, open } from "@tauri-apps/api/dialog";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
+import { WebviewWindow, appWindow } from "@tauri-apps/api/window";
 import { MESSAGE_TYPE_NUDGE, MESSAGE_TYPE_RPS, NUDGE_COOLDOWN_MS, RPS_MOVES } from "../messageTypes";
 import type { RpsMove } from "../messageTypes";
 
@@ -67,7 +68,32 @@ interface ChatWindowProps {
 
 let pendingId = Date.now();
 const EMPTY_PENDING_MESSAGES: PendingMessage[] = [];
+const SCREENSHOT_SHORTCUT = "Ctrl+Alt+A";
+const SCREENSHOT_HIDE_WINDOW_STORAGE_KEY = "echo.screenshot.hideCurrentWindow";
 type PendingMessagesUpdate = PendingMessage[] | ((prev: PendingMessage[]) => PendingMessage[]);
+
+function getInitialHideWindowForScreenshot(): boolean {
+  try {
+    const stored = window.localStorage.getItem(SCREENSHOT_HIDE_WINDOW_STORAGE_KEY);
+    if (stored === "false") return false;
+  } catch {
+    // Keep the default when storage is unavailable.
+  }
+  return true;
+}
+
+interface ScreenshotDraft {
+  file: File;
+  url: string;
+  copiedToClipboard: boolean;
+}
+
+interface ScreenshotCapturedPayload {
+  base64: string;
+  mime: string;
+  filename: string;
+  copiedToClipboard: boolean;
+}
 
 interface TextSearchHit {
   id: string;
@@ -104,6 +130,15 @@ async function readFileAndSave(file: File): Promise<string> {
   const buffer = await file.arrayBuffer();
   const data = Array.from(new Uint8Array(buffer));
   return await saveTempFile(data, file.name || "file");
+}
+
+function base64ToBlob(base64: string, mime: string): Blob {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: mime });
 }
 
 const IMAGE_FILE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tiff"]);
@@ -579,6 +614,9 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const [emojiTab, setEmojiTab] = useState<"default" | "custom">("default");
   const [customEmojis, setCustomEmojis] = useState<string[]>([]);
   const [deletingEmoji, setDeletingEmoji] = useState<string | null>(null);
+  const [capturingScreenshot, setCapturingScreenshot] = useState(false);
+  const [hideWindowForScreenshot, setHideWindowForScreenshot] = useState(getInitialHideWindowForScreenshot);
+  const [screenshotDraft, setScreenshotDraft] = useState<ScreenshotDraft | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [showSearch, setShowSearch] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -597,9 +635,30 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const [rpsSending, setRpsSending] = useState(false);
   const [nudgeCooldownRemainingMs, setNudgeCooldownRemainingMs] = useState(0);
   const [nudgeAnimating, setNudgeAnimating] = useState(false);
+  const screenshotButtonTitle = capturingScreenshot
+    ? "正在截图"
+    : `截图 (${SCREENSHOT_SHORTCUT})`;
+  const screenshotHideButtonTitle = hideWindowForScreenshot
+    ? "截图时隐藏当前窗口：开"
+    : "截图时隐藏当前窗口：关";
   const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const pendingJumpMessageIdRef = useRef<number | null>(null);
   const contextHighlightTimerRef = useRef<number | null>(null);
+  const captureScreenshotRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (screenshotDraft) URL.revokeObjectURL(screenshotDraft.url);
+    };
+  }, [screenshotDraft?.url]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SCREENSHOT_HIDE_WINDOW_STORAGE_KEY, hideWindowForScreenshot ? "true" : "false");
+    } catch {
+      // Screenshot preference persistence is optional.
+    }
+  }, [hideWindowForScreenshot]);
 
   const exitSelectMode = useCallback(() => { setSelectMode(false); setSelectedIds(new Set()); }, []);
 
@@ -875,6 +934,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     setContextHighlightId(null);
     setGroupMemberQuery("");
     setGroupInviteQuery("");
+    setScreenshotDraft(null);
     pendingJumpMessageIdRef.current = null;
     nearBottomRef.current = true;
     pendingScrollRef.current = true;
@@ -1184,15 +1244,56 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     void sendRps(move);
   }, [sendRps]);
 
+  const sendScreenshotFile = useCallback(async (file: File) => {
+    if (!peer) return;
+    nearBottomRef.current = true;
+    const conversationKey = pendingConversationKeyRef.current;
+    const tempId = ++pendingId;
+    const clientMsgId = generateClientMsgId();
+
+    updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
+      id: tempId,
+      clientMsgId,
+      content: `📎 ${file.name}`,
+      msg_type: "file",
+      file_name: file.name,
+      file_size: file.size,
+      status: "sending",
+    }]);
+
+    try {
+      const savedPath = await readFileAndSave(file);
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
+        p.id === tempId ? { ...p, file_path: savedPath, file_size: file.size } : p
+      ));
+      onSendFile(savedPath, clientMsgId, file.name).catch((e) => {
+        updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
+          p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
+        ));
+      });
+    } catch (e) {
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
+        p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
+      ));
+    }
+  }, [onSendFile, peer, updatePendingMessagesForKey]);
+
   const sendText = useCallback(async () => {
     const currentText = inputRef.current ? decodeEchoEmojiTokens(readComposerText(inputRef.current)) : inputText;
     const trimmed = currentText.trim();
-    if (!trimmed || !peer) return;
+    const draft = screenshotDraft;
+    if ((!trimmed && !draft) || !peer) return;
     setInputText("");
+    setScreenshotDraft(null);
     nearBottomRef.current = true;
     if (inputRef.current) {
       syncComposerDom("", 0);
     }
+    if (draft) {
+      URL.revokeObjectURL(draft.url);
+      await sendScreenshotFile(draft.file);
+    }
+    if (!trimmed) return;
     const conversationKey = pendingConversationKeyRef.current;
 
     const tempId = ++pendingId;
@@ -1215,7 +1316,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
       ));
     }
-  }, [inputText, peer, onSendMessage, syncComposerDom, updatePendingMessagesForKey]);
+  }, [inputText, peer, onSendMessage, screenshotDraft, sendScreenshotFile, syncComposerDom, updatePendingMessagesForKey]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "Enter" || composerComposingRef.current || e.nativeEvent.isComposing) return;
@@ -1278,6 +1379,101 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       ));
     }
   }, [peer, onSendFile, updatePendingMessagesForKey]);
+
+  const restoreMainWindowAfterScreenshot = useCallback(async () => {
+    await appWindow.show();
+    if (await appWindow.isMinimized().catch(() => false)) {
+      await appWindow.unminimize();
+    }
+    await appWindow.setFocus();
+  }, []);
+
+  const captureScreenshot = useCallback(async () => {
+    if (!peer || capturingScreenshot) return;
+    setShowEmoji(false);
+    setCapturingScreenshot(true);
+    try {
+      const existing = WebviewWindow.getByLabel("screenshot-overlay");
+      if (existing) {
+        await existing.setFocus();
+        return;
+      }
+      if (hideWindowForScreenshot) {
+        await appWindow.hide();
+        await new Promise((resolve) => window.setTimeout(resolve, 180));
+      }
+      new WebviewWindow("screenshot-overlay", {
+        url: "index.html#/screenshot-overlay",
+        title: "截图",
+        visible: false,
+        decorations: false,
+        resizable: false,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+      });
+    } catch (error) {
+      if (hideWindowForScreenshot) {
+        await restoreMainWindowAfterScreenshot().catch(() => {});
+      }
+      await showDialogMessage(`截图失败：${String(error)}`, {
+        title: "截图失败",
+        type: "error",
+        okLabel: "确定",
+      }).catch(() => {});
+    } finally {
+      setCapturingScreenshot(false);
+    }
+  }, [capturingScreenshot, hideWindowForScreenshot, peer, restoreMainWindowAfterScreenshot]);
+
+  useEffect(() => {
+    captureScreenshotRef.current = () => {
+      void captureScreenshot();
+    };
+  }, [captureScreenshot]);
+
+  useEffect(() => {
+    let unlistenCaptured: (() => void) | undefined;
+    let unlistenClosed: (() => void) | undefined;
+    import("@tauri-apps/api/event").then(({ listen }) => {
+      listen<ScreenshotCapturedPayload>("screenshot-captured", (event) => {
+        const payload = event.payload;
+        const blob = base64ToBlob(payload.base64, payload.mime);
+        const file = new File([blob], payload.filename || "screenshot.png", { type: payload.mime || "image/png" });
+        const url = URL.createObjectURL(blob);
+        setScreenshotDraft((prev) => {
+          if (prev) URL.revokeObjectURL(prev.url);
+          return { file, url, copiedToClipboard: payload.copiedToClipboard };
+        });
+        requestAnimationFrame(() => inputRef.current?.focus());
+      }).then((fn) => { unlistenCaptured = fn; });
+      listen("screenshot-overlay-closed", () => {
+        if (hideWindowForScreenshot) {
+          void restoreMainWindowAfterScreenshot();
+        }
+      }).then((fn) => { unlistenClosed = fn; });
+    });
+    return () => {
+      unlistenCaptured?.();
+      unlistenClosed?.();
+    };
+  }, [hideWindowForScreenshot, restoreMainWindowAfterScreenshot]);
+
+  useEffect(() => {
+    let registered = false;
+    import("@tauri-apps/api/globalShortcut").then(({ register }) => {
+      register(SCREENSHOT_SHORTCUT, () => {
+        captureScreenshotRef.current?.();
+      }).then(() => {
+        registered = true;
+      }).catch(() => {});
+    }).catch(() => {});
+    return () => {
+      if (!registered) return;
+      import("@tauri-apps/api/globalShortcut").then(({ unregister }) => {
+        void unregister(SCREENSHOT_SHORTCUT).catch(() => {});
+      }).catch(() => {});
+    };
+  }, []);
 
   const handlePaste = useCallback((e: React.ClipboardEvent<HTMLDivElement>) => {
     const items = e.clipboardData.items;
@@ -1829,6 +2025,28 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       )}
 
       <div className="chat-composer px-4 py-3 border-t border-gray-700 bg-gray-900/50">
+        {screenshotDraft && (
+          <div className="mb-2 flex items-center gap-2">
+            <div className="relative w-24 h-16 rounded-lg border border-gray-600 bg-gray-800 overflow-hidden">
+              <img src={screenshotDraft.url} alt="截图" className="w-full h-full object-contain" />
+              <button
+                type="button"
+                onClick={() => setScreenshotDraft(null)}
+                className="absolute right-1 top-1 w-5 h-5 rounded-full bg-black/70 hover:bg-black text-white flex items-center justify-center"
+                title="移除截图"
+                aria-label="移除截图"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <div className="min-w-0">
+              <p className="text-xs text-gray-200 truncate">{screenshotDraft.file.name}</p>
+              <p className="text-[10px] text-gray-500">{screenshotDraft.copiedToClipboard ? "已复制到剪贴板" : "当前环境未允许复制到剪贴板"}</p>
+            </div>
+          </div>
+        )}
         <div className="flex items-end gap-2">
           <div ref={emojiPopoverRef} className="relative flex-shrink-0">
             <button onClick={() => setShowEmoji(!showEmoji)} className="w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center" title="表情">
@@ -1928,7 +2146,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
             type="button"
             onClick={sendNudge}
             disabled={nudgeDisabled}
-            className="relative flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:hover:bg-gray-700 transition-colors flex items-center justify-center"
+            className="composer-tool-button relative flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:hover:bg-gray-700 transition-colors flex items-center justify-center"
             title={nudgeTitle}
             aria-label="抖一抖"
           >
@@ -1950,7 +2168,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                 sendRandomRps();
               }}
               disabled={rpsSending}
-              className="flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:hover:bg-gray-700 transition-colors flex items-center justify-center"
+              className="composer-tool-button flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:hover:bg-gray-700 transition-colors flex items-center justify-center"
               title="猜拳"
               aria-label="猜拳"
             >
@@ -1960,7 +2178,45 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
               </svg>
             </button>
           )}
-          <button onClick={handlePickFile} className="flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center" title="发送文件">
+          <div className="relative flex flex-shrink-0 items-center">
+            <button
+              type="button"
+              onClick={captureScreenshot}
+              disabled={capturingScreenshot}
+              className="composer-tool-button flex-shrink-0 w-10 h-10 rounded-xl rounded-r-none bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:hover:bg-gray-700 transition-colors flex items-center justify-center"
+              title={screenshotButtonTitle}
+              aria-label={screenshotButtonTitle}
+            >
+              <svg className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M5 7a2 2 0 012-2h10a2 2 0 012 2v7a2 2 0 01-2 2H7a2 2 0 01-2-2V7z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M9 20h6M12 16v4M8 9h3M8 12h2" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={() => setHideWindowForScreenshot((prev) => !prev)}
+              className={`composer-tool-button screenshot-hide-toggle flex-shrink-0 h-10 w-7 rounded-xl rounded-l-none border-l border-gray-600 bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center ${hideWindowForScreenshot ? "screenshot-hide-toggle-active" : ""}`}
+              title={screenshotHideButtonTitle}
+              aria-label={screenshotHideButtonTitle}
+              aria-pressed={hideWindowForScreenshot}
+            >
+              <svg className="w-4 h-4 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                {hideWindowForScreenshot ? (
+                  <>
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M3 3l18 18" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M10.6 10.7a2 2 0 002.7 2.7" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M9.4 5.3A9.8 9.8 0 0112 5c5 0 8.7 4.2 10 7a13 13 0 01-2.1 3.1M6.5 6.9C4.4 8.2 2.9 10.2 2 12c1.3 2.8 5 7 10 7 1.1 0 2.1-.2 3.1-.5" />
+                  </>
+                ) : (
+                  <>
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M2 12c1.3-2.8 5-7 10-7s8.7 4.2 10 7c-1.3 2.8-5 7-10 7s-8.7-4.2-10-7z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12 9a3 3 0 100 6 3 3 0 000-6z" />
+                  </>
+                )}
+              </svg>
+            </button>
+          </div>
+          <button onClick={handlePickFile} className="composer-tool-button flex-shrink-0 w-10 h-10 rounded-xl bg-gray-700 hover:bg-gray-600 transition-colors flex items-center justify-center" title="发送文件">
             <svg className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
             </svg>
@@ -1993,7 +2249,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
               className="composer-input flex-1 bg-gray-700 text-white text-sm rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-indigo-500"
             />
           </div>
-          <button onClick={sendText} disabled={!inputText.trim()}
+          <button onClick={sendText} disabled={!inputText.trim() && !screenshotDraft}
             className="flex-shrink-0 w-10 h-10 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:hover:bg-indigo-600 transition-colors flex items-center justify-center"
           >
             <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">

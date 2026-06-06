@@ -20,6 +20,9 @@
         "all": true,
         "create": true
       },
+      "globalShortcut": {
+        "all": true
+      },
       "dialog": {
         "all": true,
         "open": true
