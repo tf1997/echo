@@ -9,8 +9,8 @@ export interface ThemeOption {
 
 export const THEMES: ThemeOption[] = [
   { id: "midnight", name: "星夜", preview: ["#101624", "#1f2937", "#6366f1"] },
-  { id: "daylight", name: "晨光", preview: ["#f4f6f6", "#ffffff", "#53777d"] },
-  { id: "wechat", name: "微信", preview: ["#f7f8f7", "#ffffff", "#95e66a"] },
+  { id: "daylight", name: "晨光", preview: ["#f7f9f9", "#ffffff", "#68939a"] },
+  { id: "wechat", name: "微信", preview: ["#f7f8f7", "#ffffff", "#a0ea78"] },
   { id: "aurora", name: "极光", preview: ["#071113", "#122224", "#5d918b"] },
   { id: "carbon", name: "曜石", preview: ["#0b0d10", "#20242a", "#9b7a4d"] },
   { id: "plum", name: "梅影", preview: ["#101011", "#1f1f22", "#a96b78"] },
