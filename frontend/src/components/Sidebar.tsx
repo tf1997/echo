@@ -266,7 +266,8 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
   const selectedPeerEndpoint = selectedPeer ? peerEndpointKey(selectedPeer) : "";
   const isPeerSelected = useCallback((peer: Peer, recentPeerId?: string) => {
     if (!selectedPeerId) return false;
-    if (selectedPeerId === peer.id || (recentPeerId && selectedPeerId === recentPeerId)) return true;
+    if (selectedPeerId === peer.id) return true;
+    if (recentPeerId && selectedPeerId === recentPeerId) return true;
     const endpoint = peerEndpointKey(peer);
     return !!endpoint && !!selectedPeerEndpoint && endpoint === selectedPeerEndpoint;
   }, [selectedPeerEndpoint, selectedPeerId]);
@@ -1067,7 +1068,7 @@ function PeerItem({ peer, isSelected, unread, onClick, onAvatarClick }: { peer: 
   return (
     <div
       className={`sidebar-list-item w-full flex items-center gap-3 px-4 py-3 transition-colors ${
-        isSelected ? "sidebar-list-item-active bg-indigo-600/30 border-l-2 border-indigo-400" : "hover:bg-gray-800 border-l-2 border-transparent"
+        isSelected ? "sidebar-list-item-active bg-indigo-600/30 border-l-2 border-indigo-400" : "border-l-2 border-transparent"
       }`}
     >
       <button
@@ -1183,7 +1184,7 @@ function GroupItem({ group, isSelected, onSelect }: { group: GroupInfo; isSelect
   const sender = group.last_message_sender;
   const time = group.last_message_at ? new Date(group.last_message_at).toLocaleString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
   return (
-    <div className={`sidebar-list-item flex items-stretch ${isSelected ? "sidebar-list-item-active bg-indigo-600/20 border-l-2 border-indigo-400" : "border-l-2 border-transparent hover:bg-gray-800"}`}>
+    <div className={`sidebar-list-item flex items-stretch ${isSelected ? "sidebar-list-item-active bg-indigo-600/20 border-l-2 border-indigo-400" : "border-l-2 border-transparent"}`}>
       <button onClick={onSelect} className="flex-1 min-w-0 text-left px-4 py-3 flex items-center gap-3">
         <div className="relative flex-shrink-0">
           <div className="sidebar-group-avatar w-9 h-9 rounded-full bg-indigo-700 flex items-center justify-center text-base">👥</div>

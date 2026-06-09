@@ -149,13 +149,19 @@ pub async fn save_profile(
         None
     };
 
-    let existing_peer_id = state
+    let current_runtime_id = { state.runtime.read().await.clone() }
+        .as_ref()
+        .map(|runtime| runtime.my_id.clone())
+        .filter(|peer_id| !peer_id.is_empty());
+    let existing_profile_id = state
         .profile
         .lock()
         .await
         .as_ref()
         .map(|profile| profile.peer_id.clone())
-        .filter(|peer_id| !peer_id.is_empty())
+        .filter(|peer_id| !peer_id.is_empty());
+    let profile_peer_id = current_runtime_id
+        .or(existing_profile_id)
         .unwrap_or_default(); // will be set to IP:port by RuntimeServices::start()
     let existing_avatar = state
         .profile
@@ -176,7 +182,7 @@ pub async fn save_profile(
     state
         .db
         .save_user_profile(
-            &existing_peer_id,
+            &profile_peer_id,
             username,
             department,
             &crate::profile_metadata::software_version(),
@@ -199,7 +205,7 @@ pub async fn save_profile(
 
     let final_avatar = avatar_update.unwrap_or(existing_avatar);
     let profile = UserProfile {
-        peer_id: existing_peer_id,
+        peer_id: profile_peer_id,
         username: username.to_string(),
         department: department.to_string(),
         software_version: crate::profile_metadata::software_version(),
@@ -3098,28 +3104,11 @@ async fn send_group_file_with_kind(
                 return;
             }
 
-            let mut target_id = member.peer_id.clone();
+            let target_id = member.peer_id.clone();
             let target_name = member.username.clone();
             let target_department = member.department.clone();
-            let mut resolved_addr =
+            let resolved_addr =
                 resolve_peer_addr(&target_id, bg_db.as_ref(), &bg_online_peers).await;
-            if resolved_addr.is_none() && !target_name.is_empty() {
-                if let Ok(Some(latest_peer)) = bg_db
-                    .find_peer_by_identity(&target_name, &target_department)
-                    .await
-                {
-                    if latest_peer.peer_id != target_id {
-                        log::info!(
-                            "Group file target {} resolved by identity to latest peer_id {}",
-                            target_id,
-                            latest_peer.peer_id
-                        );
-                        target_id = latest_peer.peer_id.clone();
-                        resolved_addr =
-                            resolve_peer_addr(&target_id, bg_db.as_ref(), &bg_online_peers).await;
-                    }
-                }
-            }
 
             if let Some((ip, port)) = resolved_addr {
                 let peer = crate::discovery::Peer::new(

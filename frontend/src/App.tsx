@@ -105,6 +105,11 @@ interface SelectConversationOptions {
   preserveHistory?: boolean;
 }
 
+function isSamePeerConversation(a: Peer | null | undefined, b: Peer | null | undefined) {
+  if (!a || !b) return false;
+  return !!a.id && !!b.id && a.id === b.id;
+}
+
 function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
   if (left.length !== right.length) return false;
 
@@ -478,8 +483,8 @@ function App() {
       const endpointKey = `${peer.ip}:${peer.port}`;
       const existingId = endpointToId.get(endpointKey);
       const cachedPeer = existingId ? map.get(existingId) : map.get(peer.id);
-      // Keep the stored conversation id stable for a known endpoint. Discovery can
-      // report endpoint-shaped ids before DB identity migration catches up.
+      // Keep the stored conversation id stable only for the same endpoint.
+      // A different IP:port is a different contact even when profile text matches.
       const displayId = existingId ?? peer.id;
       const nextAvatarHash = peer.avatar_hash || cachedPeer?.avatar_hash || "";
       const nextAvatarUpdatedAt = peer.avatar_updated_at || cachedPeer?.avatar_updated_at || 0;
@@ -530,9 +535,7 @@ function App() {
     setUnreadCounts(unread);
     setSelectedPeer((current) => {
       if (!current) return current;
-      const canonicalPeer = mergedPeers.find(
-        (peer) => peer.id === current.id || (peer.ip === current.ip && peer.port === current.port)
-      );
+      const canonicalPeer = mergedPeers.find((peer) => peer.id === current.id);
       return canonicalPeer ?? current;
     });
     return mergedPeers;
@@ -674,6 +677,24 @@ function App() {
   }, [appInfo?.initialized]);
 
   const handleSelectPeer = useCallback(async (peer: Peer, options?: SelectConversationOptions) => {
+    const currentActive = activeConversationRef.current;
+    if (currentActive?.kind === "contact" && isSamePeerConversation(selectedPeer, peer)) {
+      setSelectedGroupId(null);
+      setSelectedPeer((current) => {
+        if (!current) return peer;
+        return {
+          ...current,
+          ...peer,
+          id: current.id,
+          ip: current.ip || peer.ip,
+          port: current.port || peer.port,
+        };
+      });
+      if (!options?.preserveHistory) {
+        setHistorySearchRequest(null);
+      }
+      return;
+    }
     const nonce = ++selectionNonceRef.current;
     activeConversationRef.current = { kind: "contact", id: peer.id };
     setConversationLoading(true);
@@ -709,9 +730,18 @@ function App() {
         setConversationLoading(false);
       }
     }
-  }, []);
+  }, [selectedPeer]);
 
   const handleSelectGroup = useCallback(async (groupId: string, options?: SelectConversationOptions) => {
+    const currentActive = activeConversationRef.current;
+    if (currentActive?.kind === "group" && currentActive.id === groupId) {
+      setSelectedPeer(null);
+      setSelectedGroupId(groupId);
+      if (!options?.preserveHistory) {
+        setHistorySearchRequest(null);
+      }
+      return;
+    }
     const nonce = ++selectionNonceRef.current;
     activeConversationRef.current = { kind: "group", id: groupId };
     setConversationLoading(true);
@@ -753,6 +783,10 @@ function App() {
       targetId,
       nonce: ++nudgeNonceRef.current,
     });
+  }, []);
+
+  const handleNudgeSignalConsumed = useCallback((nonce: number) => {
+    setNudgeSignal((current) => (current?.nonce === nonce ? null : current));
   }, []);
 
   const canInterruptForIncomingNudge = useCallback((kind: ConversationKind, targetId: string, senderId: string) => {
@@ -1220,6 +1254,7 @@ function App() {
         onSendFile={handleSendFile}
         onSendSticker={handleSendSticker}
         nudgeSignal={nudgeSignal}
+        onNudgeSignalConsumed={handleNudgeSignalConsumed}
         onGroupUpdated={() => listGroups().then(setGroups).catch(() => {})}
         onLoadHistoryContext={handleLoadHistoryContext}
         historySearchRequest={

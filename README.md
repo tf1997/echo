@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./frontend/src/assets/hero.png" alt="Echo Logo" width="128" height="128" />
+  <img src="./src-tauri/icons/icon.png" alt="Echo App Icon" width="128" height="128" />
 
   # Echo — P2P LAN Chat
 
@@ -152,6 +152,8 @@ On first launch you'll be prompted to set a username and department — this is 
 
 Want to see how Echo works on a single machine? Run two instances with different ports:
 
+macOS / Linux:
+
 ```bash
 cd src-tauri
 
@@ -160,6 +162,38 @@ ECHO_PORT=9527 ECHO_DATA_DIR=/tmp/echo-a cargo run
 
 # Terminal B — Instance 2
 ECHO_PORT=9528 ECHO_DATA_DIR=/tmp/echo-b cargo run
+```
+
+Windows PowerShell:
+
+```powershell
+cd .\src-tauri
+
+# Terminal A - Instance 1
+$env:ECHO_PORT = "9527"
+$env:ECHO_DATA_DIR = "D:\tmp\echo-a"
+cargo run
+
+# Terminal B - Instance 2
+$env:ECHO_PORT = "9528"
+$env:ECHO_DATA_DIR = "D:\tmp\echo-b"
+cargo run
+```
+
+Windows cmd.exe:
+
+```cmd
+cd /d D:\code\echo\src-tauri
+
+:: Terminal A - Instance 1
+set ECHO_PORT=9527
+set ECHO_DATA_DIR=D:\tmp\echo-a
+cargo run
+
+:: Terminal B - Instance 2
+set ECHO_PORT=9528
+set ECHO_DATA_DIR=D:\tmp\echo-b
+cargo run
 ```
 
 They should discover each other through the local discovery channel. You can also use the manual IP lookup in the sidebar when broadcast traffic is filtered.

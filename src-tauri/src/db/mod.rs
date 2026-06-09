@@ -1499,32 +1499,7 @@ impl Database {
             .await
             .context("Failed to remove stale peer endpoints")?;
 
-        // Cleanup by identity (same name+dept under a different peer_id, e.g. peer IP changed)
-        // only when username is known — otherwise we'd nuke other unnamed peers indiscriminately.
-        if !username.trim().is_empty() {
-            let identity_duplicates = sqlx::query(
-                "SELECT peer_id FROM peers WHERE username = ? AND department = ? AND peer_id <> ?",
-            )
-            .bind(username)
-            .bind(department)
-            .bind(peer_id)
-            .fetch_all(&self.pool)
-            .await
-            .context("Failed to load duplicate identity")?;
-            for row in identity_duplicates {
-                let old_peer_id: String = row.get("peer_id");
-                self.migrate_peer_references(&old_peer_id, peer_id).await?;
-            }
-
-            sqlx::query("DELETE FROM peers WHERE username = ? AND department = ? AND peer_id <> ?")
-                .bind(username)
-                .bind(department)
-                .bind(peer_id)
-                .execute(&self.pool)
-                .await
-                .context("Failed to remove duplicate identity")?;
-        }
-
+        // Identity is IP:port, so same-name contacts at different endpoints must stay separate.
         // Upsert. Preserve existing non-empty username/department when the incoming row has
         // empty values — system messages (group_created, group_dissolved, group_member_left)
         // historically carried empty sender_name and would otherwise wipe good peer data.
@@ -1710,41 +1685,6 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .context("Failed to get stored peer")?;
-
-        Ok(row.map(|row| StoredPeer {
-            peer_id: row.get("peer_id"),
-            username: row.get("username"),
-            department: row.get("department"),
-            software_version: row.get("software_version"),
-            mac_address: row.get("mac_address"),
-            avatar_path: row.get("avatar_path"),
-            avatar_hash: row.get("avatar_hash"),
-            avatar_updated_at: row.get("avatar_updated_at"),
-            ip: row.get("ip"),
-            port: row.get::<i64, _>("port") as u16,
-            is_online: row.get::<bool, _>("is_online"),
-            first_seen_at: row.get("first_seen_at"),
-            last_seen_at: row.get("last_seen_at"),
-        }))
-    }
-
-    pub async fn find_peer_by_identity(
-        &self,
-        username: &str,
-        department: &str,
-    ) -> Result<Option<StoredPeer>> {
-        let row = sqlx::query(
-            "SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at
-             FROM peers
-             WHERE username = ? AND department = ?
-             ORDER BY is_online DESC, last_seen_at DESC
-             LIMIT 1",
-        )
-        .bind(username)
-        .bind(department)
-        .fetch_optional(&self.pool)
-        .await
-        .context("Failed to find peer by identity")?;
 
         Ok(row.map(|row| StoredPeer {
             peer_id: row.get("peer_id"),
@@ -2417,6 +2357,73 @@ mod tests {
         assert_eq!(stored.department, "Ops");
         assert_eq!(stored.ip, "10.0.0.6");
         assert!(!stored.is_online);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn same_identity_at_new_endpoint_stays_separate() {
+        let db_path = temp_db_path("same-identity-new-endpoint");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+
+        db.upsert_peer("10.0.0.2:9527", "Alice", "Ops", "10.0.0.2", 9527, true)
+            .await
+            .expect("first endpoint should persist");
+        db.add_recent_contact("10.0.0.2:9527")
+            .await
+            .expect("first endpoint should become recent");
+        db.save_message(
+            "me",
+            "Me",
+            "10.0.0.2:9527",
+            "old endpoint message",
+            "text",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("message to old endpoint should persist");
+
+        db.upsert_peer("10.0.0.3:9527", "Alice", "Ops", "10.0.0.3", 9527, true)
+            .await
+            .expect("new endpoint should persist as a separate contact");
+
+        let old_peer = db
+            .get_stored_peer("10.0.0.2:9527")
+            .await
+            .expect("old peer lookup should succeed")
+            .expect("old endpoint should remain");
+        let new_peer = db
+            .get_stored_peer("10.0.0.3:9527")
+            .await
+            .expect("new peer lookup should succeed")
+            .expect("new endpoint should exist");
+        assert_eq!(old_peer.username, "Alice");
+        assert_eq!(new_peer.username, "Alice");
+
+        let recent = db
+            .list_recent_contacts()
+            .await
+            .expect("recent contacts should load");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].peer_id, "10.0.0.2:9527");
+
+        let old_messages = db
+            .get_conversation("me", "10.0.0.2:9527", Some(10))
+            .await
+            .expect("old endpoint messages should load");
+        let new_messages = db
+            .get_conversation("me", "10.0.0.3:9527", Some(10))
+            .await
+            .expect("new endpoint messages should load");
+        assert_eq!(old_messages.len(), 1);
+        assert!(new_messages.is_empty());
 
         drop(db);
         let _ = std::fs::remove_file(db_path);

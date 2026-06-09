@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import type { ChatMessage, Peer } from "../types";
 import type { GroupInfo } from "../api";
-import { MessageBubble, DateDivider } from "./MessageBubble";
+import { MessageBubble, DateDivider, getCollapsedMessageText, isLongMessageText } from "./MessageBubble";
 import { HistorySearchView } from "./HistorySearchView";
 import { Avatar } from "./Avatar";
 import { AvatarPreviewTrigger } from "./AvatarPreview";
@@ -54,6 +54,7 @@ interface ChatWindowProps {
   onSendSticker: (filePath: string, clientMsgId?: string) => Promise<ChatMessage>;
   onGroupUpdated?: () => void;
   onLoadHistoryContext?: (messageId: number) => Promise<void>;
+  onNudgeSignalConsumed?: (nonce: number) => void;
   nudgeSignal?: {
     kind: "contact" | "group";
     targetId: string;
@@ -173,6 +174,30 @@ function InlineEmojiText({ text }: { text: string }) {
           />
         )
       ))}
+    </>
+  );
+}
+
+function PendingTextContent({ text }: { text: string }) {
+  const isLong = isLongMessageText(text);
+  const [expanded, setExpanded] = useState(false);
+  const visibleText = isLong && !expanded ? getCollapsedMessageText(text) : text;
+
+  return (
+    <>
+      <p className="message-text"><InlineEmojiText text={visibleText} /></p>
+      {isLong ? (
+        <button
+          type="button"
+          className="message-inline-action"
+          onClick={(event) => {
+            event.stopPropagation();
+            setExpanded((value) => !value);
+          }}
+        >
+          {expanded ? "收起" : "展开全文"}
+        </button>
+      ) : null}
     </>
   );
 }
@@ -540,7 +565,7 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
   );
 }
 
-export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, loadingMessages = false, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendNudge, onSendRps, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, nudgeSignal = null, historySearchRequest = null }: ChatWindowProps) {
+export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, loadingMessages = false, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendNudge, onSendRps, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, onNudgeSignalConsumed, nudgeSignal = null, historySearchRequest = null }: ChatWindowProps) {
   const peerId = peer?.id ?? null;
   const pendingConversationKey = isGroup
     ? groupId ? `group:${groupId}` : peerId ? `group:${peerId}` : ""
@@ -989,7 +1014,8 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     const activeId = isGroup ? groupId : peer?.id;
     if (!activeId || nudgeSignal.kind !== activeKind || nudgeSignal.targetId !== activeId) return;
     playNudgeAnimation();
-  }, [groupId, isGroup, nudgeSignal, peer?.id, playNudgeAnimation]);
+    onNudgeSignalConsumed?.(nudgeSignal.nonce);
+  }, [groupId, isGroup, nudgeSignal, onNudgeSignalConsumed, peer?.id, playNudgeAnimation]);
 
   const syncComposerDom = useCallback((text: string, caretOffset: number | null = null) => {
     const el = inputRef.current;
@@ -1951,11 +1977,12 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
               const isPendingSticker = item.msg_type === "sticker" && !!item.file_path;
               const isPendingImageFile = item.msg_type === "file" && !!item.file_path && (isImageFileName(item.file_name) || isImageFileName(item.file_path));
               const isPendingMedia = isPendingSticker || isPendingImageFile;
+              const isPendingLongText = item.msg_type === "text" && isLongMessageText(item.content);
               const pendingStatusText = getPendingStatusText(item);
               elements.push(
                 <div key={`pending-${item.id}`} className="message-row flex justify-end mb-3 px-4">
-                  <div className="message-stack flex flex-col items-end">
-                    <div className={`${isPendingMedia ? "overflow-hidden rounded-xl" : "message-bubble-shell message-bubble-content rounded-2xl rounded-br-md"} ${
+                  <div className={`message-stack ${isPendingLongText ? "message-stack-long-text" : ""} flex flex-col items-end`}>
+                    <div className={`${isPendingMedia ? "overflow-hidden rounded-xl" : `message-bubble-shell message-bubble-content rounded-2xl rounded-br-md ${isPendingLongText ? "message-bubble-collapsible message-bubble-collapsed" : ""}`} ${
                       item.status === "failed"
                         ? isPendingMedia ? "ring-1 ring-red-500/70" : "bg-red-600/30 border border-red-500/50"
                         : isPendingMedia ? "" : "message-bubble-own bg-indigo-600/50"
@@ -1972,7 +1999,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                           <p className="message-file-name truncate" title={item.file_name || "文件"}>{item.file_name || "文件"}</p>
                         </div>
                       ) : (
-                        <p className="message-text"><InlineEmojiText text={item.content} /></p>
+                        <PendingTextContent text={item.content} />
                       )}
                     </div>
                     {item.msg_type === "file" && (item.status === "sending" || item.status === "paused") && item.progress !== undefined && (

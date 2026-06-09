@@ -254,7 +254,7 @@ pub fn run() {
                     .expect("Failed to initialize database")
             }));
 
-            let profile = tauri::async_runtime::block_on(async {
+            let mut profile = tauri::async_runtime::block_on(async {
                 db.get_user_profile()
                     .await
                     .expect("Failed to load user profile")
@@ -263,13 +263,17 @@ pub fn run() {
             // Channel to bridge UDP-discovered relay peers → async DB contact sync
             let (relay_tx, mut relay_rx) = mpsc::unbounded_channel::<Vec<PeerEntry>>();
 
-            let runtime_services = if let Some(profile) = profile.as_ref() {
+            let runtime_services = if let Some(saved_profile) = profile.as_ref() {
+                let saved_username = saved_profile.username.clone();
                 let runtime = tauri::async_runtime::block_on(async {
-                    state::RuntimeServices::start(app.handle().clone(), Arc::clone(&db), profile, listen_port, Some(relay_tx.clone()))
+                    state::RuntimeServices::start(app.handle().clone(), Arc::clone(&db), saved_profile, listen_port, Some(relay_tx.clone()))
                         .await
                         .expect("Failed to start runtime services")
                 });
-                info!("Runtime started with saved profile: {}", profile.username);
+                if let Some(profile) = profile.as_mut() {
+                    profile.peer_id = runtime.my_id.clone();
+                }
+                info!("Runtime started with saved profile: {}", saved_username);
                 Some(Arc::new(runtime))
             } else {
                 info!("No saved profile found, waiting for first-time setup.");
