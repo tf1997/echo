@@ -53,6 +53,7 @@ whoami = "1"
 
 # base64 (optional, we have our own impl but useful for decoding on other side)
 base64 = "0.22"
+png = "0.17"
 
 # Randomization (subnet scan IP shuffling)
 rand = "0.8"

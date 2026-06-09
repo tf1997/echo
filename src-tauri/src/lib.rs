@@ -1,5 +1,6 @@
 mod chat;
 mod commands;
+mod contact_filter;
 mod contact_sync;
 mod db;
 mod discovery;
@@ -290,11 +291,15 @@ pub fn run() {
             let processor_db = db.clone();
             tauri::async_runtime::spawn(async move {
                 while let Some(batch) = relay_rx.recv().await {
+                    let mut persisted = 0usize;
                     for entry in &batch {
-                        if entry.ip.is_empty() || entry.port == 0 {
-                            continue;
-                        }
-                        if entry.ip.parse::<IpAddr>().is_err() {
+                        if !crate::contact_filter::is_syncable_contact(
+                            &entry.id,
+                            &entry.username,
+                            &entry.department,
+                            &entry.ip,
+                            entry.port,
+                        ) {
                             continue;
                         }
                         let _ = processor_db
@@ -313,10 +318,11 @@ pub fn run() {
                             )
                             .await;
                         let _ = processor_db.add_recent_contact(&entry.id).await;
+                        persisted += 1;
                     }
                     info!(
                         "RelaySync: persisted {} relayed peer(s) to contacts",
-                        batch.len()
+                        persisted
                     );
                 }
             });

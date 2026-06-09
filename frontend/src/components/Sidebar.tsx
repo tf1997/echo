@@ -712,7 +712,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
               ) : (
                 <>
                   {recentGroups.length > 0 ? (
-                    <div className="pb-1">
+                    <div className="sidebar-recent-list pb-1">
                       <p className="sidebar-section-label px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">最近群聊</p>
                       {recentGroups.map((group) => (
                         <GroupItem
@@ -725,7 +725,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                     </div>
                   ) : null}
                   {recentContacts.length > 0 ? (
-                    <div className="pb-1">
+                    <div className="sidebar-recent-list pb-1">
                       <p className="sidebar-section-label px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">最近联系人</p>
                       {recentContacts.map(r => {
                         const livePeer = peerById.get(r.peer_id);
@@ -826,7 +826,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                         className="sidebar-dept-button w-full flex items-center gap-2 px-4 py-2 text-xs text-gray-400 font-medium hover:bg-gray-800 transition-colors"
                       >
                         <svg
-                          className={`w-3 h-3 text-gray-500 transition-transform flex-shrink-0 ${expanded ? "rotate-90" : ""}`}
+                          className={`w-3 h-3 text-gray-500 flex-shrink-0 ${expanded ? "rotate-90" : ""}`}
                           fill="none" viewBox="0 0 24 24" stroke="currentColor"
                         >
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />

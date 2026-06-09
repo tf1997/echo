@@ -1296,7 +1296,11 @@ pub async fn discover_by_ip(
                 .await
                 .get_peers()
                 .into_iter()
-                .filter(|p| p.online)
+                .filter(|p| {
+                    p.online
+                        && crate::contact_filter::has_contact_identity(&p.username, &p.department)
+                        && p.port != 0
+                })
                 .map(|p| {
                     serde_json::json!({
                         "id": p.id, "username": p.username, "department": p.department,
@@ -1822,40 +1826,83 @@ fn capture_screenshot_impl() -> Result<ScreenshotData, String> {
             return Err("无法读取截图像素".to_string());
         }
 
-        let file_header_size = 14usize;
-        let info_header_size = size_of::<BITMAPINFOHEADER>();
-        let pixel_offset = file_header_size + info_header_size;
-        let file_size = pixel_offset
-            .checked_add(pixels.len())
-            .ok_or_else(|| "截图数据过大".to_string())?;
-        let mut bmp = Vec::with_capacity(file_size);
-        bmp.extend_from_slice(b"BM");
-        bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
-        bmp.extend_from_slice(&0u16.to_le_bytes());
-        bmp.extend_from_slice(&0u16.to_le_bytes());
-        bmp.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
-        bmp.extend_from_slice(&bitmap_info.bmiHeader.biSize.to_le_bytes());
-        bmp.extend_from_slice(&bitmap_info.bmiHeader.biWidth.to_le_bytes());
-        bmp.extend_from_slice(&bitmap_info.bmiHeader.biHeight.to_le_bytes());
-        bmp.extend_from_slice(&bitmap_info.bmiHeader.biPlanes.to_le_bytes());
-        bmp.extend_from_slice(&bitmap_info.bmiHeader.biBitCount.to_le_bytes());
-        bmp.extend_from_slice(&bitmap_info.bmiHeader.biCompression.to_le_bytes());
-        bmp.extend_from_slice(&bitmap_info.bmiHeader.biSizeImage.to_le_bytes());
-        bmp.extend_from_slice(&bitmap_info.bmiHeader.biXPelsPerMeter.to_le_bytes());
-        bmp.extend_from_slice(&bitmap_info.bmiHeader.biYPelsPerMeter.to_le_bytes());
-        bmp.extend_from_slice(&bitmap_info.bmiHeader.biClrUsed.to_le_bytes());
-        bmp.extend_from_slice(&bitmap_info.bmiHeader.biClrImportant.to_le_bytes());
-        bmp.extend_from_slice(&pixels);
+        let rgb = dib_bgr_bottom_up_to_rgb(&pixels, width, height, row_stride)?;
+        let png = encode_rgb_png_fast(width, height, &rgb)?;
 
         Ok(ScreenshotData {
-            base64: base64_encode_std(&bmp),
-            mime: "image/bmp".to_string(),
+            base64: base64_encode_std(&png),
+            mime: "image/png".to_string(),
             width,
             height,
             x,
             y,
         })
     }
+}
+
+#[cfg(target_os = "windows")]
+fn dib_bgr_bottom_up_to_rgb(
+    pixels: &[u8],
+    width: i32,
+    height: i32,
+    row_stride: usize,
+) -> Result<Vec<u8>, String> {
+    let width = usize::try_from(width).map_err(|_| "截图宽度无效".to_string())?;
+    let height = usize::try_from(height).map_err(|_| "截图高度无效".to_string())?;
+    let row_bytes = width
+        .checked_mul(3)
+        .ok_or_else(|| "截图行数据过大".to_string())?;
+    let rgb_len = row_bytes
+        .checked_mul(height)
+        .ok_or_else(|| "截图数据过大".to_string())?;
+    let mut rgb = vec![0u8; rgb_len];
+
+    for dest_y in 0..height {
+        let src_y = height - 1 - dest_y;
+        let src_row = src_y
+            .checked_mul(row_stride)
+            .ok_or_else(|| "截图行偏移过大".to_string())?;
+        let dest_row = dest_y
+            .checked_mul(row_bytes)
+            .ok_or_else(|| "截图行偏移过大".to_string())?;
+        let src_end = src_row
+            .checked_add(row_bytes)
+            .ok_or_else(|| "截图行数据过大".to_string())?;
+        if src_end > pixels.len() {
+            return Err("截图像素数据不完整".to_string());
+        }
+
+        for x in 0..width {
+            let src = src_row + x * 3;
+            let dest = dest_row + x * 3;
+            rgb[dest] = pixels[src + 2];
+            rgb[dest + 1] = pixels[src + 1];
+            rgb[dest + 2] = pixels[src];
+        }
+    }
+
+    Ok(rgb)
+}
+
+#[cfg(target_os = "windows")]
+fn encode_rgb_png_fast(width: i32, height: i32, rgb: &[u8]) -> Result<Vec<u8>, String> {
+    let width = u32::try_from(width).map_err(|_| "截图宽度无效".to_string())?;
+    let height = u32::try_from(height).map_err(|_| "截图高度无效".to_string())?;
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        encoder.set_filter(png::FilterType::Sub);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("无法创建 PNG 截图：{e}"))?;
+        writer
+            .write_image_data(rgb)
+            .map_err(|e| format!("无法写入 PNG 截图：{e}"))?;
+    }
+    Ok(bytes)
 }
 
 #[cfg(target_os = "macos")]

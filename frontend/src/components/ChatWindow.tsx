@@ -1438,6 +1438,13 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         alwaysOnTop: true,
         skipTaskbar: true,
       });
+      if (hideWindowForScreenshot) {
+        window.setTimeout(() => {
+          if (!WebviewWindow.getByLabel("screenshot-overlay")) {
+            void restoreMainWindowAfterScreenshot();
+          }
+        }, 15000);
+      }
     } catch (error) {
       if (hideWindowForScreenshot) {
         await restoreMainWindowAfterScreenshot().catch(() => {});
@@ -1948,7 +1955,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
               elements.push(
                 <div key={`pending-${item.id}`} className="message-row flex justify-end mb-3 px-4">
                   <div className="message-stack flex flex-col items-end">
-                    <div className={`${isPendingMedia ? "overflow-hidden rounded-xl" : "message-bubble-shell rounded-2xl px-4 py-2.5 rounded-br-md"} ${
+                    <div className={`${isPendingMedia ? "overflow-hidden rounded-xl" : "message-bubble-shell message-bubble-content rounded-2xl rounded-br-md"} ${
                       item.status === "failed"
                         ? isPendingMedia ? "ring-1 ring-red-500/70" : "bg-red-600/30 border border-red-500/50"
                         : isPendingMedia ? "" : "message-bubble-own bg-indigo-600/50"

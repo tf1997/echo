@@ -11,6 +11,8 @@ use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::contact_filter;
+
 use super::peer::{Peer, PeerEntry};
 
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 42);
@@ -316,7 +318,11 @@ impl LanDiscovery {
         if include_known_peers {
             let map = peers.read().unwrap();
             pkt.known_peers = map.values()
-                .filter(|p| p.online)
+                .filter(|p| {
+                    p.online
+                        && contact_filter::has_contact_identity(&p.username, &p.department)
+                        && p.port != 0
+                })
                 .map(|p| PeerEntry {
                     id: p.id.clone(), username: p.username.clone(),
                     department: p.department.clone(),
@@ -485,6 +491,13 @@ impl LanDiscovery {
                         continue;
                     }
 
+                    if !contact_filter::has_contact_identity(&packet.username, &packet.department)
+                        || packet.port == 0
+                    {
+                        debug!("UDP recv: skipping peer without contact identity: {}", packet.id);
+                        continue;
+                    }
+
                     let remote_ip = match src_addr.ip() {
                         IpAddr::V4(ip) => IpAddr::V4(ip),
                         IpAddr::V6(ip) => IpAddr::V6(ip),
@@ -533,7 +546,16 @@ impl LanDiscovery {
                     // Process peer relay: register all known_peers too
                     let mut relayed: Vec<PeerEntry> = Vec::new();
                     for entry in &packet.known_peers {
-                        if entry.id != my_info.id && !peers_map.contains_key(&entry.id) {
+                        if entry.id != my_info.id
+                            && !peers_map.contains_key(&entry.id)
+                            && contact_filter::is_syncable_contact(
+                                &entry.id,
+                                &entry.username,
+                                &entry.department,
+                                &entry.ip,
+                                entry.port,
+                            )
+                        {
                             if let Ok(ip) = entry.ip.parse::<IpAddr>() {
                                 peers_map.insert(
                                     entry.id.clone(),

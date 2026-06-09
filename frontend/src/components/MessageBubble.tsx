@@ -478,7 +478,8 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
   const hasSearchQuery = !!searchQuery.trim();
   const shouldCollapseText = isTextMessage && !hasSearchQuery && isLongText(message.content);
   const visibleText = shouldCollapseText && !textExpanded ? getCollapsedText(message.content) : message.content;
-  const messageTextClass = `message-text ${looksLikeCodeText(message.content) ? "message-text-code" : ""}`;
+  const isCodeTextMessage = isTextMessage && looksLikeCodeText(message.content);
+  const messageTextClass = `message-text ${isCodeTextMessage ? "message-text-code" : ""}`;
 
   useEffect(() => {
     if (!showMenu) return;
@@ -641,7 +642,7 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
         {!isOwn && showSender && (
           <span className="message-sender-label" title={message.sender_name}>{message.sender_name}</span>
         )}
-        <div className={`${isMediaBubble ? "bg-transparent" : `message-bubble-shell rounded-2xl overflow-hidden ${isOwn ? "message-bubble-own bg-indigo-600 text-white rounded-br-md" : "message-bubble-other bg-gray-700 text-gray-100 rounded-bl-md"}`} ${!isMediaBubble && message.msg_type !== "forward_card" ? "px-4 py-2.5" : ""}`}>
+        <div className={`${isMediaBubble ? "bg-transparent" : `message-bubble-shell rounded-2xl overflow-hidden ${isOwn ? "message-bubble-own bg-indigo-600 text-white rounded-br-md" : "message-bubble-other bg-gray-700 text-gray-100 rounded-bl-md"}`} ${!isMediaBubble && message.msg_type !== "forward_card" ? `message-bubble-content ${isCodeTextMessage ? "message-bubble-code-content" : ""}` : ""}`}>
           {message.msg_type === "forward_card" ? (() => {
             try {
               const card: ForwardCardData = JSON.parse(message.content);

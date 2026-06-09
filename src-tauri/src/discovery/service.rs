@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 
+use crate::contact_filter;
+
 use super::broadcast::{LanDiscovery, LanDiscoveryConfig};
 use super::peer::{Peer, PeerEntry};
 
@@ -79,6 +81,10 @@ impl DiscoveryService {
             .read()
             .expect("peers lock poisoned")
             .values()
+            .filter(|peer| {
+                contact_filter::has_contact_identity(&peer.username, &peer.department)
+                    && peer.port != 0
+            })
             .cloned()
             .collect()
     }
@@ -97,6 +103,14 @@ impl DiscoveryService {
             .values()
             .find(|p| p.ip == peer.ip && p.port == peer.port)
             .map(|p| p.id.clone());
+
+        if existing_id.is_none()
+            && (!contact_filter::has_contact_identity(&peer.username, &peer.department)
+                || peer.port == 0)
+        {
+            log::debug!("Skipping peer without contact identity: {}", peer.id);
+            return;
+        }
 
         if let Some(id) = existing_id {
             // Update existing peer

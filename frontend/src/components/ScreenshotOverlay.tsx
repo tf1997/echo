@@ -679,8 +679,26 @@ export function ScreenshotOverlay() {
           )}
         </div>
       ) : (
-        <div className="flex h-screen w-screen items-center justify-center text-sm text-gray-300">
-          {error ? `截图失败：${error}` : "正在准备截图..."}
+        <div className="flex h-screen w-screen items-center justify-center bg-black px-6 text-sm text-gray-300">
+          {error ? (
+            <div className="max-w-md rounded-lg border border-red-400/30 bg-gray-900/95 p-4 text-center shadow-2xl">
+              <p className="mb-2 text-sm font-medium text-red-200">截图失败</p>
+              <p className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words text-left text-xs leading-relaxed text-gray-300">
+                {error}
+              </p>
+              <button
+                type="button"
+                onClick={() => void closeOverlay()}
+                className="screenshot-tool-button mt-4 h-8 rounded-md border px-3 text-xs"
+              >
+                关闭
+              </button>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-white/10 bg-gray-900/90 px-4 py-3 shadow-2xl">
+              正在准备截图...
+            </div>
+          )}
         </div>
       )}
     </div>

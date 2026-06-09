@@ -6,6 +6,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::chat::WireMessage;
+use crate::contact_filter;
 use crate::db::Database;
 use crate::discovery::Peer;
 
@@ -81,7 +82,16 @@ pub async fn build_summaries(
 
     // From DB
     for sp in &stored {
-        if sp.peer_id != my_id && seen.insert(sp.peer_id.clone()) {
+        if sp.peer_id != my_id
+            && contact_filter::is_syncable_contact(
+                &sp.peer_id,
+                &sp.username,
+                &sp.department,
+                &sp.ip,
+                sp.port,
+            )
+            && seen.insert(sp.peer_id.clone())
+        {
             out.push(ContactSummaryEntry {
                 peer_id: sp.peer_id.clone(),
                 username: sp.username.clone(),
@@ -100,7 +110,17 @@ pub async fn build_summaries(
     // From memory (peers not yet persisted)
     if let Ok(map) = peers_map.read() {
         for (id, p) in map.iter() {
-            if id != my_id && seen.insert(id.clone()) {
+            let ip = p.ip.to_string();
+            if id != my_id
+                && contact_filter::is_syncable_contact(
+                    &p.id,
+                    &p.username,
+                    &p.department,
+                    &ip,
+                    p.port,
+                )
+                && seen.insert(id.clone())
+            {
                 out.push(ContactSummaryEntry {
                     peer_id: p.id.clone(),
                     username: p.username.clone(),
@@ -120,6 +140,17 @@ pub async fn build_summaries(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+fn is_valid_remote_entry(entry: &ContactSummaryEntry, my_id: &str) -> bool {
+    entry.peer_id != my_id
+        && contact_filter::is_syncable_contact(
+            &entry.peer_id,
+            &entry.username,
+            &entry.department,
+            &entry.ip,
+            entry.port,
+        )
+}
 
 /// Send a `WireMessage` JSON line over a one-shot TCP connection.
 async fn deliver_response(addr: &str, msg: &WireMessage) -> bool {
@@ -156,7 +187,7 @@ fn merge_into_memory(
     my_id: &str,
     peers_map: &std::sync::RwLock<HashMap<String, Peer>>,
 ) {
-    if entry.peer_id == my_id || entry.ip.is_empty() || entry.port == 0 {
+    if !is_valid_remote_entry(entry, my_id) {
         return;
     }
     if let Ok(ip) = entry.ip.parse::<std::net::IpAddr>() {
@@ -257,13 +288,7 @@ pub async fn handle_contact_summary(
     let mut new_count = 0u32;
 
     for entry in &entries {
-        if entry.peer_id == my_id {
-            continue;
-        }
-        if entry.ip.is_empty() || entry.port == 0 {
-            continue;
-        }
-        if entry.ip.parse::<std::net::IpAddr>().is_err() {
+        if !is_valid_remote_entry(entry, my_id) {
             continue;
         }
         // Persist
@@ -308,7 +333,14 @@ pub async fn handle_contact_summary(
 
     // 3. Compute what they're missing
     let our_set: HashSet<&str> = our_summaries.iter().map(|s| s.peer_id.as_str()).collect();
-    let their_set: HashSet<&str> = entries.iter().map(|s| s.peer_id.as_str()).collect();
+    let their_set: HashSet<&str> = entries
+        .iter()
+        .filter(|s| {
+            !s.peer_id.trim().is_empty()
+                && contact_filter::has_contact_identity(&s.username, &s.department)
+        })
+        .map(|s| s.peer_id.as_str())
+        .collect();
     let missing_ids: HashSet<&str> = our_set.difference(&their_set).copied().collect();
 
     let missing_details: Vec<ContactSummaryEntry> = our_summaries
@@ -372,13 +404,7 @@ pub async fn handle_contact_sync_res(
 
     // Merge summaries
     for entry in &response.summaries {
-        if entry.peer_id == my_id {
-            continue;
-        }
-        if entry.ip.is_empty() || entry.port == 0 {
-            continue;
-        }
-        if entry.ip.parse::<std::net::IpAddr>().is_err() {
+        if !is_valid_remote_entry(entry, my_id) {
             continue;
         }
         let _ = db.add_recent_contact(&entry.peer_id).await;
@@ -403,13 +429,7 @@ pub async fn handle_contact_sync_res(
 
     // Merge missing_details
     for entry in &response.missing_details {
-        if entry.peer_id == my_id {
-            continue;
-        }
-        if entry.ip.is_empty() || entry.port == 0 {
-            continue;
-        }
-        if entry.ip.parse::<std::net::IpAddr>().is_err() {
+        if !is_valid_remote_entry(entry, my_id) {
             continue;
         }
         let _ = db.add_recent_contact(&entry.peer_id).await;

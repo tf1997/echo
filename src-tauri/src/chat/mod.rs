@@ -9,6 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
+use crate::contact_filter;
 use crate::contact_sync;
 use crate::db::{ChatMessage, Database};
 use crate::discovery::{Peer, PeerEntry};
@@ -44,6 +45,27 @@ fn normalized_client_msg_id(client_msg_id: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn is_valid_relay_entry(entry: &PeerEntry, my_id: &str) -> bool {
+    entry.id != my_id
+        && crate::contact_filter::is_syncable_contact(
+            &entry.id,
+            &entry.username,
+            &entry.department,
+            &entry.ip,
+            entry.port,
+        )
+}
+
+fn is_syncable_peer(peer: &Peer) -> bool {
+    crate::contact_filter::is_syncable_contact(
+        &peer.id,
+        &peer.username,
+        &peer.department,
+        &peer.ip.to_string(),
+        peer.port,
+    )
 }
 
 pub fn is_self_peer(peer: &Peer, my_id: &str, listen_port: u16) -> bool {
@@ -809,14 +831,16 @@ impl ChatServer {
                         continue;
                     }
 
-                    // Mark sender as recent contact
-                    let _ = db.add_recent_contact(&msg.sender_id).await;
+                    // Mark sender as recent contact when the message carries usable identity.
+                    if contact_filter::has_contact_identity(
+                        &msg.sender_name,
+                        &msg.sender_department,
+                    ) {
+                        let _ = db.add_recent_contact(&msg.sender_id).await;
+                    }
 
                     for entry in &msg.known_peers {
-                        if entry.id == my_id || entry.ip.is_empty() || entry.port == 0 {
-                            continue;
-                        }
-                        if entry.ip.parse::<std::net::IpAddr>().is_err() {
+                        if !is_valid_relay_entry(entry, &my_id) {
                             continue;
                         }
                         let _ = db
@@ -938,7 +962,10 @@ impl ChatServer {
                     }
 
                     // Also register in the in-memory peers map so UI picks it up immediately.
-                    {
+                    if contact_filter::has_contact_identity(
+                        &msg.sender_name,
+                        &msg.sender_department,
+                    ) {
                         let remote_ip = match peer_addr.ip() {
                             std::net::IpAddr::V4(ip) => std::net::IpAddr::V4(ip),
                             std::net::IpAddr::V6(ip) => std::net::IpAddr::V6(ip),
@@ -969,8 +996,12 @@ impl ChatServer {
                                     .values_mut()
                                     .find(|p| p.ip == remote_ip && p.port == msg.sender_port)
                                 {
-                                    existing.username = msg.sender_name.clone();
-                                    existing.department = msg.sender_department.clone();
+                                    if !msg.sender_name.is_empty() {
+                                        existing.username = msg.sender_name.clone();
+                                    }
+                                    if !msg.sender_department.is_empty() {
+                                        existing.department = msg.sender_department.clone();
+                                    }
                                     if !msg.sender_software_version.is_empty() {
                                         existing.software_version =
                                             msg.sender_software_version.clone();
@@ -994,7 +1025,9 @@ impl ChatServer {
 
                             // Process sender's known_peers (bidirectional relay via chat)
                             for entry in &msg.known_peers {
-                                if entry.id != my_id && !map.contains_key(&entry.id) {
+                                if is_valid_relay_entry(entry, &my_id)
+                                    && !map.contains_key(&entry.id)
+                                {
                                     if let Ok(entry_ip) = entry.ip.parse::<std::net::IpAddr>() {
                                         let relay = Peer::with_online_avatar(
                                             entry.id.clone(),
@@ -1023,10 +1056,7 @@ impl ChatServer {
                         // Persist known_peers to DB (out of the sync RwLock so we can await).
                         // Skips entries with missing ip/port — those carry id-only and we have nothing to store.
                         for entry in &msg.known_peers {
-                            if entry.id == my_id || entry.ip.is_empty() || entry.port == 0 {
-                                continue;
-                            }
-                            if entry.ip.parse::<std::net::IpAddr>().is_err() {
+                            if !is_valid_relay_entry(entry, &my_id) {
                                 continue;
                             }
                             let _ = db
@@ -1603,7 +1633,7 @@ impl ChatServer {
     fn build_known_peers(&self) -> Vec<PeerEntry> {
         if let Ok(map) = self.peers.read() {
             map.values()
-                .filter(|p| p.online)
+                .filter(|p| p.online && is_syncable_peer(p))
                 .map(|p| PeerEntry {
                     id: p.id.clone(),
                     username: p.username.clone(),
@@ -1868,7 +1898,7 @@ async fn send_file_in_background_inner(
     // Build known_peers once
     let peers_list: Vec<PeerEntry> = if let Ok(map) = peers.read() {
         map.values()
-            .filter(|p| p.online)
+            .filter(|p| p.online && is_syncable_peer(p))
             .map(|p| PeerEntry {
                 id: p.id.clone(),
                 username: p.username.clone(),

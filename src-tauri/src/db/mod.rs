@@ -7,6 +7,8 @@ use sqlx::{
     Pool, Row, Sqlite,
 };
 
+use crate::contact_filter;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserProfile {
     pub peer_id: String,
@@ -449,6 +451,30 @@ impl Database {
         .context("Failed to create recent_contacts table")?;
 
         sqlx::query(
+            "DELETE FROM recent_contacts
+             WHERE peer_id IN (
+                SELECT r.peer_id
+                FROM recent_contacts r
+                LEFT JOIN peers p ON p.peer_id = r.peer_id
+                WHERE p.peer_id IS NULL
+                   OR (TRIM(COALESCE(p.username, '')) = ''
+                       AND TRIM(COALESCE(p.department, '')) = '')
+             )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to clean dirty recent contacts")?;
+
+        sqlx::query(
+            "DELETE FROM peers
+             WHERE TRIM(COALESCE(username, '')) = ''
+               AND TRIM(COALESCE(department, '')) = ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to clean dirty stored peers")?;
+
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS groups (
                 group_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -599,17 +625,17 @@ impl Database {
 
     pub async fn list_recent_contacts(&self) -> Result<Vec<StoredPeer>> {
         let rows = sqlx::query(
-            "SELECT r.peer_id, COALESCE(p.username, r.peer_id) as username,
-                    COALESCE(p.department, '') as department,
-                    COALESCE(p.software_version, '') as software_version,
-                    COALESCE(p.mac_address, '') as mac_address,
-                    COALESCE(p.avatar_path, '') as avatar_path,
-                    COALESCE(p.avatar_hash, '') as avatar_hash,
-                    COALESCE(p.avatar_updated_at, 0) as avatar_updated_at,
-                    COALESCE(p.ip, '') as ip, COALESCE(p.port, 0) as port,
-                    COALESCE(p.is_online, 0) as is_online,
-                    COALESCE(p.first_seen_at, '') as first_seen_at,
-                    COALESCE(p.last_seen_at, '') as last_seen_at,
+            "SELECT r.peer_id, p.username as username,
+                    p.department as department,
+                    p.software_version as software_version,
+                    p.mac_address as mac_address,
+                    p.avatar_path as avatar_path,
+                    p.avatar_hash as avatar_hash,
+                    p.avatar_updated_at as avatar_updated_at,
+                    p.ip as ip, p.port as port,
+                    p.is_online as is_online,
+                    p.first_seen_at as first_seen_at,
+                    p.last_seen_at as last_seen_at,
                     (
                         SELECT MAX(m.id)
                         FROM messages m
@@ -618,7 +644,8 @@ impl Database {
                           AND m.msg_type NOT IN ('file_chunk', 'file_end')
                     ) as last_message_id
              FROM recent_contacts r
-             LEFT JOIN peers p ON r.peer_id = p.peer_id
+             JOIN peers p ON r.peer_id = p.peer_id
+             WHERE TRIM(p.username) <> '' OR TRIM(p.department) <> ''
              ORDER BY
                 CASE WHEN last_message_id IS NULL THEN 1 ELSE 0 END,
                 last_message_id DESC,
@@ -1419,6 +1446,35 @@ impl Database {
         port: u16,
         is_online: bool,
     ) -> Result<()> {
+        if peer_id.trim().is_empty() || !contact_filter::has_valid_endpoint(ip, port) {
+            log::debug!(
+                "Skipping peer with invalid endpoint: {} @ {}:{}",
+                peer_id,
+                ip,
+                port
+            );
+            return Ok(());
+        }
+
+        if !contact_filter::has_contact_identity(username, department) {
+            let existing_identity = sqlx::query(
+                "SELECT 1
+                 FROM peers
+                 WHERE peer_id = ?
+                   AND (TRIM(username) <> '' OR TRIM(department) <> '')
+                 LIMIT 1",
+            )
+            .bind(peer_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to check existing peer identity")?;
+
+            if existing_identity.is_none() {
+                log::debug!("Skipping peer without contact identity: {}", peer_id);
+                return Ok(());
+            }
+        }
+
         let now = Utc::now().to_rfc3339();
 
         let endpoint_duplicates =
@@ -1445,7 +1501,7 @@ impl Database {
 
         // Cleanup by identity (same name+dept under a different peer_id, e.g. peer IP changed)
         // only when username is known — otherwise we'd nuke other unnamed peers indiscriminately.
-        if !username.is_empty() {
+        if !username.trim().is_empty() {
             let identity_duplicates = sqlx::query(
                 "SELECT peer_id FROM peers WHERE username = ? AND department = ? AND peer_id <> ?",
             )
@@ -1476,8 +1532,8 @@ impl Database {
             "INSERT INTO peers (peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(peer_id) DO UPDATE SET
-                username = CASE WHEN excluded.username = '' THEN peers.username ELSE excluded.username END,
-                department = CASE WHEN excluded.department = '' THEN peers.department ELSE excluded.department END,
+                username = CASE WHEN TRIM(excluded.username) = '' THEN peers.username ELSE excluded.username END,
+                department = CASE WHEN TRIM(excluded.department) = '' THEN peers.department ELSE excluded.department END,
                 software_version = CASE WHEN excluded.software_version = '' THEN peers.software_version ELSE excluded.software_version END,
                 mac_address = CASE WHEN excluded.mac_address = '' THEN peers.mac_address ELSE excluded.mac_address END,
                 avatar_path = CASE
@@ -1616,6 +1672,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at
              FROM peers
+             WHERE TRIM(username) <> '' OR TRIM(department) <> ''
              ORDER BY is_online DESC, last_seen_at DESC",
         )
         .fetch_all(&self.pool)
@@ -1646,7 +1703,8 @@ impl Database {
         let row = sqlx::query(
             "SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at
              FROM peers
-             WHERE peer_id = ?",
+             WHERE peer_id = ?
+               AND (TRIM(username) <> '' OR TRIM(department) <> '')",
         )
         .bind(peer_id)
         .fetch_optional(&self.pool)
@@ -2216,6 +2274,149 @@ mod tests {
 
         assert_eq!(group_first.id, group_duplicate.id);
         assert_eq!(group_first.content, group_duplicate.content);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn filters_contacts_without_identity_from_storage_and_recent() {
+        let db_path = temp_db_path("dirty-contact");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+
+        db.upsert_peer("10.0.0.2:9527", "", "", "10.0.0.2", 9527, false)
+            .await
+            .expect("dirty peer should be ignored without error");
+        db.add_recent_contact("10.0.0.2:9527")
+            .await
+            .expect("recent row can exist independently");
+
+        assert!(db
+            .get_stored_peer("10.0.0.2:9527")
+            .await
+            .expect("dirty peer lookup should succeed")
+            .is_none());
+        assert!(db
+            .list_stored_peers()
+            .await
+            .expect("stored peers should load")
+            .is_empty());
+        assert!(db
+            .list_recent_contacts()
+            .await
+            .expect("recent contacts should load")
+            .is_empty());
+
+        db.upsert_peer("10.0.0.3:9527", "Manual", "", "10.0.0.3", 9527, true)
+            .await
+            .expect("manual contact should persist");
+        db.add_recent_contact("10.0.0.3:9527")
+            .await
+            .expect("manual contact should be recent");
+
+        let recent = db
+            .list_recent_contacts()
+            .await
+            .expect("recent contacts should load");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].peer_id, "10.0.0.3:9527");
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn startup_removes_legacy_dirty_contacts() {
+        let db_path = temp_db_path("legacy-dirty-contact");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO peers (peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at)
+             VALUES (?, '', '', '', '', '', '', 0, ?, ?, 0, ?, ?)",
+        )
+        .bind("10.0.0.8:9527")
+        .bind("10.0.0.8")
+        .bind(9527_i64)
+        .bind(&now)
+        .bind(&now)
+        .execute(&db.pool)
+        .await
+        .expect("legacy dirty peer should insert");
+        sqlx::query(
+            "INSERT INTO peers (peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at)
+             VALUES (?, 'Alice', 'Ops', '', '', '', '', 0, ?, ?, 1, ?, ?)",
+        )
+        .bind("10.0.0.9:9527")
+        .bind("10.0.0.9")
+        .bind(9527_i64)
+        .bind(&now)
+        .bind(&now)
+        .execute(&db.pool)
+        .await
+        .expect("valid legacy peer should insert");
+        db.add_recent_contact("10.0.0.8:9527")
+            .await
+            .expect("dirty recent should insert");
+        db.add_recent_contact("10.0.0.9:9527")
+            .await
+            .expect("valid recent should insert");
+        drop(db);
+
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should reopen and clean legacy dirty contacts");
+        let dirty_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM peers WHERE peer_id = ?")
+            .bind("10.0.0.8:9527")
+            .fetch_one(&db.pool)
+            .await
+            .expect("dirty peer count should load");
+        assert_eq!(dirty_count, 0);
+
+        let recent = db
+            .list_recent_contacts()
+            .await
+            .expect("recent contacts should load");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].peer_id, "10.0.0.9:9527");
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn empty_identity_updates_do_not_overwrite_existing_peer_identity() {
+        let db_path = temp_db_path("preserve-contact");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+
+        db.upsert_peer("peer-1", "Alice", "Ops", "10.0.0.4", 9527, true)
+            .await
+            .expect("named peer should persist");
+        db.upsert_peer("peer-1", "", "", "10.0.0.5", 9527, false)
+            .await
+            .expect("empty identity update should preserve existing identity");
+        db.upsert_peer("peer-1", "   ", "   ", "10.0.0.6", 9527, false)
+            .await
+            .expect("blank identity update should preserve existing identity");
+
+        let stored = db
+            .get_stored_peer("peer-1")
+            .await
+            .expect("stored peer should load")
+            .expect("peer should still exist");
+        assert_eq!(stored.username, "Alice");
+        assert_eq!(stored.department, "Ops");
+        assert_eq!(stored.ip, "10.0.0.6");
+        assert!(!stored.is_online);
 
         drop(db);
         let _ = std::fs::remove_file(db_path);
