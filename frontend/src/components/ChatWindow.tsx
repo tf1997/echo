@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import type { ChatMessage, Peer } from "../types";
 import type { GroupInfo } from "../api";
 import { MessageBubble, DateDivider, getCollapsedMessageText, isLongMessageText } from "./MessageBubble";
@@ -54,6 +54,7 @@ interface ChatWindowProps {
   onSendSticker: (filePath: string, clientMsgId?: string) => Promise<ChatMessage>;
   onGroupUpdated?: () => void;
   onLoadHistoryContext?: (messageId: number) => Promise<void>;
+  onDeleteMessages?: (messageIds: number[]) => Promise<void>;
   onNudgeSignalConsumed?: (nonce: number) => void;
   nudgeSignal?: {
     kind: "contact" | "group";
@@ -565,7 +566,7 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
   );
 }
 
-export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, loadingMessages = false, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendNudge, onSendRps, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, onNudgeSignalConsumed, nudgeSignal = null, historySearchRequest = null }: ChatWindowProps) {
+export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, loadingMessages = false, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendNudge, onSendRps, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, onDeleteMessages, onNudgeSignalConsumed, nudgeSignal = null, historySearchRequest = null }: ChatWindowProps) {
   const peerId = peer?.id ?? null;
   const pendingConversationKey = isGroup
     ? groupId ? `group:${groupId}` : peerId ? `group:${peerId}` : ""
@@ -650,6 +651,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [forwardModal, setForwardModal] = useState<{ messages: ChatMessage[]; mode: ForwardMode } | null>(null);
+  const [deletingSelected, setDeletingSelected] = useState(false);
   const [showGroupPanel, setShowGroupPanel] = useState(false);
   const [groupNameEdit, setGroupNameEdit] = useState("");
   const [groupActionBusy, setGroupActionBusy] = useState("");
@@ -672,6 +674,10 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const contextHighlightTimerRef = useRef<number | null>(null);
   const captureScreenshotRef = useRef<(() => void) | null>(null);
   const screenshotOptionsRef = useRef<HTMLDivElement>(null);
+  const selectedMessageIds = useMemo(
+    () => messages.filter((message) => selectedIds.has(message.id)).map((message) => message.id),
+    [messages, selectedIds]
+  );
 
   useEffect(() => {
     return () => {
@@ -689,6 +695,24 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
 
   const exitSelectMode = useCallback(() => { setSelectMode(false); setSelectedIds(new Set()); }, []);
 
+  const enterSelectMode = useCallback((initialMessage?: ChatMessage) => {
+    setForwardModal(null);
+    setShowHistory(false);
+    setShowSearch(false);
+    setSearchQuery("");
+    setSearchIndex(0);
+    setSelectMode(true);
+    setSelectedIds(initialMessage ? new Set([initialMessage.id]) : new Set());
+  }, []);
+
+  const handleToggleSelectMode = useCallback(() => {
+    if (selectMode) {
+      exitSelectMode();
+      return;
+    }
+    enterSelectMode();
+  }, [enterSelectMode, exitSelectMode, selectMode]);
+
   useEffect(() => {
     if (!historySearchRequest?.query.trim()) return;
     setForwardModal(null);
@@ -700,9 +724,8 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   }, [exitSelectMode, historySearchRequest?.nonce, historySearchRequest?.query]);
 
   const handleStartForward = useCallback((msg: ChatMessage) => {
-    setSelectMode(true);
-    setSelectedIds(new Set([msg.id]));
-  }, []);
+    enterSelectMode(msg);
+  }, [enterSelectMode]);
 
   const handleToggleSelect = useCallback((msg: ChatMessage) => {
     setSelectedIds((prev) => {
@@ -717,6 +740,36 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     if (selected.length === 0) return;
     setForwardModal({ messages: selected, mode });
   }, [messages, selectedIds]);
+
+  const handleDeleteSelected = useCallback(async () => {
+    if (selectedMessageIds.length === 0 || deletingSelected || !onDeleteMessages) return;
+
+    const confirmed = await ask(`确定删除选中的 ${selectedMessageIds.length} 条聊天记录吗？删除后只会从本机记录中移除。`, {
+      title: "删除聊天记录",
+      type: "warning",
+      okLabel: "删除",
+      cancelLabel: "取消",
+    });
+    if (!confirmed) return;
+
+    setDeletingSelected(true);
+    try {
+      await onDeleteMessages(selectedMessageIds);
+      setForwardModal(null);
+      setContextHighlightId((current) => (
+        current !== null && selectedMessageIds.includes(current) ? null : current
+      ));
+      exitSelectMode();
+    } catch (error) {
+      await showDialogMessage(String(error || "删除失败，请重试"), {
+        title: "删除失败",
+        type: "error",
+        okLabel: "确定",
+      }).catch(() => {});
+    } finally {
+      setDeletingSelected(false);
+    }
+  }, [deletingSelected, exitSelectMode, onDeleteMessages, selectedMessageIds]);
 
   // 核心去重逻辑：通过 client_msg_id 自动清理已保存的 pending 消息
   useEffect(() => {
@@ -1867,6 +1920,19 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
           <span>聊天记录</span>
         </button>
         <button
+          type="button"
+          onClick={handleToggleSelectMode}
+          className={`chat-header-action flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center hover:bg-gray-700 ${selectMode ? "chat-header-action-active bg-gray-700 text-white" : "text-gray-400 hover:text-white"}`}
+          title={selectMode ? "退出选择" : "选择消息"}
+          aria-pressed={selectMode}
+          aria-label={selectMode ? "退出选择" : "选择消息"}
+        >
+          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 11l2 2 4-4" />
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 5h14v14H5z" />
+          </svg>
+        </button>
+        <button
           onClick={() => { setShowHistory(false); setShowSearch((v) => !v); setSearchQuery(""); setSearchIndex(0); }}
           className="chat-header-action flex-shrink-0 w-8 h-8 rounded-lg hover:bg-gray-700 flex items-center justify-center text-gray-400 hover:text-white"
           title="搜索消息"
@@ -2065,15 +2131,20 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       </div>
       {selectMode && (
         <div className="chat-selection-bar flex items-center gap-2 px-4 py-2.5 bg-gray-900 border-t border-gray-700">
-          <span className="text-sm text-gray-300 flex-1">已选 {selectedIds.size} 条</span>
-          <button onClick={exitSelectMode} className="px-3 py-1.5 text-sm text-gray-400 hover:text-white rounded-lg hover:bg-gray-700">取消</button>
+          <span className="text-sm text-gray-300 flex-1">已选 {selectedMessageIds.length} 条</span>
+          <button onClick={exitSelectMode} disabled={deletingSelected} className="px-3 py-1.5 text-sm text-gray-400 hover:text-white rounded-lg hover:bg-gray-700 disabled:opacity-40">取消</button>
           <button
-            disabled={selectedIds.size === 0}
+            disabled={selectedMessageIds.length === 0 || deletingSelected || !onDeleteMessages}
+            onClick={handleDeleteSelected}
+            className="chat-danger-action px-3 py-1.5 text-sm rounded-lg disabled:opacity-40"
+          >{deletingSelected ? "删除中..." : "删除"}</button>
+          <button
+            disabled={selectedMessageIds.length === 0 || deletingSelected}
             onClick={() => openForwardModal("individual")}
             className="sidebar-secondary-action px-3 py-1.5 text-sm bg-gray-700 hover:bg-gray-600 text-white rounded-lg disabled:opacity-40"
           >逐条转发</button>
           <button
-            disabled={selectedIds.size === 0}
+            disabled={selectedMessageIds.length === 0 || deletingSelected}
             onClick={() => openForwardModal("merged")}
             className="sidebar-primary-action px-3 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg disabled:opacity-40"
           >合并转发</button>

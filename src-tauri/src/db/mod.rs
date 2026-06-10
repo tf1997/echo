@@ -684,6 +684,23 @@ impl Database {
         Ok(())
     }
 
+    pub async fn delete_messages(&self, message_ids: &[i64]) -> Result<u64> {
+        let mut deleted = 0;
+        for message_id in message_ids
+            .iter()
+            .copied()
+            .filter(|message_id| *message_id > 0)
+        {
+            let result = sqlx::query("DELETE FROM messages WHERE id = ?")
+                .bind(message_id)
+                .execute(&self.pool)
+                .await
+                .context("Failed to delete message")?;
+            deleted += result.rows_affected();
+        }
+        Ok(deleted)
+    }
+
     pub async fn get_user_profile(&self) -> Result<Option<UserProfile>> {
         let row = sqlx::query("SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at FROM user_profile WHERE id = 1")
             .fetch_optional(&self.pool)

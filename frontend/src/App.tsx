@@ -16,6 +16,7 @@ import {
   getPeers,
   getConversation,
   getConversationHistory,
+  deleteChatMessages,
   sendMessage,
   sendMessageTyped,
   sendFile,
@@ -1096,6 +1097,27 @@ function App() {
     }
   }, [selectedGroupId, selectedPeer]);
 
+  const handleDeleteMessages = useCallback(async (messageIds: number[]) => {
+    const ids = Array.from(new Set(messageIds.filter((id) => Number.isFinite(id) && id > 0)));
+    if (ids.length === 0) return;
+
+    const deletedIds = new Set(ids);
+    await deleteChatMessages(ids);
+    setMessages((currentMessages) => currentMessages.filter((messageItem) => !deletedIds.has(messageItem.id)));
+    setHistorySearchRequest((current) => (
+      current?.messageId && deletedIds.has(current.messageId) ? null : current
+    ));
+    setRecentRefreshKey((key) => key + 1);
+
+    if (selectedGroupId) {
+      const nextGroups = await listGroups();
+      setGroups(nextGroups);
+      return;
+    }
+
+    await loadPeerState();
+  }, [loadPeerState, selectedGroupId]);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-screen bg-gray-900">
@@ -1257,6 +1279,7 @@ function App() {
         onNudgeSignalConsumed={handleNudgeSignalConsumed}
         onGroupUpdated={() => listGroups().then(setGroups).catch(() => {})}
         onLoadHistoryContext={handleLoadHistoryContext}
+        onDeleteMessages={handleDeleteMessages}
         historySearchRequest={
           historySearchRequest && (
             selectedGroupId

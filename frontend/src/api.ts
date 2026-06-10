@@ -273,6 +273,10 @@ export async function getGroupHistory(groupId: string, beforeId?: number, limit?
   });
 }
 
+export async function deleteChatMessages(messageIds: number[]): Promise<number> {
+  return await invoke("delete_chat_messages", { messageIds });
+}
+
 export async function searchConversationMessages(peerId: string, query: string, limit?: number, filter?: HistoryFilter, dayStart?: string, dayEnd?: string): Promise<ChatMessage[]> {
   const args = limit === undefined ? { peerId, query, dayStart, dayEnd } : { peerId, query, limit, dayStart, dayEnd };
   if (filter && filter !== "all") return await invoke("search_conversation_messages", { ...args, filter });

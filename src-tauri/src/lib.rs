@@ -645,6 +645,7 @@ pub fn run() {
             commands::search_group_messages,
             commands::get_conversation_history,
             commands::get_group_history,
+            commands::delete_chat_messages,
             commands::check_peer_online,
             commands::discover_by_ip,
             commands::get_scan_subnets,
