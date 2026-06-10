@@ -111,6 +111,11 @@ function isSamePeerConversation(a: Peer | null | undefined, b: Peer | null | und
   return !!a.id && !!b.id && a.id === b.id;
 }
 
+function getPeerEndpointKey(peer: Pick<Peer, "ip" | "port"> | null | undefined) {
+  if (!peer?.ip || !peer.port) return "";
+  return `${peer.ip}:${peer.port}`;
+}
+
 function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
   if (left.length !== right.length) return false;
 
@@ -220,6 +225,7 @@ function App() {
   const onlineGraceUntilRef = useRef(new Map<string, number>());
   const loadPeerStateInFlightRef = useRef(false);
   const activeConversationRef = useRef<ActiveConversation | null>(null);
+  const selectedContactIdentityRef = useRef<{ id: string; endpoint: string } | null>(null);
   const selectionNonceRef = useRef(0);
   const nudgeNonceRef = useRef(0);
   const incomingNudgeCooldownRef = useRef(new Map<string, number>());
@@ -537,7 +543,10 @@ function App() {
     setSelectedPeer((current) => {
       if (!current) return current;
       const canonicalPeer = mergedPeers.find((peer) => peer.id === current.id);
-      return canonicalPeer ?? current;
+      if (canonicalPeer) return canonicalPeer;
+      const currentEndpoint = getPeerEndpointKey(current);
+      if (!currentEndpoint) return current;
+      return mergedPeers.find((peer) => getPeerEndpointKey(peer) === currentEndpoint) ?? current;
     });
     return mergedPeers;
   }, [mergePeers]);
@@ -629,6 +638,42 @@ function App() {
     activeConversationRef.current = null;
   }, [selectedPeerId, selectedGroupId]);
 
+  useEffect(() => {
+    if (selectedGroupId || !selectedPeer) {
+      selectedContactIdentityRef.current = null;
+      return;
+    }
+
+    const endpoint = getPeerEndpointKey(selectedPeer);
+    const currentIdentity = { id: selectedPeer.id, endpoint };
+    const previousIdentity = selectedContactIdentityRef.current;
+    selectedContactIdentityRef.current = currentIdentity;
+
+    if (
+      !appInfo?.initialized ||
+      !endpoint ||
+      !previousIdentity ||
+      previousIdentity.endpoint !== endpoint ||
+      previousIdentity.id === currentIdentity.id
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    activeConversationRef.current = { kind: "contact", id: currentIdentity.id };
+    getConversation(currentIdentity.id, MESSAGE_FETCH_LIMIT)
+      .then((conversation) => {
+        const active = activeConversationRef.current;
+        if (cancelled || active?.kind !== "contact" || active.id !== currentIdentity.id) return;
+        setMessages(conversation);
+      })
+      .catch(console.error);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [appInfo?.initialized, selectedGroupId, selectedPeer, selectedPeerId]);
+
   const isActiveConversation = useCallback((kind: ConversationKind, id: string) => {
     const active = activeConversationRef.current;
     return active?.kind === kind && active.id === id;
@@ -680,6 +725,7 @@ function App() {
   const handleSelectPeer = useCallback(async (peer: Peer, options?: SelectConversationOptions) => {
     const currentActive = activeConversationRef.current;
     if (currentActive?.kind === "contact" && isSamePeerConversation(selectedPeer, peer)) {
+      const shouldReloadEmptyConversation = messages.length === 0 && !conversationLoading;
       setSelectedGroupId(null);
       setSelectedPeer((current) => {
         if (!current) return peer;
@@ -693,6 +739,24 @@ function App() {
       });
       if (!options?.preserveHistory) {
         setHistorySearchRequest(null);
+      }
+      if (shouldReloadEmptyConversation) {
+        const nonce = ++selectionNonceRef.current;
+        setConversationLoading(true);
+        try {
+          const [conv] = await Promise.all([
+            getConversation(peer.id, MESSAGE_FETCH_LIMIT),
+            markRead(peer.id),
+          ]);
+          if (selectionNonceRef.current !== nonce) return;
+          setMessages(conv);
+        } catch (err) {
+          console.error("Failed to reload empty conversation:", err);
+        } finally {
+          if (selectionNonceRef.current === nonce) {
+            setConversationLoading(false);
+          }
+        }
       }
       return;
     }
@@ -731,7 +795,7 @@ function App() {
         setConversationLoading(false);
       }
     }
-  }, [selectedPeer]);
+  }, [conversationLoading, messages.length, selectedPeer]);
 
   const handleSelectGroup = useCallback(async (groupId: string, options?: SelectConversationOptions) => {
     const currentActive = activeConversationRef.current;
