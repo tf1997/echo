@@ -2344,6 +2344,18 @@ pub async fn get_group_history(
 }
 
 #[tauri::command]
+pub async fn delete_chat_messages(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+) -> Result<u64, String> {
+    state
+        .db
+        .delete_messages(&message_ids)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn get_scan_subnets(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     // Return from in-memory config (more up-to-date), fallback to DB
     if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {

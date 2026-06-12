@@ -2079,7 +2079,8 @@ body {
 
 .sidebar-primary-action,
 .sidebar-secondary-action,
-.chat-header-action {
+.chat-header-action,
+.chat-danger-action {
   border-radius: var(--radius-md) !important;
   box-shadow: none !important;
   transition: background-color var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast);
@@ -2116,6 +2117,57 @@ body {
   background: var(--echo-control) !important;
   color: var(--echo-text) !important;
   box-shadow: var(--shadow-soft) !important;
+}
+
+.chat-danger-action {
+  border: 1px solid color-mix(in srgb, var(--echo-danger) 34%, transparent) !important;
+  background: color-mix(in srgb, var(--echo-danger) 14%, transparent) !important;
+  color: color-mix(in srgb, var(--echo-danger) 78%, var(--echo-text) 22%) !important;
+}
+
+.chat-danger-action:hover,
+.chat-danger-action:focus-visible {
+  border-color: var(--echo-danger) !important;
+  background: var(--echo-danger) !important;
+  color: #ffffff !important;
+  box-shadow: var(--shadow-soft) !important;
+  transform: none;
+}
+
+.chat-danger-action:disabled,
+.chat-danger-action:disabled:hover,
+.chat-danger-action:disabled:focus-visible {
+  border-color: var(--echo-border) !important;
+  background: var(--echo-control) !important;
+  color: var(--echo-muted) !important;
+  box-shadow: none !important;
+}
+
+:root[data-theme="daylight"] .chat-danger-action,
+:root[data-theme="wechat"] .chat-danger-action {
+  border-color: color-mix(in srgb, var(--echo-danger) 36%, var(--echo-border) 64%) !important;
+  background: color-mix(in srgb, var(--echo-danger) 10%, var(--echo-panel) 90%) !important;
+  color: var(--echo-danger) !important;
+}
+
+:root[data-theme="daylight"] .chat-danger-action:hover,
+:root[data-theme="daylight"] .chat-danger-action:focus-visible,
+:root[data-theme="wechat"] .chat-danger-action:hover,
+:root[data-theme="wechat"] .chat-danger-action:focus-visible {
+  border-color: var(--echo-danger) !important;
+  background: var(--echo-danger) !important;
+  color: #ffffff !important;
+}
+
+:root[data-theme="daylight"] .chat-danger-action:disabled,
+:root[data-theme="daylight"] .chat-danger-action:disabled:hover,
+:root[data-theme="daylight"] .chat-danger-action:disabled:focus-visible,
+:root[data-theme="wechat"] .chat-danger-action:disabled,
+:root[data-theme="wechat"] .chat-danger-action:disabled:hover,
+:root[data-theme="wechat"] .chat-danger-action:disabled:focus-visible {
+  border-color: var(--echo-border) !important;
+  background: var(--echo-control) !important;
+  color: var(--echo-muted) !important;
 }
 
 .sidebar-tabs {
@@ -2607,6 +2659,7 @@ body {
 .sidebar-primary-action,
 .sidebar-secondary-action,
 .chat-header-action,
+.chat-danger-action,
 .composer-tool-button,
 .composer-send-button,
 .screenshot-tool-button,

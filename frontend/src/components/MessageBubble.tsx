@@ -580,7 +580,7 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
             className="px-3 py-1 text-xs text-gray-200 hover:bg-gray-700 rounded-lg whitespace-nowrap"
             onClick={(e) => { e.stopPropagation(); onStartForward?.(message); setShowMenu(false); }}
           >
-            转发
+            多选
           </button>
           {canAddSticker && (
             <button
