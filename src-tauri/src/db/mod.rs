@@ -6,6 +6,7 @@ use sqlx::{
     sqlite::{SqlitePoolOptions, SqliteRow},
     Pool, Row, Sqlite,
 };
+use std::net::IpAddr;
 
 use crate::contact_filter;
 
@@ -141,6 +142,56 @@ fn normalize_search_limit(limit: Option<i64>) -> i64 {
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .max(1)
         .min(MAX_SEARCH_LIMIT)
+}
+
+fn endpoint_peer_id(ip: &str, port: u16) -> String {
+    format!("{}:{}", ip.trim(), port)
+}
+
+fn canonicalize_endpoint_peer_id(peer_id: &str, ip: &str, port: u16) -> String {
+    let trimmed = peer_id.trim();
+    if is_endpoint_peer_id(trimmed) {
+        endpoint_peer_id(ip, port)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn is_endpoint_peer_id(peer_id: &str) -> bool {
+    let Some((host, port_text)) = peer_id.rsplit_once(':') else {
+        return false;
+    };
+    if host.trim().parse::<IpAddr>().is_err() {
+        return false;
+    }
+    port_text.parse::<u16>().is_ok()
+}
+
+fn rewrite_peer_ids_in_json(
+    value: &mut serde_json::Value,
+    old_peer_id: &str,
+    new_peer_id: &str,
+    changed: &mut bool,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text == old_peer_id {
+                *text = new_peer_id.to_string();
+                *changed = true;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_peer_ids_in_json(item, old_peer_id, new_peer_id, changed);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values_mut() {
+                rewrite_peer_ids_in_json(value, old_peer_id, new_peer_id, changed);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn message_filter_clause(filter: Option<&str>) -> &'static str {
@@ -386,16 +437,6 @@ impl Database {
         .context("Failed to create messages table")?;
 
         sqlx::query(
-            "DELETE FROM peers
-             WHERE rowid NOT IN (
-                SELECT MAX(rowid) FROM peers GROUP BY ip, port
-             )",
-        )
-        .execute(&self.pool)
-        .await
-        .context("Failed to clean duplicate peer endpoints")?;
-
-        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_messages_conversation
              ON messages(sender_id, receiver_id)",
         )
@@ -609,7 +650,76 @@ impl Database {
         .await
         .ok();
 
+        self.normalize_legacy_endpoint_peer_ids().await?;
+        self.clean_duplicate_peer_endpoints().await?;
+
         info!("Database initialized successfully.");
+        Ok(())
+    }
+
+    async fn normalize_legacy_endpoint_peer_ids(&self) -> Result<()> {
+        let rows = sqlx::query("SELECT peer_id, ip, port FROM peers")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to load peers for endpoint normalization")?;
+
+        for row in rows {
+            let old_peer_id: String = row.get("peer_id");
+            let ip: String = row.get("ip");
+            let port_i64: i64 = row.get("port");
+            let Ok(port) = u16::try_from(port_i64) else {
+                continue;
+            };
+            if !contact_filter::has_valid_endpoint(&ip, port) {
+                continue;
+            }
+
+            let new_peer_id = canonicalize_endpoint_peer_id(&old_peer_id, &ip, port);
+            if old_peer_id != new_peer_id {
+                self.migrate_legacy_endpoint_peer(&old_peer_id, &new_peer_id)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn clean_duplicate_peer_endpoints(&self) -> Result<()> {
+        let rows = sqlx::query(
+            "SELECT stale.peer_id AS old_peer_id, keep.peer_id AS new_peer_id
+             FROM peers stale
+             JOIN (
+                SELECT ip, port, MAX(rowid) AS keep_rowid
+                FROM peers
+                GROUP BY ip, port
+                HAVING COUNT(*) > 1
+             ) endpoint_keep
+                ON stale.ip = endpoint_keep.ip
+               AND stale.port = endpoint_keep.port
+               AND stale.rowid <> endpoint_keep.keep_rowid
+             JOIN peers keep ON keep.rowid = endpoint_keep.keep_rowid",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to load duplicate peer endpoints")?;
+
+        for row in rows {
+            let old_peer_id: String = row.get("old_peer_id");
+            let new_peer_id: String = row.get("new_peer_id");
+            self.migrate_peer_references(&old_peer_id, &new_peer_id)
+                .await?;
+        }
+
+        sqlx::query(
+            "DELETE FROM peers
+             WHERE rowid NOT IN (
+                SELECT MAX(rowid) FROM peers GROUP BY ip, port
+             )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to clean duplicate peer endpoints")?;
+
         Ok(())
     }
 
@@ -714,6 +824,29 @@ impl Database {
         software_version: &str,
         mac_address: &str,
     ) -> Result<()> {
+        let peer_id = peer_id.trim();
+        if !peer_id.is_empty() {
+            let existing = sqlx::query("SELECT peer_id FROM user_profile WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await
+                .context("Failed to load existing user profile peer_id")?;
+            if let Some(row) = existing {
+                let old_peer_id = row
+                    .try_get::<Option<String>, _>("peer_id")
+                    .unwrap_or_default()
+                    .unwrap_or_default();
+                let old_peer_id = old_peer_id.trim();
+                if !old_peer_id.is_empty()
+                    && old_peer_id != peer_id
+                    && is_endpoint_peer_id(old_peer_id)
+                    && is_endpoint_peer_id(peer_id)
+                {
+                    self.migrate_self_endpoint_peer(old_peer_id, peer_id)
+                        .await?;
+                }
+            }
+        }
+
         sqlx::query(
             "INSERT INTO user_profile (id, peer_id, username, department, software_version, mac_address)
              VALUES (1, ?, ?, ?, ?, ?)
@@ -1446,14 +1579,23 @@ impl Database {
         port: u16,
         is_online: bool,
     ) -> Result<()> {
-        if peer_id.trim().is_empty() || !contact_filter::has_valid_endpoint(ip, port) {
+        let incoming_peer_id = peer_id.trim();
+        if incoming_peer_id.is_empty() || !contact_filter::has_valid_endpoint(ip, port) {
             log::debug!(
                 "Skipping peer with invalid endpoint: {} @ {}:{}",
-                peer_id,
+                incoming_peer_id,
                 ip,
                 port
             );
             return Ok(());
+        }
+
+        let canonical_peer_id = canonicalize_endpoint_peer_id(incoming_peer_id, ip, port);
+        let peer_id = canonical_peer_id.as_str();
+
+        if incoming_peer_id != peer_id {
+            self.migrate_legacy_endpoint_peer(incoming_peer_id, peer_id)
+                .await?;
         }
 
         if !contact_filter::has_contact_identity(username, department) {
@@ -1595,6 +1737,13 @@ impl Database {
             .await
             .context("Failed to migrate pending group messages")?;
 
+        sqlx::query("UPDATE pending_group_messages SET sender_id = ? WHERE sender_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to migrate pending group message senders")?;
+
         sqlx::query("UPDATE pending_notifications SET peer_id = ? WHERE peer_id = ?")
             .bind(new_peer_id)
             .bind(old_peer_id)
@@ -1602,12 +1751,22 @@ impl Database {
             .await
             .context("Failed to migrate pending notifications")?;
 
+        self.migrate_pending_notification_payloads(old_peer_id, new_peer_id)
+            .await?;
+
         sqlx::query("UPDATE pending_file_transfers SET peer_id = ? WHERE peer_id = ?")
             .bind(new_peer_id)
             .bind(old_peer_id)
             .execute(&self.pool)
             .await
             .context("Failed to migrate pending file transfers")?;
+
+        sqlx::query("UPDATE pending_file_transfers SET sender_id = ? WHERE sender_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to migrate pending file transfer senders")?;
 
         sqlx::query("UPDATE messages SET sender_id = ? WHERE sender_id = ?")
             .bind(new_peer_id)
@@ -1629,6 +1788,137 @@ impl Database {
             .execute(&self.pool)
             .await
             .context("Failed to migrate group creators")?;
+
+        Ok(())
+    }
+
+    async fn migrate_pending_notification_payloads(
+        &self,
+        old_peer_id: &str,
+        new_peer_id: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query("SELECT id, payload FROM pending_notifications")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to load pending notification payloads")?;
+
+        for row in rows {
+            let id: i64 = row.get("id");
+            let payload: String = row.get("payload");
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                continue;
+            };
+            let mut changed = false;
+            rewrite_peer_ids_in_json(&mut value, old_peer_id, new_peer_id, &mut changed);
+            if !changed {
+                continue;
+            }
+
+            let updated = serde_json::to_string(&value)
+                .context("Failed to serialize migrated pending notification payload")?;
+            sqlx::query("UPDATE pending_notifications SET payload = ? WHERE id = ?")
+                .bind(updated)
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .context("Failed to update pending notification payload")?;
+        }
+
+        Ok(())
+    }
+
+    async fn migrate_legacy_endpoint_peer(
+        &self,
+        old_peer_id: &str,
+        new_peer_id: &str,
+    ) -> Result<()> {
+        if old_peer_id == new_peer_id {
+            return Ok(());
+        }
+
+        self.copy_peer_row(old_peer_id, new_peer_id).await?;
+        self.migrate_peer_references(old_peer_id, new_peer_id)
+            .await?;
+
+        sqlx::query("DELETE FROM peers WHERE peer_id = ?")
+            .bind(old_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to remove legacy endpoint peer")?;
+
+        Ok(())
+    }
+
+    async fn copy_peer_row(&self, old_peer_id: &str, new_peer_id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO peers (
+                peer_id, username, department, software_version, mac_address,
+                avatar_path, avatar_hash, avatar_updated_at,
+                ip, port, is_online, first_seen_at, last_seen_at
+             )
+             SELECT
+                ?, username, department, software_version, mac_address,
+                avatar_path, avatar_hash, avatar_updated_at,
+                ip, port, is_online, first_seen_at, last_seen_at
+             FROM peers
+             WHERE peer_id = ?
+             ON CONFLICT(peer_id) DO UPDATE SET
+                username = CASE WHEN TRIM(excluded.username) = '' THEN peers.username ELSE excluded.username END,
+                department = CASE WHEN TRIM(excluded.department) = '' THEN peers.department ELSE excluded.department END,
+                software_version = CASE WHEN excluded.software_version = '' THEN peers.software_version ELSE excluded.software_version END,
+                mac_address = CASE WHEN excluded.mac_address = '' THEN peers.mac_address ELSE excluded.mac_address END,
+                avatar_path = CASE
+                    WHEN peers.avatar_path = '' THEN excluded.avatar_path
+                    WHEN excluded.avatar_updated_at > peers.avatar_updated_at THEN excluded.avatar_path
+                    ELSE peers.avatar_path
+                END,
+                avatar_hash = CASE
+                    WHEN excluded.avatar_updated_at > peers.avatar_updated_at THEN excluded.avatar_hash
+                    WHEN peers.avatar_hash = '' AND excluded.avatar_hash <> '' THEN excluded.avatar_hash
+                    ELSE peers.avatar_hash
+                END,
+                avatar_updated_at = CASE
+                    WHEN excluded.avatar_updated_at > peers.avatar_updated_at THEN excluded.avatar_updated_at
+                    WHEN peers.avatar_hash = '' AND excluded.avatar_hash <> '' THEN excluded.avatar_updated_at
+                    ELSE peers.avatar_updated_at
+                END,
+                ip = excluded.ip,
+                port = excluded.port,
+                is_online = CASE WHEN excluded.is_online THEN excluded.is_online ELSE peers.is_online END,
+                first_seen_at = CASE
+                    WHEN peers.first_seen_at = '' THEN excluded.first_seen_at
+                    WHEN excluded.first_seen_at = '' THEN peers.first_seen_at
+                    WHEN excluded.first_seen_at < peers.first_seen_at THEN excluded.first_seen_at
+                    ELSE peers.first_seen_at
+                END,
+                last_seen_at = CASE
+                    WHEN excluded.last_seen_at > peers.last_seen_at THEN excluded.last_seen_at
+                    ELSE peers.last_seen_at
+                END",
+        )
+        .bind(new_peer_id)
+        .bind(old_peer_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to copy peer row")?;
+
+        Ok(())
+    }
+
+    async fn migrate_self_endpoint_peer(&self, old_peer_id: &str, new_peer_id: &str) -> Result<()> {
+        if old_peer_id == new_peer_id {
+            return Ok(());
+        }
+
+        self.migrate_peer_references(old_peer_id, new_peer_id)
+            .await?;
+
+        sqlx::query("DELETE FROM peers WHERE peer_id IN (?, ?)")
+            .bind(old_peer_id)
+            .bind(new_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to remove stale self peer rows")?;
 
         Ok(())
     }
@@ -2357,6 +2647,258 @@ mod tests {
         assert_eq!(stored.department, "Ops");
         assert_eq!(stored.ip, "10.0.0.6");
         assert!(!stored.is_online);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn endpoint_peer_id_drift_migrates_to_current_endpoint() {
+        let db_path = temp_db_path("endpoint-drift");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+
+        db.upsert_peer_with_avatar(
+            "10.0.0.2:9527",
+            "Alice",
+            "Ops",
+            "1.0.0",
+            "aa:bb:cc",
+            "/tmp/alice.png",
+            "avatar-old",
+            10,
+            "10.0.0.2",
+            9527,
+            true,
+        )
+        .await
+        .expect("old endpoint should persist");
+        db.add_recent_contact("10.0.0.2:9527")
+            .await
+            .expect("old endpoint should become recent");
+        db.save_message(
+            "me",
+            "Me",
+            "10.0.0.2:9527",
+            "old endpoint message",
+            "text",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("message to old endpoint should persist");
+
+        db.upsert_peer_with_avatar(
+            "10.0.0.2:9527",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "avatar-new",
+            20,
+            "10.0.0.9",
+            9527,
+            true,
+        )
+        .await
+        .expect("drifted endpoint should migrate");
+
+        assert!(db
+            .get_stored_peer("10.0.0.2:9527")
+            .await
+            .expect("old peer lookup should succeed")
+            .is_none());
+
+        let migrated = db
+            .get_stored_peer("10.0.0.9:9527")
+            .await
+            .expect("new peer lookup should succeed")
+            .expect("new endpoint should exist");
+        assert_eq!(migrated.username, "Alice");
+        assert_eq!(migrated.department, "Ops");
+        assert_eq!(migrated.software_version, "1.0.0");
+        assert_eq!(migrated.mac_address, "aa:bb:cc");
+        assert_eq!(migrated.avatar_path, "");
+        assert_eq!(migrated.avatar_hash, "avatar-new");
+        assert_eq!(migrated.avatar_updated_at, 20);
+        assert_eq!(migrated.ip, "10.0.0.9");
+
+        let recent = db
+            .list_recent_contacts()
+            .await
+            .expect("recent contacts should load");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].peer_id, "10.0.0.9:9527");
+
+        let old_messages = db
+            .get_conversation("10.0.0.2:9527", "me", Some(10))
+            .await
+            .expect("old endpoint messages should load");
+        let new_messages = db
+            .get_conversation("10.0.0.9:9527", "me", Some(10))
+            .await
+            .expect("new endpoint messages should load");
+        assert!(old_messages.is_empty());
+        assert_eq!(new_messages.len(), 1);
+        assert_eq!(new_messages[0].content, "old endpoint message");
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn user_profile_endpoint_peer_id_drift_migrates_self_references() {
+        let db_path = temp_db_path("profile-endpoint-drift");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+
+        db.save_user_profile("10.0.0.2:9527", "Me", "Ops", "1.0.0", "aa:bb:cc")
+            .await
+            .expect("old profile should save");
+        db.upsert_peer_with_avatar(
+            "10.0.0.2:9527",
+            "Me",
+            "Ops",
+            "1.0.0",
+            "aa:bb:cc",
+            "/tmp/me.png",
+            "self-avatar",
+            10,
+            "10.0.0.2",
+            9527,
+            true,
+        )
+        .await
+        .expect("legacy self peer row should persist");
+        db.upsert_peer("10.0.0.3:9527", "Alice", "Ops", "10.0.0.3", 9527, true)
+            .await
+            .expect("peer should persist");
+        db.save_message(
+            "10.0.0.2:9527",
+            "Me",
+            "10.0.0.3:9527",
+            "hello before ip change",
+            "text",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("self message should persist");
+        db.create_group(
+            "group-1",
+            "Ops Group",
+            "10.0.0.2:9527",
+            &["10.0.0.2:9527".to_string(), "10.0.0.3:9527".to_string()],
+        )
+        .await
+        .expect("group should persist");
+        db.store_pending_group_msg(
+            "group-1",
+            "10.0.0.3:9527",
+            "10.0.0.2:9527",
+            "Me",
+            "queued group message",
+            "text",
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .expect("legacy pending group message should persist");
+        db.queue_pending_notification(
+            "10.0.0.3:9527",
+            "group_created",
+            r#"{"sender_id":"10.0.0.2:9527","receiver_id":"10.0.0.3:9527","content":{"member_ids":["10.0.0.2:9527","10.0.0.3:9527"]}}"#,
+        )
+        .await
+        .expect("pending notification should persist");
+        db.queue_pending_file_transfer(
+            "group-1",
+            "10.0.0.3:9527",
+            "10.0.0.2:9527",
+            "Me",
+            "Ops",
+            9527,
+            "/tmp/queued-file.txt",
+            "queued-file.txt",
+            1,
+            "file",
+            Some("client-queued-file"),
+        )
+        .await
+        .expect("pending file transfer should persist");
+
+        db.save_user_profile("10.0.0.9:9527", "Me", "Ops", "1.0.1", "aa:bb:cc")
+            .await
+            .expect("new profile should save and migrate references");
+
+        let profile = db
+            .get_user_profile()
+            .await
+            .expect("profile should load")
+            .expect("profile should exist");
+        assert_eq!(profile.peer_id, "10.0.0.9:9527");
+        assert_eq!(profile.software_version, "1.0.1");
+
+        assert!(db
+            .get_stored_peer("10.0.0.2:9527")
+            .await
+            .expect("old self peer lookup should succeed")
+            .is_none());
+        assert!(db
+            .get_stored_peer("10.0.0.9:9527")
+            .await
+            .expect("new self peer lookup should succeed")
+            .is_none());
+
+        let old_messages = db
+            .get_conversation("10.0.0.3:9527", "10.0.0.2:9527", Some(10))
+            .await
+            .expect("old self conversation lookup should load");
+        let new_messages = db
+            .get_conversation("10.0.0.3:9527", "10.0.0.9:9527", Some(10))
+            .await
+            .expect("new self conversation lookup should load");
+        assert!(old_messages.is_empty());
+        assert_eq!(new_messages.len(), 1);
+        assert_eq!(new_messages[0].sender_id, "10.0.0.9:9527");
+        assert_eq!(new_messages[0].receiver_id, "10.0.0.3:9527");
+
+        let groups = db
+            .list_groups("10.0.0.9:9527")
+            .await
+            .expect("groups should load for new self id");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].creator_id, "10.0.0.9:9527");
+
+        let pending_group = db
+            .get_pending_for_peer("10.0.0.3:9527")
+            .await
+            .expect("pending group messages should load");
+        assert_eq!(pending_group.len(), 1);
+        assert_eq!(pending_group[0].sender_id, "10.0.0.9:9527");
+
+        let notifications = db
+            .get_pending_notifications("10.0.0.3:9527")
+            .await
+            .expect("pending notifications should load");
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0].2.contains("10.0.0.9:9527"));
+        assert!(!notifications[0].2.contains("10.0.0.2:9527"));
+
+        let pending_files = db
+            .get_pending_file_transfers("10.0.0.3:9527")
+            .await
+            .expect("pending file transfers should load");
+        assert_eq!(pending_files.len(), 1);
+        assert_eq!(pending_files[0].sender_id, "10.0.0.9:9527");
 
         drop(db);
         let _ = std::fs::remove_file(db_path);
