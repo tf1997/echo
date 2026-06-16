@@ -923,9 +923,28 @@ impl ChatServer {
                         );
                     }
 
+                    // Handle peer_id change embedded in profile_updated
+                    if msg.msg_type == "profile_updated" || msg.msg_type == "peer_id_changed" {
+                        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+                            if let Some(old_peer_id) = payload.get("old_peer_id").and_then(|v| v.as_str()) {
+                                if old_peer_id != msg.sender_id {
+                                    info!(
+                                        "Peer ID changed: {} -> {} ({})",
+                                        old_peer_id, msg.sender_id, msg.sender_name
+                                    );
+                                    let _ = db.migrate_peer_references(old_peer_id, &msg.sender_id).await;
+                                    let _ = sqlx::query("DELETE FROM peers WHERE peer_id = ?")
+                                        .bind(old_peer_id)
+                                        .execute(&db.pool)
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+
                     let mut sender_avatar_hash = String::new();
                     let mut sender_avatar_updated_at = 0i64;
-                    if msg.msg_type == "profile_updated" {
+                    if msg.msg_type == "profile_updated" || msg.msg_type == "peer_id_changed" {
                         if let Ok(profile_payload) =
                             serde_json::from_str::<serde_json::Value>(&msg.content)
                         {
@@ -1255,7 +1274,7 @@ impl ChatServer {
                             });
                         }
                         "group_created" | "group_dissolved" | "group_member_left"
-                        | "profile_updated" => {
+                        | "profile_updated" | "peer_id_changed" => {
                             // System notifications — already handled above, don't save as message
                             if let Some(ref gid) = msg.group_id {
                                 emit_group_updated(&app_handle, gid);

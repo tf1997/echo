@@ -27,6 +27,20 @@ impl RuntimeServices {
             .map_err(|e| anyhow::anyhow!("Failed to get local IP: {}", e))?;
         let my_id = format!("{}:{}", local_ip, listen_port);
 
+        let old_peer_id = profile.peer_id.clone();
+        let peer_id_changed = !old_peer_id.is_empty() && old_peer_id != my_id;
+
+        // Migrate local data if peer_id changed
+        if peer_id_changed {
+            log::info!("IP changed: {} -> {}, migrating local data", old_peer_id, my_id);
+            db.migrate_peer_references(&old_peer_id, &my_id).await?;
+            sqlx::query("DELETE FROM peers WHERE peer_id = ?")
+                .bind(&old_peer_id)
+                .execute(&db.pool)
+                .await
+                .ok();
+        }
+
         // Persist peer_id for profile
         if profile.peer_id.is_empty() || profile.peer_id != my_id {
             db.save_user_profile(
@@ -61,17 +75,59 @@ impl RuntimeServices {
         let peers = discovery.peers_arc();
 
         let chat = ChatServer::new(
-            app_handle,
+            app_handle.clone(),
             listen_port,
             my_id.clone(),
             profile.username.clone(),
             profile.department.clone(),
             crate::profile_metadata::software_version(),
             crate::profile_metadata::mac_address(),
-            db,
+            db.clone(),
             peers,
         );
         chat.start().await?;
+
+        // Broadcast peer_id change to all peers
+        if peer_id_changed {
+            log::info!("Broadcasting peer_id change to all peers: old={} new={}", old_peer_id, my_id);
+            let new_id = my_id.clone();
+            let old_id = old_peer_id.clone();
+            let username = profile.username.clone();
+            let department = profile.department.clone();
+            let avatar_hash = profile.avatar_hash.clone();
+            let avatar_updated_at = profile.avatar_updated_at;
+            let db_clone = db.clone();
+
+            // Cannot access AppState from here during startup, so just schedule the broadcast
+            // It will be handled by the startup sequence after RuntimeServices is registered
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                let stored = db_clone.list_stored_peers().await.unwrap_or_default();
+                let targets: Vec<String> = stored.iter().map(|p| p.peer_id.clone()).collect();
+
+                // Use profile_updated with old_peer_id for backward compatibility
+                let payload = serde_json::json!({
+                    "old_peer_id": old_id,  // NEW field - old versions ignore it
+                    "username": username,
+                    "department": department,
+                    "software_version": crate::profile_metadata::software_version(),
+                    "mac_address": crate::profile_metadata::mac_address(),
+                    "avatar_hash": avatar_hash,
+                    "avatar_updated_at": avatar_updated_at,
+                }).to_string();
+
+                for peer_id in &targets {
+                    if peer_id == &new_id { continue; }
+                    let json = crate::commands::build_notification_json(
+                        &new_id, &username, &department, listen_port, peer_id,
+                        &payload, "profile_updated", None, None, None, &[]
+                    );
+                    let _ = db_clone.queue_pending_notification(peer_id, "profile_updated", &json).await;
+                }
+                log::info!("Queued profile_updated (with peer_id change) for {} peers", targets.len());
+            });
+        }
 
         Ok(Self {
             discovery: RwLock::new(discovery),

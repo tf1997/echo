@@ -122,7 +122,7 @@ pub struct ChatMessage {
 }
 
 pub struct Database {
-    pool: Pool<Sqlite>,
+    pub(crate) pool: Pool<Sqlite>,
 }
 
 const DEFAULT_MESSAGE_LIMIT: i64 = 500;
@@ -1636,6 +1636,38 @@ impl Database {
 
         let now = Utc::now().to_rfc3339();
 
+        // Check for same-identity peer at this endpoint (IP changed, old client didn't broadcast)
+        if !username.is_empty() && !department.is_empty() {
+            let existing_at_endpoint = sqlx::query(
+                "SELECT peer_id FROM peers
+                 WHERE ip = ? AND port = ? AND peer_id <> ?
+                 AND username = ? AND department = ?
+                 LIMIT 1"
+            )
+            .bind(ip)
+            .bind(port as i64)
+            .bind(peer_id)
+            .bind(username)
+            .bind(department)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to check identity at endpoint")?;
+
+            if let Some(row) = existing_at_endpoint {
+                let old_peer_id: String = row.get("peer_id");
+                log::info!(
+                    "Same identity ({} {}) moved from {} to {} at {}:{} - migrating references",
+                    username, department, old_peer_id, peer_id, ip, port
+                );
+                self.migrate_peer_references(&old_peer_id, peer_id).await?;
+                sqlx::query("DELETE FROM peers WHERE peer_id = ?")
+                    .bind(&old_peer_id)
+                    .execute(&self.pool)
+                    .await
+                    .context("Failed to remove old peer_id after identity match")?;
+            }
+        }
+
         let endpoint_duplicates =
             sqlx::query("SELECT peer_id FROM peers WHERE ip = ? AND port = ? AND peer_id <> ?")
                 .bind(ip)
@@ -1710,7 +1742,7 @@ impl Database {
         Ok(())
     }
 
-    async fn migrate_peer_references(&self, old_peer_id: &str, new_peer_id: &str) -> Result<()> {
+    pub(crate) async fn migrate_peer_references(&self, old_peer_id: &str, new_peer_id: &str) -> Result<()> {
         if old_peer_id == new_peer_id {
             return Ok(());
         }

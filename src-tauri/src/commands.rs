@@ -3793,7 +3793,7 @@ fn echo_files_dir() -> std::path::PathBuf {
 }
 
 /// Build a WireMessage JSON for a notification.
-fn build_notification_json(
+pub(crate) fn build_notification_json(
     sender_id: &str,
     sender_name: &str,
     sender_department: &str,
