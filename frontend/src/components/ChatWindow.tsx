@@ -72,7 +72,34 @@ let pendingId = Date.now();
 const EMPTY_PENDING_MESSAGES: PendingMessage[] = [];
 const SCREENSHOT_SHORTCUT = "Ctrl+Alt+A";
 const SCREENSHOT_HIDE_WINDOW_STORAGE_KEY = "echo.screenshot.hideCurrentWindow";
+const NATIVE_FILE_DROP_DEDUP_MS = 1500;
+let activeNativeFileDropOwner: string | null = null;
+let nativeFileDropOwnerSequence = 0;
+const recentNativeFileDropSignatures = new Map<string, number>();
 type PendingMessagesUpdate = PendingMessage[] | ((prev: PendingMessage[]) => PendingMessage[]);
+
+function createNativeFileDropOwnerId(): string {
+  nativeFileDropOwnerSequence += 1;
+  return `${Date.now()}_${nativeFileDropOwnerSequence}`;
+}
+
+function shouldHandleNativeFileDrop(ownerId: string, conversationKey: string, paths: string[]): boolean {
+  if (!conversationKey || activeNativeFileDropOwner !== ownerId || paths.length === 0) return false;
+
+  const now = Date.now();
+  for (const [signature, timestamp] of recentNativeFileDropSignatures) {
+    if (now - timestamp > NATIVE_FILE_DROP_DEDUP_MS) {
+      recentNativeFileDropSignatures.delete(signature);
+    }
+  }
+
+  const signature = `${conversationKey}\n${paths.join("\n")}`;
+  const lastHandledAt = recentNativeFileDropSignatures.get(signature);
+  if (lastHandledAt && now - lastHandledAt <= NATIVE_FILE_DROP_DEDUP_MS) return false;
+
+  recentNativeFileDropSignatures.set(signature, now);
+  return true;
+}
 
 function getInitialHideWindowForScreenshot(): boolean {
   try {
@@ -832,10 +859,19 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
 
   // Listen for file send progress
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let unlistenError: (() => void) | undefined;
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const trackUnlisten = (fn: () => void) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisteners.push(fn);
+      }
+    };
+
     import("@tauri-apps/api/event").then(({ listen }) => {
       listen<{ fileName: string; clientMsgId?: string | null; sent: number; total: number; speed: number }>("file-progress", (event) => {
+        if (disposed) return;
         const { fileName, clientMsgId, sent, total, speed } = event.payload;
         const pct = total > 0 ? Math.round((sent / total) * 100) : 0;
         const matchesFile = (message: PendingMessage) =>
@@ -850,17 +886,21 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
             removePendingMessagesEverywhere(matchesFile);
           }, 2000);
         }
-      }).then((fn) => { unlisten = fn; });
+      }).then(trackUnlisten);
 
       listen<{ fileName: string; clientMsgId?: string | null; error: string }>("file-error", (event) => {
+        if (disposed) return;
         const { fileName, clientMsgId, error } = event.payload;
         updatePendingMessagesEverywhere(
           (message) => clientMsgId ? message.clientMsgId === clientMsgId : message.file_name === fileName,
           (message) => ({ ...message, status: "failed", error })
         );
-      }).then((fn) => { unlistenError = fn; });
+      }).then(trackUnlisten);
     });
-    return () => { unlisten?.(); unlistenError?.(); };
+    return () => {
+      disposed = true;
+      for (const unlisten of unlisteners.splice(0)) unlisten();
+    };
   }, [removePendingMessagesEverywhere, updatePendingMessagesEverywhere]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -1610,26 +1650,41 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   // Tauri native file-drop events (HTML5 dataTransfer.files is empty in Tauri webview)
   useEffect(() => {
     if (!peerId) return;
-    let unlistenHover: (() => void) | undefined;
-    let unlistenDrop: (() => void) | undefined;
-    let unlistenCancelled: (() => void) | undefined;
+    let disposed = false;
+    const ownerId = createNativeFileDropOwnerId();
+    activeNativeFileDropOwner = ownerId;
+    const unlisteners: Array<() => void> = [];
+    const trackUnlisten = (fn: () => void) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisteners.push(fn);
+      }
+    };
 
     import("@tauri-apps/api/event").then(({ listen }) => {
       listen("tauri://file-drop-hover", () => {
+        if (disposed || activeNativeFileDropOwner !== ownerId) return;
         showDragOverlay();
-      }).then((fn) => { unlistenHover = fn; });
+      }).then(trackUnlisten);
 
       listen("tauri://file-drop-cancelled", () => {
+        if (disposed || activeNativeFileDropOwner !== ownerId) return;
         hideDragOverlay();
-      }).then((fn) => { unlistenCancelled = fn; });
+      }).then(trackUnlisten);
 
       listen("tauri://file-drop", (event) => {
+        if (disposed || activeNativeFileDropOwner !== ownerId) return;
         hideDragOverlay();
-        const paths = event.payload as string[];
+        const paths = Array.isArray(event.payload)
+          ? event.payload.filter((path): path is string => typeof path === "string" && path.trim().length > 0)
+          : [];
+        const conversationKey = pendingConversationKeyRef.current;
+        if (!shouldHandleNativeFileDrop(ownerId, conversationKey, paths)) return;
+
         for (const filePath of paths) {
           const name = filePath.replace(/\\/g, "/").split("/").pop() || "file";
           nearBottomRef.current = true;
-          const conversationKey = pendingConversationKeyRef.current;
           const tempId = ++pendingId;
           const clientMsgId = generateClientMsgId();
           updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
@@ -1641,13 +1696,15 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
             ));
           });
         }
-      }).then((fn) => { unlistenDrop = fn; });
+      }).then(trackUnlisten);
     });
 
     return () => {
-      unlistenHover?.();
-      unlistenDrop?.();
-      unlistenCancelled?.();
+      disposed = true;
+      if (activeNativeFileDropOwner === ownerId) {
+        activeNativeFileDropOwner = null;
+      }
+      for (const unlisten of unlisteners.splice(0)) unlisten();
     };
   }, [hideDragOverlay, peerId, onSendFile, showDragOverlay, updatePendingMessagesForKey]);
 
