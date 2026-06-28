@@ -8,12 +8,12 @@ export interface ThemeOption {
 }
 
 export const THEMES: ThemeOption[] = [
-  { id: "midnight", name: "星夜", preview: ["#101624", "#1f2937", "#6366f1"] },
-  { id: "daylight", name: "晨光", preview: ["#f7f9f9", "#ffffff", "#68939a"] },
-  { id: "wechat", name: "微信", preview: ["#f7f8f7", "#ffffff", "#a0ea78"] },
-  { id: "aurora", name: "极光", preview: ["#071113", "#122224", "#5d918b"] },
-  { id: "carbon", name: "曜石", preview: ["#0b0d10", "#20242a", "#9b7a4d"] },
-  { id: "plum", name: "梅影", preview: ["#101011", "#1f1f22", "#a96b78"] },
+  { id: "midnight", name: "星夜", preview: ["#111827", "#182033", "#4f46e5"] },
+  { id: "daylight", name: "晨光", preview: ["#eef3f6", "#ffffff", "#416f78"] },
+  { id: "wechat", name: "微信", preview: ["#edf1ee", "#ffffff", "#4f6f58"] },
+  { id: "aurora", name: "极光", preview: ["#071113", "#122224", "#4d807a"] },
+  { id: "carbon", name: "曜石", preview: ["#090b0d", "#161a20", "#8d7048"] },
+  { id: "plum", name: "梅影", preview: ["#101011", "#1f1f22", "#965f6c"] },
 ];
 
 const STORAGE_KEY = "echo.theme";

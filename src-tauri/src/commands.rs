@@ -20,6 +20,7 @@ use crate::state::{AppState, RuntimeServices};
 pub struct AppInfo {
     pub initialized: bool,
     pub peer_id: String,
+    pub node_id: String,
     pub username: String,
     pub department: String,
     pub software_version: String,
@@ -63,6 +64,7 @@ pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String>
         Ok(AppInfo {
             initialized: true,
             peer_id: runtime.my_id.clone(),
+            node_id: runtime.my_node_id.clone(),
             username: profile.username,
             department: profile.department,
             software_version: crate::profile_metadata::software_version(),
@@ -77,6 +79,7 @@ pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String>
         Ok(AppInfo {
             initialized: false,
             peer_id: String::new(),
+            node_id: String::new(),
             username: String::new(),
             department: String::new(),
             software_version: crate::profile_metadata::software_version(),
@@ -204,8 +207,14 @@ pub async fn save_profile(
     }
 
     let final_avatar = avatar_update.unwrap_or(existing_avatar);
+    let node_id = state
+        .db
+        .ensure_user_node_id()
+        .await
+        .map_err(|e| e.to_string())?;
     let profile = UserProfile {
         peer_id: profile_peer_id,
+        node_id,
         username: username.to_string(),
         department: department.to_string(),
         software_version: crate::profile_metadata::software_version(),
@@ -382,6 +391,7 @@ async fn notify_profile_updated_to_peers(
 ) {
     let listen_port = runtime.listen_port;
     let my_id = runtime.my_id.clone();
+    let my_node_id = runtime.my_node_id.clone();
     let online_peers = runtime.discovery.read().await.get_peers();
     let stored = db.list_stored_peers().await.unwrap_or_default();
     let mut targets: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -410,6 +420,7 @@ async fn notify_profile_updated_to_peers(
         &online_peers,
         &target_ids,
         &my_id,
+        &my_node_id,
         &profile.username,
         &profile.department,
         listen_port,
@@ -428,6 +439,7 @@ fn spawn_send_or_queue_notification(
     online_peers: Vec<Peer>,
     target_peer_ids: Vec<String>,
     self_id: String,
+    self_node_id: String,
     self_name: String,
     self_department: String,
     self_port: u16,
@@ -444,6 +456,7 @@ fn spawn_send_or_queue_notification(
             &online_peers,
             &target_peer_ids,
             &self_id,
+            &self_node_id,
             &self_name,
             &self_department,
             self_port,
@@ -557,7 +570,7 @@ pub async fn request_peer_avatar(
     let peer = if let Some(peer) = online_peer {
         peer
     } else if let Some(stored) = stored_peer.clone() {
-        Peer::new_with_avatar(
+        let mut peer = Peer::new_with_avatar(
             stored.peer_id.clone(),
             stored.username.clone(),
             stored.department.clone(),
@@ -571,7 +584,9 @@ pub async fn request_peer_avatar(
                 .parse()
                 .map_err(|_| "无效的联系人 IP 地址".to_string())?,
             stored.port,
-        )
+        );
+        peer.node_id = stored.node_id.clone();
+        peer
     } else {
         return Ok(None);
     };
@@ -600,12 +615,14 @@ pub async fn request_peer_avatar(
 
     let request = WireMessage {
         sender_id: runtime.my_id.clone(),
+        sender_node_id: runtime.my_node_id.clone(),
         sender_name: profile.username.clone(),
         sender_department: profile.department.clone(),
         sender_software_version: crate::profile_metadata::software_version(),
         sender_mac_address: crate::profile_metadata::mac_address(),
         sender_port: runtime.listen_port,
         receiver_id: peer.id.clone(),
+        receiver_node_id: peer.node_id.clone(),
         content: peer.avatar_hash.clone(),
         msg_type: "avatar_request".to_string(),
         file_name: None,
@@ -658,8 +675,9 @@ pub async fn request_peer_avatar(
 
     state
         .db
-        .upsert_peer_with_avatar(
+        .upsert_peer_with_node_id_avatar(
             &peer.id,
+            &peer.node_id,
             &peer.username,
             &peer.department,
             &peer.software_version,
@@ -674,22 +692,20 @@ pub async fn request_peer_avatar(
         .await
         .map_err(|e| e.to_string())?;
 
-    runtime
-        .discovery
-        .read()
-        .await
-        .register_peer(Peer::new_with_avatar(
-            peer.id.clone(),
-            peer.username,
-            peer.department,
-            peer.software_version,
-            peer.mac_address,
-            avatar_path,
-            payload.avatar_hash,
-            payload.avatar_updated_at,
-            peer.ip,
-            peer.port,
-        ));
+    let mut updated_peer = Peer::new_with_avatar(
+        peer.id.clone(),
+        peer.username,
+        peer.department,
+        peer.software_version,
+        peer.mac_address,
+        avatar_path,
+        payload.avatar_hash,
+        payload.avatar_updated_at,
+        peer.ip,
+        peer.port,
+    );
+    updated_peer.node_id = peer.node_id.clone();
+    runtime.discovery.read().await.register_peer(updated_peer);
 
     state
         .db
@@ -715,10 +731,14 @@ pub async fn refresh_peer_profile(
     port: u16,
 ) -> Result<Option<StoredPeer>, String> {
     let my_profile = state.profile.lock().await.clone();
-    let (my_id, my_port) = {
+    let (my_id, my_node_id, my_port) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         match runtime_opt.as_ref() {
-            Some(runtime) => (runtime.my_id.clone(), runtime.listen_port),
+            Some(runtime) => (
+                runtime.my_id.clone(),
+                runtime.my_node_id.clone(),
+                runtime.listen_port,
+            ),
             None => return Err("应用尚未初始化".to_string()),
         }
     };
@@ -732,7 +752,8 @@ pub async fn refresh_peer_profile(
         .unwrap_or("");
 
     let addr = format!("{}:{}", ip, port);
-    let Some(identity) = probe_identity(&addr, &my_id, my_name, my_department, my_port).await
+    let Some(identity) =
+        probe_identity(&addr, &my_id, &my_node_id, my_name, my_department, my_port).await
     else {
         return state
             .db
@@ -757,8 +778,9 @@ pub async fn refresh_peer_profile(
 
     state
         .db
-        .upsert_peer_with_avatar(
+        .upsert_peer_with_node_id_avatar(
             &identity.peer_id,
+            &identity.node_id,
             &identity.username,
             &identity.department,
             &identity.software_version,
@@ -774,7 +796,7 @@ pub async fn refresh_peer_profile(
         .map_err(|e| e.to_string())?;
 
     if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
-        let peer = crate::discovery::Peer::new_with_avatar(
+        let mut peer = crate::discovery::Peer::new_with_avatar(
             identity.peer_id.clone(),
             identity.username,
             identity.department,
@@ -786,6 +808,7 @@ pub async fn refresh_peer_profile(
             parsed_ip,
             remote_port,
         );
+        peer.node_id = identity.node_id.clone();
         runtime.discovery.read().await.register_peer(peer);
     }
 
@@ -983,20 +1006,24 @@ async fn send_file_with_kind(
         let last_seen = chrono::DateTime::parse_from_rfc3339(&stored_peer.last_seen_at)
             .map(|dt| dt.timestamp())
             .unwrap_or_default();
-        Peer::with_online_details(
-            stored_peer.peer_id,
-            stored_peer.username,
-            stored_peer.department,
-            stored_peer.software_version,
-            stored_peer.mac_address,
-            stored_peer
-                .ip
-                .parse()
-                .map_err(|_| "无效的联系人 IP 地址".to_string())?,
-            stored_peer.port,
-            stored_peer.is_online,
-            last_seen,
-        )
+        {
+            let mut peer = Peer::with_online_details(
+                stored_peer.peer_id,
+                stored_peer.username,
+                stored_peer.department,
+                stored_peer.software_version,
+                stored_peer.mac_address,
+                stored_peer
+                    .ip
+                    .parse()
+                    .map_err(|_| "无效的联系人 IP 地址".to_string())?,
+                stored_peer.port,
+                stored_peer.is_online,
+                last_seen,
+            );
+            peer.node_id = stored_peer.node_id;
+            peer
+        }
     } else {
         return Err(format!("Peer {} not found", peer_id));
     };
@@ -1008,10 +1035,11 @@ async fn send_file_with_kind(
     }
 
     // Clone what we need and release the chat lock immediately
-    let (my_id, my_name, my_department, listen_port, db, peers_arc) = {
+    let (my_id, my_node_id, my_name, my_department, listen_port, db, peers_arc) = {
         let chat = runtime.chat.lock().await;
         (
             chat.my_id().to_string(),
+            chat.my_node_id().to_string(),
             chat.my_name().to_string(),
             chat.my_department().to_string(),
             chat.listen_port(),
@@ -1095,6 +1123,7 @@ async fn send_file_with_kind(
             &bg_name,
             &bg_peer,
             my_id,
+            my_node_id,
             my_name,
             my_department,
             listen_port,
@@ -1163,6 +1192,7 @@ pub struct DiscoverResult {
 #[derive(Clone)]
 struct RemoteIdentity {
     peer_id: String,
+    node_id: String,
     username: String,
     department: String,
     software_version: String,
@@ -1176,6 +1206,7 @@ struct RemoteIdentity {
 async fn probe_identity(
     addr: &str,
     my_id: &str,
+    my_node_id: &str,
     my_name: &str,
     my_department: &str,
     my_port: u16,
@@ -1195,12 +1226,14 @@ async fn probe_identity(
 
     let probe = WireMessage {
         sender_id: my_id.to_string(),
+        sender_node_id: my_node_id.to_string(),
         sender_name: my_name.to_string(),
         sender_department: my_department.to_string(),
         sender_software_version: crate::profile_metadata::software_version(),
         sender_mac_address: crate::profile_metadata::mac_address(),
         sender_port: my_port,
         receiver_id: String::new(),
+        receiver_node_id: String::new(),
         content: String::new(),
         msg_type: "identity_probe".to_string(),
         file_name: None,
@@ -1240,6 +1273,7 @@ async fn probe_identity(
 
     Some(RemoteIdentity {
         peer_id: msg.sender_id,
+        node_id: msg.sender_node_id,
         username: msg.sender_name,
         department: msg.sender_department,
         software_version: msg.sender_software_version,
@@ -1283,10 +1317,10 @@ pub async fn discover_by_ip(
 
     // Read my profile and runtime info
     let my_profile = state.profile.lock().await.clone();
-    let (my_id, my_port) = {
+    let (my_id, my_node_id, my_port) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         match runtime_opt.as_ref() {
-            Some(r) => (r.my_id.clone(), r.listen_port),
+            Some(r) => (r.my_id.clone(), r.my_node_id.clone(), r.listen_port),
             None => return Err("应用尚未初始化".to_string()),
         }
     };
@@ -1325,6 +1359,7 @@ pub async fn discover_by_ip(
 
     let probe = serde_json::json!({
         "id": my_id,
+        "node_id": my_node_id,
         "username": my_profile.as_ref().map(|p| p.username.as_str()).unwrap_or(""),
         "department": my_profile.as_ref().map(|p| p.department.as_str()).unwrap_or(""),
         "software_version": crate::profile_metadata::software_version(),
@@ -1352,7 +1387,9 @@ pub async fn discover_by_ip(
         .map(|p| p.department.as_str())
         .unwrap_or("");
 
-    if let Some(identity) = probe_identity(&addr, &my_id, my_name, my_department, my_port).await {
+    if let Some(identity) =
+        probe_identity(&addr, &my_id, &my_node_id, my_name, my_department, my_port).await
+    {
         let remote_port = if identity.port == 0 {
             port
         } else {
@@ -1364,7 +1401,7 @@ pub async fn discover_by_ip(
             identity.ip.clone()
         };
         let remote_parsed_ip = remote_ip.parse::<std::net::IpAddr>().unwrap_or(parsed_ip);
-        let peer = crate::discovery::Peer::new_with_avatar(
+        let mut peer = crate::discovery::Peer::new_with_avatar(
             identity.peer_id.clone(),
             identity.username.clone(),
             identity.department.clone(),
@@ -1376,6 +1413,7 @@ pub async fn discover_by_ip(
             remote_parsed_ip,
             remote_port,
         );
+        peer.node_id = identity.node_id.clone();
 
         {
             let runtime_opt = { state.runtime.read().await.clone() };
@@ -1387,8 +1425,9 @@ pub async fn discover_by_ip(
 
         state
             .db
-            .upsert_peer_with_avatar(
+            .upsert_peer_with_node_id_avatar(
                 &identity.peer_id,
+                &identity.node_id,
                 &identity.username,
                 &identity.department,
                 &identity.software_version,
@@ -1712,18 +1751,17 @@ pub fn capture_screenshot() -> Result<ScreenshotData, String> {
 fn capture_screenshot_impl() -> Result<ScreenshotData, String> {
     use std::mem::{size_of, zeroed};
     use windows_sys::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-        DESKTOPHORZRES, DESKTOPVERTRES, GetDC, GetDIBits, GetDeviceCaps, ReleaseDC,
-        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS,
-        HGDIOBJ, SRCCOPY,
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, GetDeviceCaps, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        CAPTUREBLT, DESKTOPHORZRES, DESKTOPVERTRES, DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
+    };
+    use windows_sys::Win32::UI::HiDpi::{
+        SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
         SM_YVIRTUALSCREEN,
-    };
-    use windows_sys::Win32::UI::HiDpi::{
-        DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-        SetThreadDpiAwarenessContext,
     };
 
     struct ThreadDpiAwarenessGuard(DPI_AWARENESS_CONTEXT);
@@ -1779,7 +1817,17 @@ fn capture_screenshot_impl() -> Result<ScreenshotData, String> {
         }
 
         let old_object = SelectObject(memory_dc, bitmap as HGDIOBJ);
-        let copied = BitBlt(memory_dc, 0, 0, width, height, screen_dc, x, y, SRCCOPY | CAPTUREBLT);
+        let copied = BitBlt(
+            memory_dc,
+            0,
+            0,
+            width,
+            height,
+            screen_dc,
+            x,
+            y,
+            SRCCOPY | CAPTUREBLT,
+        );
         if copied == 0 {
             if old_object != 0 {
                 SelectObject(memory_dc, old_object);
@@ -2534,11 +2582,15 @@ pub async fn create_group(
         .map_err(|e| e.to_string())?;
     let members = state.db.get_group_members(&gid).await.unwrap_or_default();
 
-    let (listen_port, online_peers) = {
+    let (my_node_id, listen_port, online_peers) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         match runtime_opt.as_ref() {
-            Some(r) => (r.listen_port, r.discovery.read().await.get_peers()),
-            None => (9527, vec![]),
+            Some(r) => (
+                r.my_node_id.clone(),
+                r.listen_port,
+                r.discovery.read().await.get_peers(),
+            ),
+            None => (String::new(), 9527, vec![]),
         }
     };
     let (my_name, my_department) = {
@@ -2564,6 +2616,7 @@ pub async fn create_group(
         online_peers,
         all_members,
         my_id.clone(),
+        my_node_id,
         my_name,
         my_department,
         listen_port,
@@ -2641,7 +2694,7 @@ pub async fn send_group_message_typed(
     client_msg_id: Option<String>,
 ) -> Result<ChatMessage, String> {
     let client_msg_id = client_msg_id_or_new(client_msg_id);
-    let (my_id, my_name, my_department, listen_port, members) = {
+    let (my_id, my_node_id, my_name, my_department, listen_port, members) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let prof = state.profile.lock().await;
@@ -2658,7 +2711,14 @@ pub async fn send_group_message_typed(
             .get_group_members(&group_id)
             .await
             .map_err(|e| e.to_string())?;
-        (r.my_id.clone(), my_name, my_dept, r.listen_port, members)
+        (
+            r.my_id.clone(),
+            r.my_node_id.clone(),
+            my_name,
+            my_dept,
+            r.listen_port,
+            members,
+        )
     };
 
     let online_peers = {
@@ -2676,6 +2736,7 @@ pub async fn send_group_message_typed(
         &online_peers,
         &target_ids,
         &my_id,
+        &my_node_id,
         &my_name,
         &my_department,
         listen_port,
@@ -2743,7 +2804,7 @@ pub async fn rename_group(
         .get_group_members(&group_id)
         .await
         .map_err(|e| e.to_string())?;
-    let (my_id, my_name, my_department, listen_port, online_peers) = {
+    let (my_id, my_node_id, my_name, my_department, listen_port, online_peers) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let prof = state.profile.lock().await;
@@ -2756,7 +2817,14 @@ pub async fn rename_group(
             .map(|p| p.department.clone())
             .unwrap_or_default();
         let peers = r.discovery.read().await.get_peers();
-        (r.my_id.clone(), my_name, my_dept, r.listen_port, peers)
+        (
+            r.my_id.clone(),
+            r.my_node_id.clone(),
+            my_name,
+            my_dept,
+            r.listen_port,
+            peers,
+        )
     };
 
     let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
@@ -2766,6 +2834,7 @@ pub async fn rename_group(
         online_peers,
         target_ids,
         my_id,
+        my_node_id,
         my_name,
         my_department,
         listen_port,
@@ -2814,11 +2883,11 @@ pub async fn invite_to_group(
         .map_err(|e| e.to_string())?;
     let all_member_ids: Vec<String> = member_records.iter().map(|m| m.peer_id.clone()).collect();
 
-    let (my_id, listen_port, online_peers) = {
+    let (my_id, my_node_id, listen_port, online_peers) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let peers = r.discovery.read().await.get_peers();
-        (r.my_id.clone(), r.listen_port, peers)
+        (r.my_id.clone(), r.my_node_id.clone(), r.listen_port, peers)
     };
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
@@ -2843,6 +2912,7 @@ pub async fn invite_to_group(
         online_peers,
         all_member_ids,
         my_id,
+        my_node_id,
         my_name,
         my_department,
         listen_port,
@@ -2858,7 +2928,7 @@ pub async fn invite_to_group(
 
 #[tauri::command]
 pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result<(), String> {
-    let (my_id, listen_port, online_peers, members) = {
+    let (my_id, my_node_id, listen_port, online_peers, members) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let members = state
@@ -2867,7 +2937,13 @@ pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result
             .await
             .map_err(|e| e.to_string())?;
         let online = r.discovery.read().await.get_peers();
-        (r.my_id.clone(), r.listen_port, online, members)
+        (
+            r.my_id.clone(),
+            r.my_node_id.clone(),
+            r.listen_port,
+            online,
+            members,
+        )
     };
 
     let groups = state
@@ -2894,6 +2970,7 @@ pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result
         online_peers,
         target_ids,
         my_id.clone(),
+        my_node_id,
         my_name,
         my_department,
         listen_port,
@@ -2919,11 +2996,11 @@ pub async fn dissolve_group(state: State<'_, AppState>, group_id: String) -> Res
         .get_group_members(&group_id)
         .await
         .map_err(|e| e.to_string())?;
-    let (my_id, listen_port, online_peers) = {
+    let (my_id, my_node_id, listen_port, online_peers) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let peers = r.discovery.read().await.get_peers();
-        (r.my_id.clone(), r.listen_port, peers)
+        (r.my_id.clone(), r.my_node_id.clone(), r.listen_port, peers)
     };
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
@@ -2945,6 +3022,7 @@ pub async fn dissolve_group(state: State<'_, AppState>, group_id: String) -> Res
         online_peers,
         target_ids,
         my_id,
+        my_node_id,
         my_name,
         my_department,
         listen_port,
@@ -3483,12 +3561,14 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
                 let addr = format!("{}:{}", ip, port);
                 let wm = crate::chat::WireMessage {
                     sender_id: p.sender_id.clone(),
+                    sender_node_id: String::new(),
                     sender_name: p.sender_name.clone(),
                     sender_department: String::new(),
                     sender_software_version: crate::profile_metadata::software_version(),
                     sender_mac_address: crate::profile_metadata::mac_address(),
                     sender_port: listen_port,
                     receiver_id: peer_id.clone(),
+                    receiver_node_id: String::new(),
                     content: p.content.clone(),
                     msg_type: p.msg_type.clone(),
                     file_name: None,
@@ -3709,12 +3789,14 @@ async fn send_group_file_payloads_over_tcp_controlled(
         if let Err(error) = serialize_file_wire_message_line(
             FileWireMessageLine {
                 sender_id: &transfer.sender_id,
+                sender_node_id: "",
                 sender_name: &transfer.sender_name,
                 sender_department: &transfer.sender_department,
                 sender_software_version: &sender_software_version,
                 sender_mac_address: &sender_mac_address,
                 sender_port: transfer.sender_port,
                 receiver_id: &transfer.peer_id,
+                receiver_node_id: "",
                 content: &content_buf,
                 msg_type: "file_end",
                 file_name: &transfer.file_name,
@@ -3749,12 +3831,14 @@ async fn send_group_file_payloads_over_tcp_controlled(
             if let Err(error) = serialize_file_wire_message_line(
                 FileWireMessageLine {
                     sender_id: &transfer.sender_id,
+                    sender_node_id: "",
                     sender_name: &transfer.sender_name,
                     sender_department: &transfer.sender_department,
                     sender_software_version: &sender_software_version,
                     sender_mac_address: &sender_mac_address,
                     sender_port: transfer.sender_port,
                     receiver_id: &transfer.peer_id,
+                    receiver_node_id: "",
                     content: &content_buf,
                     msg_type,
                     file_name: &transfer.file_name,
@@ -3795,10 +3879,12 @@ fn echo_files_dir() -> std::path::PathBuf {
 /// Build a WireMessage JSON for a notification.
 pub(crate) fn build_notification_json(
     sender_id: &str,
+    sender_node_id: &str,
     sender_name: &str,
     sender_department: &str,
     sender_port: u16,
     receiver_id: &str,
+    receiver_node_id: &str,
     content: &str,
     msg_type: &str,
     group_id: Option<&str>,
@@ -3808,12 +3894,14 @@ pub(crate) fn build_notification_json(
 ) -> String {
     serde_json::json!({
         "sender_id": sender_id,
+        "sender_node_id": sender_node_id,
         "sender_name": sender_name,
         "sender_department": sender_department,
         "sender_software_version": crate::profile_metadata::software_version(),
         "sender_mac_address": crate::profile_metadata::mac_address(),
         "sender_port": sender_port,
         "receiver_id": receiver_id,
+        "receiver_node_id": receiver_node_id,
         "content": content,
         "msg_type": msg_type,
         "group_id": group_id,
@@ -3971,6 +4059,7 @@ pub async fn send_or_queue_notification(
     online_peers: &[Peer],
     target_peer_ids: &[String],
     self_id: &str,
+    self_node_id: &str,
     self_name: &str,
     self_department: &str,
     self_port: u16,
@@ -3990,12 +4079,15 @@ pub async fn send_or_queue_notification(
             continue;
         }
 
+        let receiver_node_id = resolve_peer_node_id(pid, db, online_peers).await;
         let json = build_notification_json(
             self_id,
+            self_node_id,
             self_name,
             self_department,
             self_port,
             pid,
+            &receiver_node_id,
             content,
             kind,
             group_id,
@@ -4040,6 +4132,24 @@ pub async fn send_or_queue_notification(
         );
     }
     (delivered, queued, failed)
+}
+
+async fn resolve_peer_node_id(
+    peer_id: &str,
+    db: &crate::db::Database,
+    online_peers: &[Peer],
+) -> String {
+    if let Some(peer) = online_peers.iter().find(|peer| peer.id == peer_id) {
+        if !peer.node_id.trim().is_empty() {
+            return peer.node_id.clone();
+        }
+    }
+    db.get_stored_peer(peer_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|peer| peer.node_id)
+        .unwrap_or_default()
 }
 
 async fn resolve_peer_addr(
@@ -4087,6 +4197,10 @@ async fn build_member_directory(
         if id == self_id {
             out.push(crate::discovery::PeerEntry {
                 id: self_id.to_string(),
+                node_id: self_avatar
+                    .as_ref()
+                    .map(|profile| profile.node_id.clone())
+                    .unwrap_or_default(),
                 username: self_name.to_string(),
                 department: self_department.to_string(),
                 software_version: crate::profile_metadata::software_version(),
@@ -4107,6 +4221,7 @@ async fn build_member_directory(
         if let Some(p) = online_peers.iter().find(|p| p.id == *id) {
             out.push(crate::discovery::PeerEntry {
                 id: p.id.clone(),
+                node_id: p.node_id.clone(),
                 username: p.username.clone(),
                 department: p.department.clone(),
                 software_version: p.software_version.clone(),
@@ -4121,6 +4236,7 @@ async fn build_member_directory(
         if let Ok(Some(sp)) = db.get_stored_peer(id).await {
             out.push(crate::discovery::PeerEntry {
                 id: sp.peer_id,
+                node_id: sp.node_id,
                 username: sp.username,
                 department: sp.department,
                 software_version: sp.software_version,
@@ -4134,6 +4250,7 @@ async fn build_member_directory(
             // Member we have no info about — still ship the id so receivers know they exist
             out.push(crate::discovery::PeerEntry {
                 id: id.clone(),
+                node_id: String::new(),
                 username: String::new(),
                 department: String::new(),
                 software_version: String::new(),

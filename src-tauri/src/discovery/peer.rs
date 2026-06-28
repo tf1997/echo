@@ -6,6 +6,8 @@ use std::net::IpAddr;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerEntry {
     pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node_id: String,
     pub username: String,
     pub department: String,
     #[serde(default)]
@@ -24,6 +26,8 @@ pub struct PeerEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
     pub id: String,
+    #[serde(default)]
+    pub node_id: String,
     pub username: String,
     pub department: String,
     #[serde(default)]
@@ -44,7 +48,15 @@ pub struct Peer {
 
 impl Peer {
     pub fn new(id: String, username: String, department: String, ip: IpAddr, port: u16) -> Self {
-        Self::new_with_profile(id, username, department, String::new(), String::new(), ip, port)
+        Self::new_with_profile(
+            id,
+            username,
+            department,
+            String::new(),
+            String::new(),
+            ip,
+            port,
+        )
     }
 
     pub fn new_with_profile(
@@ -88,6 +100,7 @@ impl Peer {
             .as_secs() as i64;
         Self {
             id,
+            node_id: String::new(),
             username,
             department,
             software_version,
@@ -104,8 +117,26 @@ impl Peer {
 
     // Compatibility constructor for callers that do not yet provide profile metadata.
     #[allow(dead_code)]
-    pub fn with_online(id: String, username: String, department: String, ip: IpAddr, port: u16, online: bool, last_seen: i64) -> Self {
-        Self::with_online_details(id, username, department, String::new(), String::new(), ip, port, online, last_seen)
+    pub fn with_online(
+        id: String,
+        username: String,
+        department: String,
+        ip: IpAddr,
+        port: u16,
+        online: bool,
+        last_seen: i64,
+    ) -> Self {
+        Self::with_online_details(
+            id,
+            username,
+            department,
+            String::new(),
+            String::new(),
+            ip,
+            port,
+            online,
+            last_seen,
+        )
     }
 
     pub fn with_online_details(
@@ -151,6 +182,7 @@ impl Peer {
     ) -> Self {
         Self {
             id,
+            node_id: String::new(),
             username,
             department,
             software_version,

@@ -5,15 +5,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Cursor, Read, Write};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-use tauri::api::dialog::{
-    blocking::MessageDialogBuilder, MessageDialogButtons, MessageDialogKind,
-};
+use tauri::api::dialog::{blocking::MessageDialogBuilder, MessageDialogButtons, MessageDialogKind};
 use tauri::{AppHandle, Manager};
 use tokio::io::AsyncWriteExt;
 

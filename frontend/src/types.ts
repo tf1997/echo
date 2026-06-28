@@ -1,5 +1,6 @@
 export interface Peer {
   id: string;
+  node_id?: string;
   username: string;
   department: string;
   software_version?: string;
@@ -15,6 +16,7 @@ export interface Peer {
 
 export interface StoredPeer {
   peer_id: string;
+  node_id?: string;
   username: string;
   department: string;
   software_version?: string;
@@ -47,6 +49,7 @@ export interface ChatMessage {
 export interface AppInfo {
   initialized: boolean;
   peer_id: string;
+  node_id: string;
   username: string;
   department: string;
   software_version: string;

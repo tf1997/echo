@@ -1292,7 +1292,7 @@ function App() {
   }
 
   return (
-    <div className="flex h-screen bg-gray-900 overflow-hidden">
+    <div className="echo-app-shell flex h-screen bg-gray-900 overflow-hidden">
       <Sidebar
         peers={peers}
         selectedPeerId={selectedPeer?.id ?? null}

@@ -59,7 +59,9 @@ fn detect_mac_from_ifconfig() -> Option<String> {
 
     if let Some(ref ip) = local_ip {
         for block in interface_blocks(&text) {
-            if block.contains(&format!("inet {}", ip)) || block.contains(&format!("inet addr:{}", ip)) {
+            if block.contains(&format!("inet {}", ip))
+                || block.contains(&format!("inet addr:{}", ip))
+            {
                 if let Some(mac) = mac_from_block(block) {
                     return Some(mac);
                 }
@@ -144,10 +146,18 @@ fn normalize_mac(raw: &str) -> Option<String> {
     if parts.len() != 6 {
         return None;
     }
-    if parts.iter().all(|part| part.len() == 2 && part.chars().all(|ch| ch.is_ascii_hexdigit()))
+    if parts
+        .iter()
+        .all(|part| part.len() == 2 && part.chars().all(|ch| ch.is_ascii_hexdigit()))
         && parts.iter().any(|part| *part != "00")
     {
-        return Some(parts.iter().map(|part| part.to_ascii_uppercase()).collect::<Vec<_>>().join(":"));
+        return Some(
+            parts
+                .iter()
+                .map(|part| part.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(":"),
+        );
     }
     None
 }

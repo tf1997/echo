@@ -16,6 +16,7 @@ const SERVICE_TYPE: &str = "_echo-p2p._tcp.local.";
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
     pub peer_id: String,
+    pub node_id: String,
     pub username: String,
     pub department: String,
     pub software_version: String,
@@ -31,6 +32,7 @@ pub struct DiscoveryConfig {
 impl DiscoveryConfig {
     pub fn new(
         peer_id: impl Into<String>,
+        node_id: impl Into<String>,
         username: impl Into<String>,
         department: impl Into<String>,
         listen_port: u16,
@@ -40,6 +42,7 @@ impl DiscoveryConfig {
     ) -> Self {
         Self {
             peer_id: peer_id.into(),
+            node_id: node_id.into(),
             username: username.into(),
             department: department.into(),
             software_version: crate::profile_metadata::software_version(),
@@ -62,8 +65,8 @@ pub struct DiscoveryService {
 
 impl DiscoveryService {
     pub fn new(config: DiscoveryConfig) -> Result<Self> {
-        let mdns = ServiceDaemon::new()
-            .context("Failed to create mDNS daemon. Is the port 5353 free?")?;
+        let mdns =
+            ServiceDaemon::new().context("Failed to create mDNS daemon. Is the port 5353 free?")?;
         Ok(Self {
             config,
             mdns,
@@ -143,6 +146,7 @@ impl DiscoveryService {
                 peer.id.clone(),
                 Peer {
                     id: peer.id,
+                    node_id: peer.node_id,
                     username: peer.username,
                     department: peer.department,
                     software_version: peer.software_version,
@@ -182,7 +186,12 @@ impl DiscoveryService {
     }
 
     pub fn set_online(&self, peer_id: &str, online: bool) {
-        if let Some(peer) = self.peers.write().expect("peers lock poisoned").get_mut(peer_id) {
+        if let Some(peer) = self
+            .peers
+            .write()
+            .expect("peers lock poisoned")
+            .get_mut(peer_id)
+        {
             peer.online = online;
         }
     }
@@ -204,11 +213,15 @@ impl DiscoveryService {
         // mDNS disabled — unreliable on this network, using UDP broadcast instead
         // Keeping the code but skipping registration and browsing
         if false {
-            let instance_name = format!("echo-{}", &self.config.peer_id.get(..8).unwrap_or("00000000"));
+            let instance_name = format!(
+                "echo-{}",
+                &self.config.peer_id.get(..8).unwrap_or("00000000")
+            );
             let port_str = self.config.listen_port.to_string();
             let avatar_updated_at_str = self.config.avatar_updated_at.to_string();
             let properties = vec![
                 ("id", self.config.peer_id.as_str()),
+                ("node_id", self.config.node_id.as_str()),
                 ("username", self.config.username.as_str()),
                 ("department", self.config.department.as_str()),
                 ("software_version", self.config.software_version.as_str()),
@@ -249,6 +262,7 @@ impl DiscoveryService {
         let discovery_port = self.config.listen_port + 2;
         let lan_config = LanDiscoveryConfig {
             peer_id: self.config.peer_id.clone(),
+            node_id: self.config.node_id.clone(),
             username: self.config.username.clone(),
             department: self.config.department.clone(),
             software_version: self.config.software_version.clone(),
@@ -269,7 +283,9 @@ impl DiscoveryService {
     }
 
     pub fn get_scan_subnets(&self) -> Vec<String> {
-        self.lan.lock().unwrap()
+        self.lan
+            .lock()
+            .unwrap()
             .as_ref()
             .map(|lan| lan.get_scan_subnets())
             .unwrap_or_default()
@@ -297,7 +313,10 @@ impl DiscoveryService {
 
         let _ = self.mdns.unregister(SERVICE_TYPE);
 
-        let instance_name = format!("echo-{}", &self.config.peer_id.get(..8).unwrap_or("00000000"));
+        let instance_name = format!(
+            "echo-{}",
+            &self.config.peer_id.get(..8).unwrap_or("00000000")
+        );
         let port_str = self.config.listen_port.to_string();
         let avatar_updated_at_str = self.config.avatar_updated_at.to_string();
         let properties = vec![
@@ -325,7 +344,10 @@ impl DiscoveryService {
             .register(service_info)
             .context("Failed to re-register mDNS service")?;
 
-        info!("Discovery identity updated to '{}' ({})", username, department);
+        info!(
+            "Discovery identity updated to '{}' ({})",
+            username, department
+        );
         Ok(())
     }
 
@@ -379,6 +401,11 @@ impl DiscoveryService {
         if peer_id == my_id {
             return;
         }
+
+        let node_id = properties
+            .get("node_id")
+            .map(|v| v.val_str().to_string())
+            .unwrap_or_default();
 
         let username = properties
             .get("username")
@@ -461,6 +488,7 @@ impl DiscoveryService {
             peer_id.clone(),
             Peer {
                 id: peer.id.clone(),
+                node_id: node_id.clone(),
                 username: peer.username.clone(),
                 department: peer.department.clone(),
                 software_version: peer.software_version.clone(),
@@ -480,10 +508,7 @@ impl DiscoveryService {
         }
     }
 
-    fn on_service_removed(
-        full_name: &str,
-        peers: &Arc<RwLock<HashMap<String, Peer>>>,
-    ) {
+    fn on_service_removed(full_name: &str, peers: &Arc<RwLock<HashMap<String, Peer>>>) {
         let removed_id = {
             let peers_map = peers.read().expect("peers lock poisoned");
             peers_map

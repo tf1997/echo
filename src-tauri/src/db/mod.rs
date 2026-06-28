@@ -13,6 +13,8 @@ use crate::contact_filter;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserProfile {
     pub peer_id: String,
+    #[serde(default)]
+    pub node_id: String,
     pub username: String,
     pub department: String,
     pub software_version: String,
@@ -80,6 +82,8 @@ pub struct GroupUnread {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredPeer {
     pub peer_id: String,
+    #[serde(default)]
+    pub node_id: String,
     pub username: String,
     pub department: String,
     pub software_version: String,
@@ -249,6 +253,7 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS user_profile (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 peer_id TEXT,
+                node_id TEXT NOT NULL DEFAULT '',
                 username TEXT NOT NULL,
                 department TEXT NOT NULL,
                 software_version TEXT NOT NULL DEFAULT '',
@@ -269,6 +274,17 @@ impl Database {
             let message = error.to_string();
             if !message.contains("duplicate column name") {
                 return Err(error).context("Failed to add peer_id column to user_profile");
+            }
+        }
+
+        if let Err(error) =
+            sqlx::query("ALTER TABLE user_profile ADD COLUMN node_id TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add node_id column to user_profile");
             }
         }
 
@@ -344,6 +360,7 @@ impl Database {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS peers (
                 peer_id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL DEFAULT '',
                 username TEXT NOT NULL,
                 department TEXT NOT NULL,
                 software_version TEXT NOT NULL DEFAULT '',
@@ -361,6 +378,17 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("Failed to create peers table")?;
+
+        if let Err(error) =
+            sqlx::query("ALTER TABLE peers ADD COLUMN node_id TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await
+        {
+            let message = error.to_string();
+            if !message.contains("duplicate column name") {
+                return Err(error).context("Failed to add node_id column to peers");
+            }
+        }
 
         if let Err(error) =
             sqlx::query("ALTER TABLE peers ADD COLUMN software_version TEXT NOT NULL DEFAULT ''")
@@ -416,6 +444,28 @@ impl Database {
                 return Err(error).context("Failed to add avatar_updated_at column to peers");
             }
         }
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS peer_aliases (
+                alias_peer_id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create peer_aliases table")?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_peers_node_id ON peers(node_id)")
+            .execute(&self.pool)
+            .await
+            .context("Failed to create peers node_id index")?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_peer_aliases_node_id ON peer_aliases(node_id)")
+            .execute(&self.pool)
+            .await
+            .context("Failed to create peer_aliases node_id index")?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS messages (
@@ -735,7 +785,7 @@ impl Database {
 
     pub async fn list_recent_contacts(&self) -> Result<Vec<StoredPeer>> {
         let rows = sqlx::query(
-            "SELECT r.peer_id, p.username as username,
+            "SELECT r.peer_id, p.node_id as node_id, p.username as username,
                     p.department as department,
                     p.software_version as software_version,
                     p.mac_address as mac_address,
@@ -769,6 +819,7 @@ impl Database {
             .iter()
             .map(|r| StoredPeer {
                 peer_id: r.get("peer_id"),
+                node_id: r.try_get("node_id").unwrap_or_default(),
                 username: r.get("username"),
                 department: r.get("department"),
                 software_version: r.get("software_version"),
@@ -812,7 +863,7 @@ impl Database {
     }
 
     pub async fn get_user_profile(&self) -> Result<Option<UserProfile>> {
-        let row = sqlx::query("SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at FROM user_profile WHERE id = 1")
+        let row = sqlx::query("SELECT peer_id, node_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at FROM user_profile WHERE id = 1")
             .fetch_optional(&self.pool)
             .await
             .context("Failed to load user profile")?;
@@ -820,6 +871,11 @@ impl Database {
         Ok(row.map(|row| UserProfile {
             peer_id: row
                 .try_get::<Option<String>, _>("peer_id")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            node_id: row
+                .try_get::<Option<String>, _>("node_id")
                 .ok()
                 .flatten()
                 .unwrap_or_default(),
@@ -833,6 +889,32 @@ impl Database {
         }))
     }
 
+    pub async fn ensure_user_node_id(&self) -> Result<String> {
+        let existing = sqlx::query("SELECT node_id FROM user_profile WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to load existing user_profile node_id")?;
+
+        if let Some(row) = existing {
+            let node_id = row
+                .try_get::<Option<String>, _>("node_id")
+                .unwrap_or_default()
+                .unwrap_or_default();
+            let node_id = node_id.trim();
+            if !node_id.is_empty() {
+                return Ok(node_id.to_string());
+            }
+        }
+
+        let node_id = format!("node_{}", uuid::Uuid::new_v4());
+        sqlx::query("UPDATE user_profile SET node_id = ? WHERE id = 1")
+            .bind(&node_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to persist generated user_profile node_id")?;
+        Ok(node_id)
+    }
+
     pub async fn save_user_profile(
         &self,
         peer_id: &str,
@@ -842,39 +924,52 @@ impl Database {
         mac_address: &str,
     ) -> Result<()> {
         let peer_id = peer_id.trim();
+        let mut existing_node_id = String::new();
         if !peer_id.is_empty() {
-            let existing = sqlx::query("SELECT peer_id FROM user_profile WHERE id = 1")
+            let existing = sqlx::query("SELECT peer_id, node_id FROM user_profile WHERE id = 1")
                 .fetch_optional(&self.pool)
                 .await
-                .context("Failed to load existing user profile peer_id")?;
+                .context("Failed to load existing user profile identity")?;
             if let Some(row) = existing {
                 let old_peer_id = row
                     .try_get::<Option<String>, _>("peer_id")
                     .unwrap_or_default()
                     .unwrap_or_default();
+                existing_node_id = row
+                    .try_get::<Option<String>, _>("node_id")
+                    .unwrap_or_default()
+                    .unwrap_or_default();
                 let old_peer_id = old_peer_id.trim();
+                let node_id = existing_node_id.trim();
                 if !old_peer_id.is_empty()
                     && old_peer_id != peer_id
                     && is_endpoint_peer_id(old_peer_id)
                     && is_endpoint_peer_id(peer_id)
                 {
-                    self.migrate_self_endpoint_peer(old_peer_id, peer_id)
-                        .await?;
+                    if node_id.is_empty() {
+                        self.migrate_self_endpoint_peer(old_peer_id, peer_id)
+                            .await?;
+                    } else {
+                        self.upsert_peer_alias(node_id, old_peer_id).await?;
+                        self.upsert_peer_alias(node_id, peer_id).await?;
+                    }
                 }
             }
         }
 
         sqlx::query(
-            "INSERT INTO user_profile (id, peer_id, username, department, software_version, mac_address)
-             VALUES (1, ?, ?, ?, ?, ?)
+            "INSERT INTO user_profile (id, peer_id, node_id, username, department, software_version, mac_address)
+             VALUES (1, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 peer_id = excluded.peer_id,
+                node_id = CASE WHEN user_profile.node_id = '' THEN excluded.node_id ELSE user_profile.node_id END,
                 username = excluded.username,
                 department = excluded.department,
                 software_version = excluded.software_version,
                 mac_address = excluded.mac_address",
         )
         .bind(peer_id)
+        .bind(existing_node_id.trim())
         .bind(username)
         .bind(department)
         .bind(software_version)
@@ -1232,6 +1327,7 @@ impl Database {
         // For "myself" we have no row in `peers` — fall back to `user_profile`.
         let rows = sqlx::query(
             "SELECT gm.peer_id AS peer_id,
+                    COALESCE(NULLIF(p.node_id, ''), up.node_id, '') AS node_id,
                     COALESCE(NULLIF(p.username, ''), up.username, '') AS username,
                     COALESCE(NULLIF(p.department, ''), up.department, '') AS department,
                     COALESCE(NULLIF(p.software_version, ''), up.software_version, '') AS software_version,
@@ -1256,6 +1352,7 @@ impl Database {
                 let is_self: i64 = r.try_get("is_self").unwrap_or(0);
                 StoredPeer {
                     peer_id: r.get("peer_id"),
+                    node_id: r.try_get("node_id").unwrap_or_default(),
                     username: r.try_get("username").unwrap_or_default(),
                     department: r.try_get("department").unwrap_or_default(),
                     software_version: r.try_get("software_version").unwrap_or_default(),
@@ -1596,7 +1693,40 @@ impl Database {
         port: u16,
         is_online: bool,
     ) -> Result<()> {
+        self.upsert_peer_with_node_id_avatar(
+            peer_id,
+            "",
+            username,
+            department,
+            software_version,
+            mac_address,
+            avatar_path,
+            avatar_hash,
+            avatar_updated_at,
+            ip,
+            port,
+            is_online,
+        )
+        .await
+    }
+
+    pub async fn upsert_peer_with_node_id_avatar(
+        &self,
+        peer_id: &str,
+        node_id: &str,
+        username: &str,
+        department: &str,
+        software_version: &str,
+        mac_address: &str,
+        avatar_path: &str,
+        avatar_hash: &str,
+        avatar_updated_at: i64,
+        ip: &str,
+        port: u16,
+        is_online: bool,
+    ) -> Result<()> {
         let incoming_peer_id = peer_id.trim();
+        let node_id = node_id.trim();
         if incoming_peer_id.is_empty() || !contact_filter::has_valid_endpoint(ip, port) {
             log::debug!(
                 "Skipping peer with invalid endpoint: {} @ {}:{}",
@@ -1636,13 +1766,27 @@ impl Database {
 
         let now = Utc::now().to_rfc3339();
 
+        let existing_node_peer_ids = if node_id.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query("SELECT peer_id FROM peers WHERE node_id = ? AND peer_id <> ?")
+                .bind(node_id)
+                .bind(peer_id)
+                .fetch_all(&self.pool)
+                .await
+                .context("Failed to load existing peers for node_id")?
+                .into_iter()
+                .map(|row| row.get::<String, _>("peer_id"))
+                .collect::<Vec<_>>()
+        };
+
         // Check for same-identity peer at this endpoint (IP changed, old client didn't broadcast)
         if !username.is_empty() && !department.is_empty() {
             let existing_at_endpoint = sqlx::query(
                 "SELECT peer_id FROM peers
                  WHERE ip = ? AND port = ? AND peer_id <> ?
                  AND username = ? AND department = ?
-                 LIMIT 1"
+                 LIMIT 1",
             )
             .bind(ip)
             .bind(port as i64)
@@ -1657,7 +1801,12 @@ impl Database {
                 let old_peer_id: String = row.get("peer_id");
                 log::info!(
                     "Same identity ({} {}) moved from {} to {} at {}:{} - migrating references",
-                    username, department, old_peer_id, peer_id, ip, port
+                    username,
+                    department,
+                    old_peer_id,
+                    peer_id,
+                    ip,
+                    port
                 );
                 self.migrate_peer_references(&old_peer_id, peer_id).await?;
                 sqlx::query("DELETE FROM peers WHERE peer_id = ?")
@@ -1690,14 +1839,15 @@ impl Database {
             .await
             .context("Failed to remove stale peer endpoints")?;
 
-        // Identity is IP:port, so same-name contacts at different endpoints must stay separate.
+        // With node_id present, endpoint changes are tracked as aliases; same-name legacy peers stay separate.
         // Upsert. Preserve existing non-empty username/department when the incoming row has
         // empty values — system messages (group_created, group_dissolved, group_member_left)
         // historically carried empty sender_name and would otherwise wipe good peer data.
         sqlx::query(
-            "INSERT INTO peers (peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO peers (peer_id, node_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(peer_id) DO UPDATE SET
+                node_id = CASE WHEN excluded.node_id = '' THEN peers.node_id ELSE excluded.node_id END,
                 username = CASE WHEN TRIM(excluded.username) = '' THEN peers.username ELSE excluded.username END,
                 department = CASE WHEN TRIM(excluded.department) = '' THEN peers.department ELSE excluded.department END,
                 software_version = CASE WHEN excluded.software_version = '' THEN peers.software_version ELSE excluded.software_version END,
@@ -1723,6 +1873,7 @@ impl Database {
                 last_seen_at = excluded.last_seen_at",
         )
         .bind(peer_id)
+        .bind(node_id)
         .bind(username)
         .bind(department)
         .bind(software_version)
@@ -1739,10 +1890,152 @@ impl Database {
         .await
         .context("Failed to upsert peer")?;
 
+        if !node_id.is_empty() {
+            self.upsert_peer_alias(node_id, peer_id).await?;
+            for old_peer_id in existing_node_peer_ids {
+                self.upsert_peer_alias(node_id, &old_peer_id).await?;
+                self.move_recent_contact_reference(&old_peer_id, peer_id)
+                    .await?;
+                sqlx::query("DELETE FROM peers WHERE peer_id = ?")
+                    .bind(&old_peer_id)
+                    .execute(&self.pool)
+                    .await
+                    .context("Failed to remove stale peer row for node_id")?;
+            }
+        }
+
         Ok(())
     }
 
-    pub(crate) async fn migrate_peer_references(&self, old_peer_id: &str, new_peer_id: &str) -> Result<()> {
+    pub async fn upsert_peer_alias(&self, node_id: &str, alias_peer_id: &str) -> Result<()> {
+        let node_id = node_id.trim();
+        let alias_peer_id = alias_peer_id.trim();
+        if node_id.is_empty() || alias_peer_id.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO peer_aliases (alias_peer_id, node_id, created_at, last_seen_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(alias_peer_id) DO UPDATE SET
+                node_id = excluded.node_id,
+                last_seen_at = excluded.last_seen_at",
+        )
+        .bind(alias_peer_id)
+        .bind(node_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .context("Failed to upsert peer alias")?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn list_peer_aliases(&self, node_id: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT alias_peer_id FROM peer_aliases WHERE node_id = ? ORDER BY alias_peer_id",
+        )
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list peer aliases")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get("alias_peer_id"))
+            .collect())
+    }
+
+    async fn move_recent_contact_reference(
+        &self,
+        old_peer_id: &str,
+        new_peer_id: &str,
+    ) -> Result<()> {
+        if old_peer_id == new_peer_id {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO recent_contacts (peer_id, added_at)
+             SELECT ?, added_at FROM recent_contacts WHERE peer_id = ?",
+        )
+        .bind(new_peer_id)
+        .bind(old_peer_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to move recent contact reference")?;
+        sqlx::query("DELETE FROM recent_contacts WHERE peer_id = ?")
+            .bind(old_peer_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to remove old recent contact reference")?;
+        Ok(())
+    }
+
+    async fn identity_keys_for(&self, identity: &str) -> Result<Vec<String>> {
+        let identity = identity.trim();
+        let mut keys = Vec::<String>::new();
+        if !identity.is_empty() {
+            keys.push(identity.to_string());
+        }
+
+        let node_rows = sqlx::query(
+            "SELECT node_id FROM peers WHERE peer_id = ? AND TRIM(node_id) <> ''
+             UNION
+             SELECT node_id FROM peer_aliases WHERE alias_peer_id = ? AND TRIM(node_id) <> ''
+             UNION
+             SELECT node_id FROM user_profile WHERE (peer_id = ? OR node_id = ?) AND TRIM(node_id) <> ''",
+        )
+        .bind(identity)
+        .bind(identity)
+        .bind(identity)
+        .bind(identity)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to resolve identity node_id")?;
+
+        for row in node_rows {
+            let node_id: String = row.get("node_id");
+            if !keys.iter().any(|key| key == &node_id) {
+                keys.push(node_id.clone());
+            }
+
+            let alias_rows = sqlx::query(
+                "SELECT peer_id AS id FROM peers WHERE node_id = ?
+                 UNION
+                 SELECT alias_peer_id AS id FROM peer_aliases WHERE node_id = ?
+                 UNION
+                 SELECT peer_id AS id FROM user_profile WHERE node_id = ? AND TRIM(peer_id) <> ''",
+            )
+            .bind(&node_id)
+            .bind(&node_id)
+            .bind(&node_id)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to resolve identity aliases")?;
+
+            for alias_row in alias_rows {
+                let alias: String = alias_row.get("id");
+                if !alias.trim().is_empty() && !keys.iter().any(|key| key == &alias) {
+                    keys.push(alias);
+                }
+            }
+        }
+
+        Ok(keys)
+    }
+
+    fn placeholders(count: usize) -> String {
+        std::iter::repeat("?")
+            .take(count.max(1))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub(crate) async fn migrate_peer_references(
+        &self,
+        old_peer_id: &str,
+        new_peer_id: &str,
+    ) -> Result<()> {
         if old_peer_id == new_peer_id {
             return Ok(());
         }
@@ -1984,7 +2277,7 @@ impl Database {
 
     pub async fn list_stored_peers(&self) -> Result<Vec<StoredPeer>> {
         let rows = sqlx::query(
-            "SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at
+            "SELECT peer_id, node_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at
              FROM peers
              WHERE TRIM(username) <> '' OR TRIM(department) <> ''
              ORDER BY is_online DESC, last_seen_at DESC",
@@ -1997,6 +2290,7 @@ impl Database {
             .iter()
             .map(|row| StoredPeer {
                 peer_id: row.get("peer_id"),
+                node_id: row.try_get("node_id").unwrap_or_default(),
                 username: row.get("username"),
                 department: row.get("department"),
                 software_version: row.get("software_version"),
@@ -2015,7 +2309,7 @@ impl Database {
 
     pub async fn get_stored_peer(&self, peer_id: &str) -> Result<Option<StoredPeer>> {
         let row = sqlx::query(
-            "SELECT peer_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at
+            "SELECT peer_id, node_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at
              FROM peers
              WHERE peer_id = ?
                AND (TRIM(username) <> '' OR TRIM(department) <> '')",
@@ -2027,6 +2321,7 @@ impl Database {
 
         Ok(row.map(|row| StoredPeer {
             peer_id: row.get("peer_id"),
+            node_id: row.try_get("node_id").unwrap_or_default(),
             username: row.get("username"),
             department: row.get("department"),
             software_version: row.get("software_version"),
@@ -2131,24 +2426,39 @@ impl Database {
     ) -> Result<Vec<ChatMessage>> {
         let limit = normalize_message_limit(limit);
         log::info!("get_conversation: peer_id={}, my_id={}", peer_id, my_id);
-        let rows = sqlx::query(
+        let peer_keys = self.identity_keys_for(peer_id).await?;
+        let my_keys = self.identity_keys_for(my_id).await?;
+        let peer_placeholders = Self::placeholders(peer_keys.len());
+        let my_placeholders = Self::placeholders(my_keys.len());
+        let sql = format!(
             "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
              FROM (
                  SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
                  FROM messages
-                 WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
+                 WHERE (sender_id IN ({my_placeholders}) AND receiver_id IN ({peer_placeholders}))
+                    OR (sender_id IN ({peer_placeholders}) AND receiver_id IN ({my_placeholders}))
                  ORDER BY id DESC LIMIT ?
              ) AS recent_messages
              ORDER BY id ASC"
-        )
-        .bind(my_id)
-        .bind(peer_id)
-        .bind(peer_id)
-        .bind(my_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .context("Failed to fetch conversation")?;
+        );
+        let mut query = sqlx::query(&sql);
+        for key in &my_keys {
+            query = query.bind(key);
+        }
+        for key in &peer_keys {
+            query = query.bind(key);
+        }
+        for key in &peer_keys {
+            query = query.bind(key);
+        }
+        for key in &my_keys {
+            query = query.bind(key);
+        }
+        let rows = query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to fetch conversation")?;
 
         let messages = rows
             .iter()
@@ -2182,6 +2492,10 @@ impl Database {
         day_end: Option<&str>,
     ) -> Result<Vec<ChatMessage>> {
         let limit = normalize_message_limit(limit);
+        let peer_keys = self.identity_keys_for(peer_id).await?;
+        let my_keys = self.identity_keys_for(my_id).await?;
+        let peer_placeholders = Self::placeholders(peer_keys.len());
+        let my_placeholders = Self::placeholders(my_keys.len());
         let before_clause = if before_id.is_some() {
             "AND id < ?"
         } else {
@@ -2198,7 +2512,8 @@ impl Database {
              FROM (
                  SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
                  FROM messages
-                 WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+                 WHERE ((sender_id IN ({my_placeholders}) AND receiver_id IN ({peer_placeholders}))
+                    OR (sender_id IN ({peer_placeholders}) AND receiver_id IN ({my_placeholders})))
                    {before_clause}
                    {filter_clause}
                    {day_clause}
@@ -2206,11 +2521,19 @@ impl Database {
              ) AS history_messages
              ORDER BY id ASC"
         );
-        let mut query = sqlx::query(&sql)
-            .bind(my_id)
-            .bind(peer_id)
-            .bind(peer_id)
-            .bind(my_id);
+        let mut query = sqlx::query(&sql);
+        for key in &my_keys {
+            query = query.bind(key);
+        }
+        for key in &peer_keys {
+            query = query.bind(key);
+        }
+        for key in &peer_keys {
+            query = query.bind(key);
+        }
+        for key in &my_keys {
+            query = query.bind(key);
+        }
         if let Some(before_id) = before_id {
             query = query.bind(before_id);
         }
@@ -2288,6 +2611,10 @@ impl Database {
     ) -> Result<Vec<ChatMessage>> {
         let pattern = format!("%{}%", query);
         let limit = normalize_search_limit(limit);
+        let peer_keys = self.identity_keys_for(peer_id).await?;
+        let my_keys = self.identity_keys_for(my_id).await?;
+        let peer_placeholders = Self::placeholders(peer_keys.len());
+        let my_placeholders = Self::placeholders(my_keys.len());
         let filter_clause = message_filter_clause(filter);
         let day_clause = if day_start.is_some() && day_end.is_some() {
             "AND timestamp >= ? AND timestamp < ?"
@@ -2297,20 +2624,28 @@ impl Database {
         let sql = format!(
             "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
              FROM messages
-             WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+             WHERE ((sender_id IN ({my_placeholders}) AND receiver_id IN ({peer_placeholders}))
+                OR (sender_id IN ({peer_placeholders}) AND receiver_id IN ({my_placeholders})))
                AND (content LIKE ? OR file_name LIKE ?)
                {filter_clause}
                {day_clause}
              ORDER BY id DESC
              LIMIT ?"
         );
-        let mut query = sqlx::query(&sql)
-            .bind(my_id)
-            .bind(peer_id)
-            .bind(peer_id)
-            .bind(my_id)
-            .bind(&pattern)
-            .bind(&pattern);
+        let mut query = sqlx::query(&sql);
+        for key in &my_keys {
+            query = query.bind(key);
+        }
+        for key in &peer_keys {
+            query = query.bind(key);
+        }
+        for key in &peer_keys {
+            query = query.bind(key);
+        }
+        for key in &my_keys {
+            query = query.bind(key);
+        }
+        query = query.bind(&pattern).bind(&pattern);
         if let (Some(day_start), Some(day_end)) = (day_start, day_end) {
             query = query.bind(day_start).bind(day_end);
         }
@@ -2368,80 +2703,109 @@ impl Database {
 
     pub async fn search_messages(&self, my_id: &str, query: &str) -> Result<Vec<ChatMessage>> {
         let pattern = format!("%{}%", query);
-        let rows = sqlx::query(
+        let my_keys = self.identity_keys_for(my_id).await?;
+        let my_placeholders = Self::placeholders(my_keys.len());
+        let sql = format!(
             "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
              FROM messages
-             WHERE (sender_id = ? OR receiver_id = ?)
+             WHERE (sender_id IN ({my_placeholders}) OR receiver_id IN ({my_placeholders}))
                AND (content LIKE ? OR file_name LIKE ?)
              ORDER BY id DESC
-             LIMIT 100",
-        )
-        .bind(my_id)
-        .bind(my_id)
-        .bind(&pattern)
-        .bind(&pattern)
-        .fetch_all(&self.pool)
-        .await
-        .context("Failed to search messages")?;
+             LIMIT 100"
+        );
+        let mut query = sqlx::query(&sql);
+        for key in &my_keys {
+            query = query.bind(key);
+        }
+        for key in &my_keys {
+            query = query.bind(key);
+        }
+        let rows = query
+            .bind(&pattern)
+            .bind(&pattern)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to search messages")?;
 
-        Ok(rows
-            .iter()
-            .map(|row| ChatMessage {
-                id: row.get("id"),
-                sender_id: row.get("sender_id"),
-                sender_name: row.get("sender_name"),
-                receiver_id: row.get("receiver_id"),
-                content: row.get("content"),
-                msg_type: row.get("msg_type"),
-                file_path: row.get("file_path"),
-                file_name: row.get("file_name"),
-                file_size: row.get("file_size"),
-                timestamp: row.get("timestamp"),
-                is_read: row.get::<bool, _>("is_read"),
-                client_msg_id: row.try_get("client_msg_id").ok(),
-            })
-            .collect())
+        Ok(rows.iter().map(chat_message_from_row).collect())
     }
 
     pub async fn mark_read(&self, sender_id: &str, receiver_id: &str) -> Result<()> {
-        sqlx::query(
+        let sender_keys = self.identity_keys_for(sender_id).await?;
+        let receiver_keys = self.identity_keys_for(receiver_id).await?;
+        let sender_placeholders = Self::placeholders(sender_keys.len());
+        let receiver_placeholders = Self::placeholders(receiver_keys.len());
+        let sql = format!(
             "UPDATE messages
              SET is_read = 1
-             WHERE receiver_id = ?
+             WHERE receiver_id IN ({receiver_placeholders})
                AND (
-                    sender_id = ?
+                    sender_id IN ({sender_placeholders})
                     OR (
                         sender_name <> ''
                         AND sender_name = (
                             SELECT username FROM peers
-                            WHERE peer_id = ? AND username <> ''
+                            WHERE peer_id IN ({sender_placeholders}) AND username <> ''
                             LIMIT 1
                         )
                     )
-               )",
-        )
-        .bind(receiver_id)
-        .bind(sender_id)
-        .bind(sender_id)
-        .execute(&self.pool)
-        .await
-        .context("Failed to mark messages as read")?;
+               )"
+        );
+        let mut query = sqlx::query(&sql);
+        for key in &receiver_keys {
+            query = query.bind(key);
+        }
+        for key in &sender_keys {
+            query = query.bind(key);
+        }
+        for key in &sender_keys {
+            query = query.bind(key);
+        }
+        query
+            .execute(&self.pool)
+            .await
+            .context("Failed to mark messages as read")?;
         Ok(())
     }
 
     pub async fn get_unread_counts(&self, my_id: &str) -> Result<Vec<UnreadCount>> {
-        let rows = sqlx::query(
-            "SELECT m.sender_id, COUNT(*) as cnt,
-                    COALESCE(NULLIF(p.username, ''), NULLIF(MAX(m.sender_name), ''), m.sender_id) as username
-             FROM messages m
-             LEFT JOIN peers p ON m.sender_id = p.peer_id
-             WHERE m.receiver_id = ? AND m.is_read = 0
-             GROUP BY m.sender_id",
-        )
-        .bind(my_id)
-        .fetch_all(&self.pool)
-        .await
-        .context("Failed to get unread counts")?;
+        let my_keys = self.identity_keys_for(my_id).await?;
+        let my_placeholders = Self::placeholders(my_keys.len());
+        let sql = format!(
+            "WITH unread AS (
+                 SELECT m.sender_id,
+                        COALESCE(NULLIF(p.node_id, ''), NULLIF(pa.node_id, ''), '') AS node_id,
+                        COUNT(*) AS cnt,
+                        COALESCE(NULLIF(p.username, ''), NULLIF(MAX(m.sender_name), ''), m.sender_id) AS username
+                 FROM messages m
+                 LEFT JOIN peers p ON m.sender_id = p.peer_id
+                 LEFT JOIN peer_aliases pa ON m.sender_id = pa.alias_peer_id
+                 WHERE m.receiver_id IN ({my_placeholders}) AND m.is_read = 0
+                 GROUP BY m.sender_id, node_id
+             )
+             SELECT COALESCE(
+                        (
+                            SELECT p2.peer_id
+                            FROM peers p2
+                            WHERE p2.node_id = unread.node_id AND TRIM(p2.node_id) <> ''
+                            ORDER BY p2.is_online DESC, p2.last_seen_at DESC
+                            LIMIT 1
+                        ),
+                        unread.sender_id
+                    ) AS sender_id,
+                    SUM(unread.cnt) AS cnt,
+                    COALESCE(NULLIF(MAX(unread.username), ''), unread.sender_id) AS username
+             FROM unread
+             GROUP BY CASE WHEN unread.node_id <> '' THEN unread.node_id ELSE unread.sender_id END"
+        );
+        let mut query = sqlx::query(&sql);
+        for key in &my_keys {
+            query = query.bind(key);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to get unread counts")?;
 
         Ok(rows
             .iter()
@@ -3015,6 +3379,206 @@ mod tests {
             .expect("new endpoint messages should load");
         assert_eq!(old_messages.len(), 1);
         assert!(new_messages.is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn conversation_resolves_messages_across_peer_aliases() {
+        let db_path = temp_db_path("node-alias-conversation");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+
+        db.upsert_peer_with_node_id_avatar(
+            "10.0.0.2:9527",
+            "node-alice",
+            "Alice",
+            "Ops",
+            "1.0.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.2",
+            9527,
+            true,
+        )
+        .await
+        .expect("old endpoint should persist with node_id");
+        db.save_message(
+            "me",
+            "Me",
+            "10.0.0.2:9527",
+            "message before DHCP change",
+            "text",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("message to old endpoint should save");
+
+        db.upsert_peer_with_node_id_avatar(
+            "10.0.0.9:9527",
+            "node-alice",
+            "Alice",
+            "Ops",
+            "1.0.1",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.9",
+            9527,
+            true,
+        )
+        .await
+        .expect("new endpoint should update same node_id");
+
+        let messages = db
+            .get_conversation("10.0.0.9:9527", "me", Some(10))
+            .await
+            .expect("new endpoint conversation should include old alias messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "message before DHCP change");
+
+        let aliases = db
+            .list_peer_aliases("node-alice")
+            .await
+            .expect("aliases should load");
+        assert!(aliases.iter().any(|alias| alias == "10.0.0.2:9527"));
+        assert!(aliases.iter().any(|alias| alias == "10.0.0.9:9527"));
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn alias_identity_covers_history_search_and_read_state() {
+        let db_path = temp_db_path("node-alias-history-search-read");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+
+        db.upsert_peer_with_node_id_avatar(
+            "10.0.0.2:9527",
+            "node-alice",
+            "Alice",
+            "Ops",
+            "1.0.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.2",
+            9527,
+            true,
+        )
+        .await
+        .expect("old endpoint should persist with node_id");
+        db.save_message(
+            "10.0.0.2:9527",
+            "Alice",
+            "me",
+            "searchable message before DHCP change",
+            "text",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("old endpoint message should save");
+
+        db.upsert_peer_with_node_id_avatar(
+            "10.0.0.9:9527",
+            "node-alice",
+            "Alice",
+            "Ops",
+            "1.0.1",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.9",
+            9527,
+            true,
+        )
+        .await
+        .expect("new endpoint should update same node_id");
+
+        let history = db
+            .get_conversation_history("10.0.0.9:9527", "me", None, Some(10), None, None, None)
+            .await
+            .expect("history should resolve aliases");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "searchable message before DHCP change");
+
+        let conversation_search = db
+            .search_conversation_messages("10.0.0.9:9527", "me", "DHCP", Some(10), None, None, None)
+            .await
+            .expect("conversation search should resolve aliases");
+        assert_eq!(conversation_search.len(), 1);
+
+        let global_search = db
+            .search_messages("me", "searchable")
+            .await
+            .expect("global search should include messages to current self id");
+        assert_eq!(global_search.len(), 1);
+
+        let unread = db
+            .get_unread_counts("me")
+            .await
+            .expect("unread counts should resolve aliases");
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].peer_id, "10.0.0.9:9527");
+        assert_eq!(unread[0].count, 1);
+
+        db.mark_read("10.0.0.9:9527", "me")
+            .await
+            .expect("mark_read should resolve aliases");
+        let unread_after = db
+            .get_unread_counts("me")
+            .await
+            .expect("unread counts should reload");
+        assert!(unread_after.is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn user_profile_persists_node_id_across_peer_id_changes() {
+        let db_path = temp_db_path("profile-node-id");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+
+        db.save_user_profile("10.0.0.2:9527", "Me", "Ops", "1.0.0", "aa:bb:cc")
+            .await
+            .expect("profile should save");
+        let first_node_id = db
+            .ensure_user_node_id()
+            .await
+            .expect("node_id should be generated");
+
+        db.save_user_profile("10.0.0.9:9527", "Me", "Ops", "1.0.1", "aa:bb:cc")
+            .await
+            .expect("profile peer_id change should save");
+        let profile = db
+            .get_user_profile()
+            .await
+            .expect("profile should load")
+            .expect("profile should exist");
+
+        assert_eq!(profile.node_id, first_node_id);
+        assert_eq!(profile.peer_id, "10.0.0.9:9527");
 
         drop(db);
         let _ = std::fs::remove_file(db_path);

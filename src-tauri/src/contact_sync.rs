@@ -16,6 +16,8 @@ use crate::discovery::Peer;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactSummaryEntry {
     pub peer_id: String,
+    #[serde(default)]
+    pub node_id: String,
     pub username: String,
     pub department: String,
     #[serde(default)]
@@ -63,6 +65,10 @@ pub async fn build_summaries(
     seen.insert(my_id.to_string());
     out.push(ContactSummaryEntry {
         peer_id: my_id.to_string(),
+        node_id: my_profile
+            .as_ref()
+            .map(|profile| profile.node_id.clone())
+            .unwrap_or_default(),
         username: my_name.to_string(),
         department: my_department.to_string(),
         software_version: my_software_version.to_string(),
@@ -94,6 +100,7 @@ pub async fn build_summaries(
         {
             out.push(ContactSummaryEntry {
                 peer_id: sp.peer_id.clone(),
+                node_id: sp.node_id.clone(),
                 username: sp.username.clone(),
                 department: sp.department.clone(),
                 software_version: sp.software_version.clone(),
@@ -123,6 +130,7 @@ pub async fn build_summaries(
             {
                 out.push(ContactSummaryEntry {
                     peer_id: p.id.clone(),
+                    node_id: p.node_id.clone(),
                     username: p.username.clone(),
                     department: p.department.clone(),
                     software_version: p.software_version.clone(),
@@ -193,6 +201,9 @@ fn merge_into_memory(
     if let Ok(ip) = entry.ip.parse::<std::net::IpAddr>() {
         if let Ok(mut map) = peers_map.write() {
             if let Some(existing) = map.get_mut(&entry.peer_id) {
+                if !entry.node_id.is_empty() {
+                    existing.node_id = entry.node_id.clone();
+                }
                 if !entry.username.is_empty() {
                     existing.username = entry.username.clone();
                 }
@@ -219,9 +230,8 @@ fn merge_into_memory(
                     existing.last_seen = entry.version;
                 }
             } else {
-                map.insert(
-                    entry.peer_id.clone(),
-                    Peer::with_online_avatar(
+                map.insert(entry.peer_id.clone(), {
+                    let mut peer = Peer::with_online_avatar(
                         entry.peer_id.clone(),
                         entry.username.clone(),
                         entry.department.clone(),
@@ -234,8 +244,10 @@ fn merge_into_memory(
                         entry.port,
                         false,
                         entry.version,
-                    ),
-                );
+                    );
+                    peer.node_id = entry.node_id.clone();
+                    peer
+                });
             }
         }
     }
@@ -254,6 +266,7 @@ pub async fn handle_contact_summary(
     db: &Database,
     peers_map: &std::sync::RwLock<HashMap<String, Peer>>,
     my_id: &str,
+    my_node_id: &str,
     my_name: &str,
     my_department: &str,
     my_software_version: &str,
@@ -261,6 +274,7 @@ pub async fn handle_contact_summary(
     my_port: u16,
     my_ip: &str,
     sender_id: &str,
+    sender_node_id: &str,
     sender_port: u16,
     sender_ip: &str,
     content: &str,
@@ -293,8 +307,9 @@ pub async fn handle_contact_summary(
         }
         // Persist
         let _ = db
-            .upsert_peer_with_avatar(
+            .upsert_peer_with_node_id_avatar(
                 &entry.peer_id,
+                &entry.node_id,
                 &entry.username,
                 &entry.department,
                 &entry.software_version,
@@ -358,12 +373,14 @@ pub async fn handle_contact_summary(
 
     let response_msg = WireMessage {
         sender_id: my_id.to_string(),
+        sender_node_id: my_node_id.to_string(),
         sender_name: my_name.to_string(),
         sender_department: my_department.to_string(),
         sender_software_version: my_software_version.to_string(),
         sender_mac_address: my_mac_address.to_string(),
         sender_port: my_port,
         receiver_id: sender_id.to_string(),
+        receiver_node_id: sender_node_id.to_string(),
         content: response_content,
         msg_type: "contact_sync_res".to_string(),
         file_name: None,
@@ -409,8 +426,9 @@ pub async fn handle_contact_sync_res(
         }
         let _ = db.add_recent_contact(&entry.peer_id).await;
         let _ = db
-            .upsert_peer_with_avatar(
+            .upsert_peer_with_node_id_avatar(
                 &entry.peer_id,
+                &entry.node_id,
                 &entry.username,
                 &entry.department,
                 &entry.software_version,
@@ -434,8 +452,9 @@ pub async fn handle_contact_sync_res(
         }
         let _ = db.add_recent_contact(&entry.peer_id).await;
         let _ = db
-            .upsert_peer_with_avatar(
+            .upsert_peer_with_node_id_avatar(
                 &entry.peer_id,
+                &entry.node_id,
                 &entry.username,
                 &entry.department,
                 &entry.software_version,
@@ -469,6 +488,7 @@ pub async fn exchange_with_peer(
     db: &Database,
     peers_map: &std::sync::RwLock<HashMap<String, Peer>>,
     my_id: &str,
+    my_node_id: &str,
     my_name: &str,
     my_department: &str,
     my_software_version: &str,
@@ -478,6 +498,7 @@ pub async fn exchange_with_peer(
     target_ip: &str,
     target_port: u16,
     target_id: &str,
+    target_node_id: &str,
 ) {
     let summaries = build_summaries(
         db,
@@ -495,12 +516,14 @@ pub async fn exchange_with_peer(
 
     let msg = WireMessage {
         sender_id: my_id.to_string(),
+        sender_node_id: my_node_id.to_string(),
         sender_name: my_name.to_string(),
         sender_department: my_department.to_string(),
         sender_software_version: my_software_version.to_string(),
         sender_mac_address: my_mac_address.to_string(),
         sender_port: my_port,
         receiver_id: target_id.to_string(),
+        receiver_node_id: target_node_id.to_string(),
         content,
         msg_type: "contact_summary".to_string(),
         file_name: None,

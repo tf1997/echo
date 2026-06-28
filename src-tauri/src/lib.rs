@@ -7,19 +7,17 @@ mod discovery;
 mod profile_metadata;
 mod state;
 mod tray;
-mod windows_event_log;
 pub mod updater;
+mod windows_event_log;
 
-use db::Database;
 use crate::discovery::{Peer, PeerEntry};
+use db::Database;
 use log::info;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::api::dialog::{
-    blocking::MessageDialogBuilder, MessageDialogButtons, MessageDialogKind,
-};
+use tauri::api::dialog::{blocking::MessageDialogBuilder, MessageDialogButtons, MessageDialogKind};
 use tauri::{CustomMenuItem, Manager, Menu, Submenu};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -77,12 +75,7 @@ fn install_panic_logger(log_dir: PathBuf) {
             .payload()
             .downcast_ref::<&str>()
             .map(|value| (*value).to_string())
-            .or_else(|| {
-                panic_info
-                    .payload()
-                    .downcast_ref::<String>()
-                    .cloned()
-            })
+            .or_else(|| panic_info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "unknown panic payload".to_string());
         let location = panic_info
             .location()
@@ -266,12 +259,19 @@ pub fn run() {
             let runtime_services = if let Some(saved_profile) = profile.as_ref() {
                 let saved_username = saved_profile.username.clone();
                 let runtime = tauri::async_runtime::block_on(async {
-                    state::RuntimeServices::start(app.handle().clone(), Arc::clone(&db), saved_profile, listen_port, Some(relay_tx.clone()))
-                        .await
-                        .expect("Failed to start runtime services")
+                    state::RuntimeServices::start(
+                        app.handle().clone(),
+                        Arc::clone(&db),
+                        saved_profile,
+                        listen_port,
+                        Some(relay_tx.clone()),
+                    )
+                    .await
+                    .expect("Failed to start runtime services")
                 });
                 if let Some(profile) = profile.as_mut() {
                     profile.peer_id = runtime.my_id.clone();
+                    profile.node_id = runtime.my_node_id.clone();
                 }
                 info!("Runtime started with saved profile: {}", saved_username);
                 Some(Arc::new(runtime))
@@ -307,8 +307,9 @@ pub fn run() {
                             continue;
                         }
                         let _ = processor_db
-                            .upsert_peer_with_avatar(
+                            .upsert_peer_with_node_id_avatar(
                                 &entry.id,
+                                &entry.node_id,
                                 &entry.username,
                                 &entry.department,
                                 &entry.software_version,
@@ -349,11 +350,12 @@ pub fn run() {
                         let now = chrono::Utc::now().timestamp();
                         for sp in &stored {
                             if let Ok(ip) = sp.ip.parse::<IpAddr>() {
-                                let last_seen = chrono::DateTime::parse_from_rfc3339(&sp.last_seen_at)
-                                    .map(|value| value.timestamp())
-                                    .unwrap_or(0);
+                                let last_seen =
+                                    chrono::DateTime::parse_from_rfc3339(&sp.last_seen_at)
+                                        .map(|value| value.timestamp())
+                                        .unwrap_or(0);
                                 let recently_seen = last_seen > 0 && now - last_seen <= 15;
-                                let peer = Peer::with_online_avatar(
+                                let mut peer = Peer::with_online_avatar(
                                     sp.peer_id.clone(),
                                     sp.username.clone(),
                                     sp.department.clone(),
@@ -367,6 +369,7 @@ pub fn run() {
                                     sp.is_online && recently_seen,
                                     last_seen,
                                 );
+                                peer.node_id = sp.node_id.clone();
                                 disc.register_peer(peer);
                             }
                         }
@@ -381,8 +384,8 @@ pub fn run() {
                 let mut metadata_probe_last: std::collections::HashMap<String, i64> =
                     std::collections::HashMap::new();
 
-                use tokio::net::TcpStream;
                 use std::net::SocketAddr;
+                use tokio::net::TcpStream;
 
                 loop {
                     if let Some(state) = app_handle.try_state::<AppState>() {
@@ -392,12 +395,40 @@ pub fn run() {
                             .as_secs() as i64;
 
                         // Snapshot peers, then release all locks
-                        let snapshot: Vec<(String, String, String, String, String, String, i64, IpAddr, u16)> = {
+                        let snapshot: Vec<(
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            i64,
+                            IpAddr,
+                            u16,
+                        )> = {
                             let runtime_opt = { state.runtime.read().await.clone() };
                             if let Some(runtime) = runtime_opt.as_ref() {
-                                runtime.discovery.read().await.get_peers()
+                                runtime
+                                    .discovery
+                                    .read()
+                                    .await
+                                    .get_peers()
                                     .into_iter()
-                                    .map(|p| (p.id, p.username, p.department, p.software_version, p.mac_address, p.avatar_hash, p.avatar_updated_at, p.ip, p.port))
+                                    .map(|p| {
+                                        (
+                                            p.id,
+                                            p.node_id,
+                                            p.username,
+                                            p.department,
+                                            p.software_version,
+                                            p.mac_address,
+                                            p.avatar_hash,
+                                            p.avatar_updated_at,
+                                            p.ip,
+                                            p.port,
+                                        )
+                                    })
                                     .collect()
                             } else {
                                 vec![]
@@ -411,7 +442,19 @@ pub fn run() {
                         // Concurrent TCP detection using JoinSet to prevent blocking
                         let mut tasks = tokio::task::JoinSet::new();
 
-                        for (id, username, department, software_version, mac_address, avatar_hash, avatar_updated_at, ip, port) in snapshot {
+                        for (
+                            id,
+                            node_id,
+                            username,
+                            department,
+                            software_version,
+                            mac_address,
+                            avatar_hash,
+                            avatar_updated_at,
+                            ip,
+                            port,
+                        ) in snapshot
+                        {
                             tasks.spawn(async move {
                                 // Support both IPv4 and IPv6 with SocketAddr
                                 let addr = SocketAddr::new(ip, port);
@@ -423,19 +466,62 @@ pub fn run() {
                                 .map(|r| r.is_ok())
                                 .unwrap_or(false);
 
-                                (id, username, department, software_version, mac_address, avatar_hash, avatar_updated_at, ip, port, tcp_ok)
+                                (
+                                    id,
+                                    node_id,
+                                    username,
+                                    department,
+                                    software_version,
+                                    mac_address,
+                                    avatar_hash,
+                                    avatar_updated_at,
+                                    ip,
+                                    port,
+                                    tcp_ok,
+                                )
                             });
                         }
 
                         // Process concurrent check results
                         while let Some(res) = tasks.join_next().await {
-                            if let Ok((id, username, department, software_version, mac_address, avatar_hash, avatar_updated_at, ip, port, tcp_ok)) = res {
+                            if let Ok((
+                                id,
+                                node_id,
+                                username,
+                                department,
+                                software_version,
+                                mac_address,
+                                avatar_hash,
+                                avatar_updated_at,
+                                ip,
+                                port,
+                                tcp_ok,
+                            )) = res
+                            {
                                 if tcp_ok {
                                     // TCP success → peer is alive, refresh last_seen
-                                    if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
+                                    if let Some(runtime) =
+                                        { state.runtime.read().await.clone() }.as_ref()
+                                    {
                                         runtime.discovery.write().await.touch_peer(&id);
                                     }
-                                    let _ = state.db.upsert_peer_with_avatar(&id, &username, &department, &software_version, &mac_address, "", &avatar_hash, avatar_updated_at, &ip.to_string(), port, true).await;
+                                    let _ = state
+                                        .db
+                                        .upsert_peer_with_node_id_avatar(
+                                            &id,
+                                            &node_id,
+                                            &username,
+                                            &department,
+                                            &software_version,
+                                            &mac_address,
+                                            "",
+                                            &avatar_hash,
+                                            avatar_updated_at,
+                                            &ip.to_string(),
+                                            port,
+                                            true,
+                                        )
+                                        .await;
                                     let db = state.db.clone();
                                     let pid = id.clone();
                                     tauri::async_runtime::spawn(async move {
@@ -448,20 +534,30 @@ pub fn run() {
                                             .unwrap_or(true);
                                         if should_probe {
                                             metadata_probe_last.insert(id.clone(), now);
-                                            if let Some(runtime) = { state.runtime.read().await.clone() } {
+                                            if let Some(runtime) =
+                                                { state.runtime.read().await.clone() }
+                                            {
                                                 let target_id = id.clone();
                                                 let target_ip = ip.to_string();
                                                 tauri::async_runtime::spawn(async move {
                                                     let chat = runtime.chat.lock().await;
-                                                    chat.exchange_contacts(&target_ip, port, &target_id).await;
+                                                    chat.exchange_contacts(
+                                                        &target_ip, port, &target_id,
+                                                    )
+                                                    .await;
                                                 });
                                             }
                                         }
                                     }
-                                    log::debug!("HealthCheck: {} TCP OK → deliver pending", username);
+                                    log::debug!(
+                                        "HealthCheck: {} TCP OK → deliver pending",
+                                        username
+                                    );
                                 } else {
                                     // TCP fail → check if last_seen is too old
-                                    let should_offline = if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
+                                    let should_offline = if let Some(runtime) =
+                                        { state.runtime.read().await.clone() }.as_ref()
+                                    {
                                         let disc = runtime.discovery.read().await;
                                         disc.get_peer(&id)
                                             .map(|p| p.online && (now - p.last_seen) >= 15)
@@ -471,11 +567,29 @@ pub fn run() {
                                     };
 
                                     if should_offline {
-                                        if let Some(runtime) = { state.runtime.read().await.clone() }.as_ref() {
+                                        if let Some(runtime) =
+                                            { state.runtime.read().await.clone() }.as_ref()
+                                        {
                                             runtime.discovery.write().await.set_online(&id, false);
                                         }
-                                        let _ = state.db.upsert_peer_with_avatar(&id, &username, &department, &software_version, &mac_address, "", &avatar_hash, avatar_updated_at, &ip.to_string(), port, false).await;
-                                        let updated = Peer::with_online_avatar(
+                                        let _ = state
+                                            .db
+                                            .upsert_peer_with_node_id_avatar(
+                                                &id,
+                                                &node_id,
+                                                &username,
+                                                &department,
+                                                &software_version,
+                                                &mac_address,
+                                                "",
+                                                &avatar_hash,
+                                                avatar_updated_at,
+                                                &ip.to_string(),
+                                                port,
+                                                false,
+                                            )
+                                            .await;
+                                        let mut updated = Peer::with_online_avatar(
                                             id.clone(),
                                             username.clone(),
                                             department.clone(),
@@ -489,8 +603,12 @@ pub fn run() {
                                             false,
                                             now,
                                         );
+                                        updated.node_id = node_id.clone();
                                         let _ = app_handle.emit_all("peer-discovered", &updated);
-                                        log::info!("HealthCheck: {} → OFFLINE (tcp failed, age>15s)", username);
+                                        log::info!(
+                                            "HealthCheck: {} → OFFLINE (tcp failed, age>15s)",
+                                            username
+                                        );
                                     }
                                 }
                             }
@@ -523,7 +641,9 @@ pub fn run() {
                     // Snapshot online + offline peers (read lock, quick)
                     let (online_peers, offline_peers): (Vec<Peer>, Vec<Peer>) = {
                         let runtime_opt = { state.runtime.read().await.clone() };
-                        let Some(runtime) = runtime_opt.as_ref() else { continue };
+                        let Some(runtime) = runtime_opt.as_ref() else {
+                            continue;
+                        };
                         let all = runtime.discovery.read().await.get_peers();
                         all.into_iter().partition(|p| p.online)
                     };
@@ -556,6 +676,7 @@ pub fn run() {
                         db,
                         peers,
                         my_id,
+                        my_node_id,
                         my_name,
                         my_department,
                         my_software_version,
@@ -564,7 +685,9 @@ pub fn run() {
                         my_ip,
                     ) = {
                         let runtime_opt = { state.runtime.read().await.clone() };
-                        let Some(runtime) = runtime_opt.as_ref() else { continue };
+                        let Some(runtime) = runtime_opt.as_ref() else {
+                            continue;
+                        };
                         let chat = runtime.chat.lock().await;
                         let my_ip = chat
                             .my_id()
@@ -576,6 +699,7 @@ pub fn run() {
                             chat.db().clone(),
                             chat.peers().clone(),
                             chat.my_id().to_string(),
+                            chat.my_node_id().to_string(),
                             chat.my_name().to_string(),
                             chat.my_department().to_string(),
                             chat.my_software_version().to_string(),
@@ -597,6 +721,7 @@ pub fn run() {
                             &db,
                             &peers,
                             &my_id,
+                            &my_node_id,
                             &my_name,
                             &my_department,
                             &my_software_version,
@@ -606,6 +731,7 @@ pub fn run() {
                             &p.ip.to_string(),
                             p.port,
                             &p.id,
+                            &p.node_id,
                         )
                         .await;
                     }

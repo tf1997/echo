@@ -164,6 +164,8 @@ pub async fn wait_for_outgoing_file_transfer(client_msg_id: Option<&str>) -> Res
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireMessage {
     pub sender_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender_node_id: String,
     pub sender_name: String,
     pub sender_department: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -172,6 +174,8 @@ pub struct WireMessage {
     pub sender_mac_address: String,
     pub sender_port: u16,
     pub receiver_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub receiver_node_id: String,
     pub content: String,
     pub msg_type: String, // "text", "file", "sticker", "file_chunk", "file_end"
     pub file_name: Option<String>,
@@ -190,6 +194,8 @@ pub struct WireMessage {
 #[derive(Serialize)]
 struct WireMessageRef<'a> {
     sender_id: &'a str,
+    #[serde(skip_serializing_if = "is_empty_str")]
+    sender_node_id: &'a str,
     sender_name: &'a str,
     sender_department: &'a str,
     #[serde(skip_serializing_if = "is_empty_str")]
@@ -198,6 +204,8 @@ struct WireMessageRef<'a> {
     sender_mac_address: &'a str,
     sender_port: u16,
     receiver_id: &'a str,
+    #[serde(skip_serializing_if = "is_empty_str")]
+    receiver_node_id: &'a str,
     content: &'a str,
     msg_type: &'a str,
     file_name: Option<&'a str>,
@@ -215,12 +223,14 @@ struct WireMessageRef<'a> {
 
 pub struct FileWireMessageLine<'a> {
     pub sender_id: &'a str,
+    pub sender_node_id: &'a str,
     pub sender_name: &'a str,
     pub sender_department: &'a str,
     pub sender_software_version: &'a str,
     pub sender_mac_address: &'a str,
     pub sender_port: u16,
     pub receiver_id: &'a str,
+    pub receiver_node_id: &'a str,
     pub content: &'a str,
     pub msg_type: &'a str,
     pub file_name: &'a str,
@@ -352,12 +362,14 @@ fn serialize_wire_message_line(msg: &WireMessage) -> Result<Vec<u8>> {
 async fn write_message_ack<W: AsyncWrite + Unpin>(
     writer: &mut W,
     my_id: &str,
+    my_node_id: &str,
     my_name: &str,
     my_department: &str,
     my_software_version: &str,
     my_mac_address: &str,
     my_port: u16,
     receiver_id: &str,
+    receiver_node_id: &str,
     client_msg_id: Option<&str>,
 ) -> Result<()> {
     let Some(client_msg_id) = normalized_client_msg_id(client_msg_id) else {
@@ -366,12 +378,14 @@ async fn write_message_ack<W: AsyncWrite + Unpin>(
 
     let ack = WireMessage {
         sender_id: my_id.to_string(),
+        sender_node_id: my_node_id.to_string(),
         sender_name: my_name.to_string(),
         sender_department: my_department.to_string(),
         sender_software_version: my_software_version.to_string(),
         sender_mac_address: my_mac_address.to_string(),
         sender_port: my_port,
         receiver_id: receiver_id.to_string(),
+        receiver_node_id: receiver_node_id.to_string(),
         content: String::new(),
         msg_type: "message_ack".to_string(),
         file_name: None,
@@ -445,12 +459,14 @@ pub fn serialize_file_wire_message_line(
     payload.clear();
     let wire_msg = WireMessageRef {
         sender_id: msg.sender_id,
+        sender_node_id: msg.sender_node_id,
         sender_name: msg.sender_name,
         sender_department: msg.sender_department,
         sender_software_version: msg.sender_software_version,
         sender_mac_address: msg.sender_mac_address,
         sender_port: msg.sender_port,
         receiver_id: msg.receiver_id,
+        receiver_node_id: msg.receiver_node_id,
         content: msg.content,
         msg_type: msg.msg_type,
         file_name: Some(msg.file_name),
@@ -509,6 +525,7 @@ pub struct ChatServer {
     app_handle: AppHandle,
     listen_port: u16,
     my_id: String,
+    my_node_id: String,
     my_name: String,
     my_department: String,
     my_software_version: String,
@@ -523,6 +540,7 @@ impl ChatServer {
         app_handle: AppHandle,
         listen_port: u16,
         my_id: String,
+        my_node_id: String,
         my_name: String,
         my_department: String,
         my_software_version: String,
@@ -535,6 +553,7 @@ impl ChatServer {
             app_handle,
             listen_port,
             my_id,
+            my_node_id,
             my_name,
             my_department,
             my_software_version,
@@ -547,6 +566,9 @@ impl ChatServer {
 
     pub fn my_id(&self) -> &str {
         &self.my_id
+    }
+    pub fn my_node_id(&self) -> &str {
+        &self.my_node_id
     }
     pub fn my_name(&self) -> &str {
         &self.my_name
@@ -589,6 +611,7 @@ impl ChatServer {
         let peers = Arc::clone(&self.peers);
         let app_handle = self.app_handle.clone();
         let my_id = self.my_id.clone();
+        let my_node_id = self.my_node_id.clone();
         let my_name = self.my_name.clone();
         let my_department = self.my_department.clone();
         let my_software_version = self.my_software_version.clone();
@@ -605,6 +628,7 @@ impl ChatServer {
                         let peers = Arc::clone(&peers);
                         let app_handle = app_handle.clone();
                         let my_id = my_id.clone();
+                        let my_node_id = my_node_id.clone();
                         let my_name = my_name.clone();
                         let my_department = my_department.clone();
                         let my_software_version = my_software_version.clone();
@@ -618,6 +642,7 @@ impl ChatServer {
                                 tx,
                                 peers,
                                 my_id,
+                                my_node_id,
                                 my_name,
                                 my_department,
                                 my_software_version,
@@ -648,6 +673,7 @@ impl ChatServer {
         incoming_tx: mpsc::UnboundedSender<IncomingMessage>,
         peers: Arc<std::sync::RwLock<std::collections::HashMap<String, Peer>>>,
         my_id: String,
+        my_node_id: String,
         my_name: String,
         my_department: String,
         my_software_version: String,
@@ -681,6 +707,7 @@ impl ChatServer {
                             &db,
                             &peers,
                             &my_id,
+                            &my_node_id,
                             &my_name,
                             &my_department,
                             &my_software_version,
@@ -688,6 +715,7 @@ impl ChatServer {
                             my_port,
                             my_ip,
                             &msg.sender_id,
+                            &msg.sender_node_id,
                             msg.sender_port,
                             &peer_addr.ip().to_string(),
                             &msg.content,
@@ -715,6 +743,7 @@ impl ChatServer {
                         .to_string();
                         let response = WireMessage {
                             sender_id: my_id.clone(),
+                            sender_node_id: my_node_id.clone(),
                             sender_name: profile
                                 .as_ref()
                                 .map(|p| p.username.clone())
@@ -727,6 +756,7 @@ impl ChatServer {
                             sender_mac_address: my_mac_address.clone(),
                             sender_port: my_port,
                             receiver_id: msg.sender_id.clone(),
+                            receiver_node_id: msg.sender_node_id.clone(),
                             content: avatar_content,
                             msg_type: "identity_response".to_string(),
                             file_name: None,
@@ -801,6 +831,7 @@ impl ChatServer {
 
                         let response = WireMessage {
                             sender_id: my_id.clone(),
+                            sender_node_id: my_node_id.clone(),
                             sender_name: profile
                                 .as_ref()
                                 .map(|p| p.username.clone())
@@ -813,6 +844,7 @@ impl ChatServer {
                             sender_mac_address: my_mac_address.clone(),
                             sender_port: my_port,
                             receiver_id: msg.sender_id.clone(),
+                            receiver_node_id: msg.sender_node_id.clone(),
                             content: response_payload.to_string(),
                             msg_type: "avatar_response".to_string(),
                             file_name: None,
@@ -844,8 +876,9 @@ impl ChatServer {
                             continue;
                         }
                         let _ = db
-                            .upsert_peer_with_avatar(
+                            .upsert_peer_with_node_id_avatar(
                                 &entry.id,
+                                &entry.node_id,
                                 &entry.username,
                                 &entry.department,
                                 &entry.software_version,
@@ -925,14 +958,19 @@ impl ChatServer {
 
                     // Handle peer_id change embedded in profile_updated
                     if msg.msg_type == "profile_updated" || msg.msg_type == "peer_id_changed" {
-                        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&msg.content) {
-                            if let Some(old_peer_id) = payload.get("old_peer_id").and_then(|v| v.as_str()) {
+                        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&msg.content)
+                        {
+                            if let Some(old_peer_id) =
+                                payload.get("old_peer_id").and_then(|v| v.as_str())
+                            {
                                 if old_peer_id != msg.sender_id {
                                     info!(
                                         "Peer ID changed: {} -> {} ({})",
                                         old_peer_id, msg.sender_id, msg.sender_name
                                     );
-                                    let _ = db.migrate_peer_references(old_peer_id, &msg.sender_id).await;
+                                    let _ = db
+                                        .migrate_peer_references(old_peer_id, &msg.sender_id)
+                                        .await;
                                     let _ = sqlx::query("DELETE FROM peers WHERE peer_id = ?")
                                         .bind(old_peer_id)
                                         .execute(&db.pool)
@@ -962,8 +1000,9 @@ impl ChatServer {
 
                     // Register the sender as a peer in DB
                     if let Err(e) = db
-                        .upsert_peer_with_avatar(
+                        .upsert_peer_with_node_id_avatar(
                             &msg.sender_id,
+                            &msg.sender_node_id,
                             &msg.sender_name,
                             &msg.sender_department,
                             &msg.sender_software_version,
@@ -990,7 +1029,7 @@ impl ChatServer {
                             std::net::IpAddr::V6(ip) => std::net::IpAddr::V6(ip),
                         };
                         let pid = format!("{}:{}", peer_addr.ip(), msg.sender_port);
-                        let new_peer = Peer::new_with_avatar(
+                        let mut new_peer = Peer::new_with_avatar(
                             pid.clone(),
                             msg.sender_name.clone(),
                             msg.sender_department.clone(),
@@ -1002,6 +1041,7 @@ impl ChatServer {
                             remote_ip,
                             msg.sender_port,
                         );
+                        new_peer.node_id = msg.sender_node_id.clone();
                         if let Ok(mut map) = peers.write() {
                             let is_new = !map.contains_key(&pid);
                             let already = map
@@ -1048,7 +1088,7 @@ impl ChatServer {
                                     && !map.contains_key(&entry.id)
                                 {
                                     if let Ok(entry_ip) = entry.ip.parse::<std::net::IpAddr>() {
-                                        let relay = Peer::with_online_avatar(
+                                        let mut relay = Peer::with_online_avatar(
                                             entry.id.clone(),
                                             entry.username.clone(),
                                             entry.department.clone(),
@@ -1062,6 +1102,7 @@ impl ChatServer {
                                             false,
                                             0,
                                         );
+                                        relay.node_id = entry.node_id.clone();
                                         map.insert(entry.id.clone(), relay.clone());
                                         info!(
                                             "Chat relay: discovered {} via {}",
@@ -1079,8 +1120,9 @@ impl ChatServer {
                                 continue;
                             }
                             let _ = db
-                                .upsert_peer_with_avatar(
+                                .upsert_peer_with_node_id_avatar(
                                     &entry.id,
+                                    &entry.node_id,
                                     &entry.username,
                                     &entry.department,
                                     &entry.software_version,
@@ -1212,12 +1254,14 @@ impl ChatServer {
                                         let _ = write_message_ack(
                                             &mut writer,
                                             &my_id,
+                                            &my_node_id,
                                             &my_name,
                                             &my_department,
                                             &my_software_version,
                                             &my_mac_address,
                                             my_port,
                                             sender_id,
+                                            &msg.sender_node_id,
                                             client_msg_id,
                                         )
                                         .await;
@@ -1247,12 +1291,14 @@ impl ChatServer {
                                         let _ = write_message_ack(
                                             &mut writer,
                                             &my_id,
+                                            &my_node_id,
                                             &my_name,
                                             &my_department,
                                             &my_software_version,
                                             &my_mac_address,
                                             my_port,
                                             sender_id,
+                                            &msg.sender_node_id,
                                             client_msg_id,
                                         )
                                         .await;
@@ -1321,12 +1367,14 @@ impl ChatServer {
                                         let _ = write_message_ack(
                                             &mut writer,
                                             &my_id,
+                                            &my_node_id,
                                             &my_name,
                                             &my_department,
                                             &my_software_version,
                                             &my_mac_address,
                                             my_port,
                                             &msg.sender_id,
+                                            &msg.sender_node_id,
                                             msg.client_msg_id.as_deref(),
                                         )
                                         .await;
@@ -1360,12 +1408,14 @@ impl ChatServer {
                                         let _ = write_message_ack(
                                             &mut writer,
                                             &my_id,
+                                            &my_node_id,
                                             &my_name,
                                             &my_department,
                                             &my_software_version,
                                             &my_mac_address,
                                             my_port,
                                             &msg.sender_id,
+                                            &msg.sender_node_id,
                                             msg.client_msg_id.as_deref(),
                                         )
                                         .await;
@@ -1439,12 +1489,14 @@ impl ChatServer {
 
         let msg = WireMessage {
             sender_id: self.my_id.clone(),
+            sender_node_id: self.my_node_id.clone(),
             sender_name: self.my_name.clone(),
             sender_department: self.my_department.clone(),
             sender_software_version: self.my_software_version.clone(),
             sender_mac_address: self.my_mac_address.clone(),
             sender_port: self.listen_port,
             receiver_id: peer.id.clone(),
+            receiver_node_id: peer.node_id.clone(),
             content: content.to_string(),
             msg_type: msg_type.to_string(),
             file_name: None,
@@ -1479,8 +1531,9 @@ impl ChatServer {
         if !delivered {
             let _ = self
                 .db
-                .upsert_peer_with_avatar(
+                .upsert_peer_with_node_id_avatar(
                     &peer.id,
+                    &peer.node_id,
                     &peer.username,
                     &peer.department,
                     &peer.software_version,
@@ -1562,12 +1615,14 @@ impl ChatServer {
             serialize_file_wire_message_line(
                 FileWireMessageLine {
                     sender_id: &self.my_id,
+                    sender_node_id: &self.my_node_id,
                     sender_name: &self.my_name,
                     sender_department: &self.my_department,
                     sender_software_version: &self.my_software_version,
                     sender_mac_address: &self.my_mac_address,
                     sender_port: self.listen_port,
                     receiver_id: &peer.id,
+                    receiver_node_id: &peer.node_id,
                     content: &content_buf,
                     msg_type,
                     file_name: &file_name,
@@ -1655,6 +1710,7 @@ impl ChatServer {
                 .filter(|p| p.online && is_syncable_peer(p))
                 .map(|p| PeerEntry {
                     id: p.id.clone(),
+                    node_id: p.node_id.clone(),
                     username: p.username.clone(),
                     department: p.department.clone(),
                     software_version: p.software_version.clone(),
@@ -1675,10 +1731,17 @@ impl ChatServer {
     /// through the normal TCP listener via `contact_sync_res`.
     pub async fn exchange_contacts(&self, target_ip: &str, target_port: u16, target_id: &str) {
         let my_ip = self.my_id.rsplitn(2, ':').nth(1).unwrap_or("127.0.0.1");
+        let target_node_id = self
+            .peers
+            .read()
+            .ok()
+            .and_then(|map| map.get(target_id).map(|p| p.node_id.clone()))
+            .unwrap_or_default();
         contact_sync::exchange_with_peer(
             &self.db,
             &self.peers,
             &self.my_id,
+            &self.my_node_id,
             &self.my_name,
             &self.my_department,
             &self.my_software_version,
@@ -1688,6 +1751,7 @@ impl ChatServer {
             target_ip,
             target_port,
             target_id,
+            &target_node_id,
         )
         .await;
     }
@@ -1790,6 +1854,7 @@ pub async fn send_file_in_background(
     file_name: &str,
     peer: &Peer,
     my_id: String,
+    my_node_id: String,
     my_name: String,
     my_department: String,
     listen_port: u16,
@@ -1803,6 +1868,7 @@ pub async fn send_file_in_background(
         file_name,
         peer,
         my_id,
+        my_node_id,
         my_name,
         my_department,
         listen_port,
@@ -1820,6 +1886,7 @@ pub async fn send_file_in_background_with_kind(
     file_name: &str,
     peer: &Peer,
     my_id: String,
+    my_node_id: String,
     my_name: String,
     my_department: String,
     listen_port: u16,
@@ -1834,6 +1901,7 @@ pub async fn send_file_in_background_with_kind(
         file_name,
         peer,
         my_id,
+        my_node_id,
         my_name,
         my_department,
         listen_port,
@@ -1854,6 +1922,7 @@ pub async fn send_file_in_background_grouped(
     file_name: &str,
     peer: &Peer,
     my_id: String,
+    my_node_id: String,
     my_name: String,
     my_department: String,
     listen_port: u16,
@@ -1868,6 +1937,7 @@ pub async fn send_file_in_background_grouped(
         file_name,
         peer,
         my_id,
+        my_node_id,
         my_name,
         my_department,
         listen_port,
@@ -1887,6 +1957,7 @@ async fn send_file_in_background_inner(
     file_name: &str,
     peer: &Peer,
     my_id: String,
+    my_node_id: String,
     my_name: String,
     my_department: String,
     listen_port: u16,
@@ -1920,6 +1991,7 @@ async fn send_file_in_background_inner(
             .filter(|p| p.online && is_syncable_peer(p))
             .map(|p| PeerEntry {
                 id: p.id.clone(),
+                node_id: p.node_id.clone(),
                 username: p.username.clone(),
                 department: p.department.clone(),
                 software_version: p.software_version.clone(),
@@ -1959,12 +2031,14 @@ async fn send_file_in_background_inner(
         serialize_file_wire_message_line(
             FileWireMessageLine {
                 sender_id: &my_id,
+                sender_node_id: &my_node_id,
                 sender_name: &my_name,
                 sender_department: &my_department,
                 sender_software_version: &sender_software_version,
                 sender_mac_address: &sender_mac_address,
                 sender_port: listen_port,
                 receiver_id: &peer.id,
+                receiver_node_id: &peer.node_id,
                 content: &content_buf,
                 msg_type: "file_end",
                 file_name,
@@ -2001,12 +2075,14 @@ async fn send_file_in_background_inner(
             serialize_file_wire_message_line(
                 FileWireMessageLine {
                     sender_id: &my_id,
+                    sender_node_id: &my_node_id,
                     sender_name: &my_name,
                     sender_department: &my_department,
                     sender_software_version: &sender_software_version,
                     sender_mac_address: &sender_mac_address,
                     sender_port: listen_port,
                     receiver_id: &peer.id,
+                    receiver_node_id: &peer.node_id,
                     content: &content_buf,
                     msg_type,
                     file_name,

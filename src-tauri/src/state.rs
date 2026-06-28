@@ -11,6 +11,7 @@ pub struct RuntimeServices {
     pub discovery: RwLock<DiscoveryService>,
     pub chat: Mutex<ChatServer>,
     pub my_id: String,
+    pub my_node_id: String,
     pub listen_port: u16,
 }
 
@@ -22,23 +23,29 @@ impl RuntimeServices {
         listen_port: u16,
         relay_tx: Option<mpsc::UnboundedSender<Vec<PeerEntry>>>,
     ) -> Result<Self> {
-        // Identity = IP:port — no UUID, the network address IS the identity
+        // peer_id remains the legacy wire address; node_id is the stable identity.
         let local_ip = local_ip_address::local_ip()
             .map_err(|e| anyhow::anyhow!("Failed to get local IP: {}", e))?;
         let my_id = format!("{}:{}", local_ip, listen_port);
+        let my_node_id = if profile.node_id.trim().is_empty() {
+            db.ensure_user_node_id().await?
+        } else {
+            profile.node_id.clone()
+        };
 
         let old_peer_id = profile.peer_id.clone();
         let peer_id_changed = !old_peer_id.is_empty() && old_peer_id != my_id;
 
-        // Migrate local data if peer_id changed
+        // Record local endpoint aliases when DHCP or adapter changes the IP.
         if peer_id_changed {
-            log::info!("IP changed: {} -> {}, migrating local data", old_peer_id, my_id);
-            db.migrate_peer_references(&old_peer_id, &my_id).await?;
-            sqlx::query("DELETE FROM peers WHERE peer_id = ?")
-                .bind(&old_peer_id)
-                .execute(&db.pool)
-                .await
-                .ok();
+            log::info!(
+                "IP changed: {} -> {}, recording aliases for node {}",
+                old_peer_id,
+                my_id,
+                my_node_id
+            );
+            db.upsert_peer_alias(&my_node_id, &old_peer_id).await?;
+            db.upsert_peer_alias(&my_node_id, &my_id).await?;
         }
 
         // Persist peer_id for profile
@@ -50,17 +57,15 @@ impl RuntimeServices {
                 &crate::profile_metadata::software_version(),
                 &crate::profile_metadata::mac_address(),
             )
-                .await
-                .ok();
+            .await
+            .ok();
         }
 
-        let scan_subnets = db
-            .get_scan_subnets()
-            .await
-            .unwrap_or_default();
+        let scan_subnets = db.get_scan_subnets().await.unwrap_or_default();
 
         let mut config = DiscoveryConfig::new(
             &my_id,
+            &my_node_id,
             &profile.username,
             &profile.department,
             listen_port,
@@ -78,6 +83,7 @@ impl RuntimeServices {
             app_handle.clone(),
             listen_port,
             my_id.clone(),
+            my_node_id.clone(),
             profile.username.clone(),
             profile.department.clone(),
             crate::profile_metadata::software_version(),
@@ -89,8 +95,13 @@ impl RuntimeServices {
 
         // Broadcast peer_id change to all peers
         if peer_id_changed {
-            log::info!("Broadcasting peer_id change to all peers: old={} new={}", old_peer_id, my_id);
+            log::info!(
+                "Broadcasting peer_id change to all peers: old={} new={}",
+                old_peer_id,
+                my_id
+            );
             let new_id = my_id.clone();
+            let node_id = my_node_id.clone();
             let old_id = old_peer_id.clone();
             let username = profile.username.clone();
             let department = profile.department.clone();
@@ -115,17 +126,36 @@ impl RuntimeServices {
                     "mac_address": crate::profile_metadata::mac_address(),
                     "avatar_hash": avatar_hash,
                     "avatar_updated_at": avatar_updated_at,
-                }).to_string();
+                })
+                .to_string();
 
                 for peer_id in &targets {
-                    if peer_id == &new_id { continue; }
+                    if peer_id == &new_id {
+                        continue;
+                    }
                     let json = crate::commands::build_notification_json(
-                        &new_id, &username, &department, listen_port, peer_id,
-                        &payload, "profile_updated", None, None, None, &[]
+                        &new_id,
+                        &node_id,
+                        &username,
+                        &department,
+                        listen_port,
+                        peer_id,
+                        "",
+                        &payload,
+                        "profile_updated",
+                        None,
+                        None,
+                        None,
+                        &[],
                     );
-                    let _ = db_clone.queue_pending_notification(peer_id, "profile_updated", &json).await;
+                    let _ = db_clone
+                        .queue_pending_notification(peer_id, "profile_updated", &json)
+                        .await;
                 }
-                log::info!("Queued profile_updated (with peer_id change) for {} peers", targets.len());
+                log::info!(
+                    "Queued profile_updated (with peer_id change) for {} peers",
+                    targets.len()
+                );
             });
         }
 
@@ -133,6 +163,7 @@ impl RuntimeServices {
             discovery: RwLock::new(discovery),
             chat: Mutex::new(chat),
             my_id,
+            my_node_id,
             listen_port,
         })
     }
@@ -149,10 +180,7 @@ impl RuntimeServices {
             .await
             .update_identity(username, department)
             .await?;
-        self.chat
-            .lock()
-            .await
-            .update_identity(username, department);
+        self.chat.lock().await.update_identity(username, department);
         Ok(())
     }
 }

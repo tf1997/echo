@@ -69,6 +69,8 @@ fn sleep_while_quiet(cancel: &AtomicBool) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AnnouncePacket {
     id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    node_id: String,
     username: String,
     department: String,
     #[serde(default)]
@@ -89,6 +91,7 @@ struct AnnouncePacket {
 /// Configuration for LAN discovery.
 pub struct LanDiscoveryConfig {
     pub peer_id: String,
+    pub node_id: String,
     pub username: String,
     pub department: String,
     pub software_version: String,
@@ -124,20 +127,27 @@ impl LanDiscovery {
         let bind_addr = format!("0.0.0.0:{}", discovery_port);
 
         // Use socket2 for cross-platform SO_REUSEADDR/SO_REUSEPORT
-        let sock2 = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let sock2 = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         sock2.set_reuse_address(true).ok();
         #[cfg(unix)]
         sock2.set_reuse_port(true).ok();
-        sock2.set_broadcast(true)
+        sock2
+            .set_broadcast(true)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        sock2.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
+        sock2
+            .set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let sock_addr = socket2::SockAddr::from(std::net::SocketAddr::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             discovery_port,
         ));
-        sock2.bind(&sock_addr)
+        sock2
+            .bind(&sock_addr)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         let socket: UdpSocket = sock2.into();
@@ -158,6 +168,7 @@ impl LanDiscovery {
         // Build the base packet (without known_peers — filled dynamically)
         let base_announce = AnnouncePacket {
             id: config.peer_id.clone(),
+            node_id: config.node_id.clone(),
             username: config.username.clone(),
             department: config.department.clone(),
             software_version: config.software_version.clone(),
@@ -177,7 +188,13 @@ impl LanDiscovery {
         let sender_my_info = base_announce.clone();
         let sender_peers = Arc::clone(&peers);
         let sender_handle = thread::spawn(move || {
-            Self::sender_loop(sender_socket, sender_my_info, sender_peers, sender_cancel, discovery_port);
+            Self::sender_loop(
+                sender_socket,
+                sender_my_info,
+                sender_peers,
+                sender_cancel,
+                discovery_port,
+            );
         });
 
         // Listener thread
@@ -297,9 +314,7 @@ impl LanDiscovery {
             if !stripped.is_empty() {
                 // Validate: expect "x.y.z" (3 octets)
                 let parts: Vec<&str> = stripped.split('.').collect();
-                if parts.len() == 3
-                    && parts.iter().all(|p| p.parse::<u8>().is_ok())
-                {
+                if parts.len() == 3 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
                     if !out.iter().any(|p| p == stripped) {
                         out.push(stripped.to_string());
                     }
@@ -317,20 +332,24 @@ impl LanDiscovery {
         let mut pkt = my_info.clone();
         if include_known_peers {
             let map = peers.read().unwrap();
-            pkt.known_peers = map.values()
+            pkt.known_peers = map
+                .values()
                 .filter(|p| {
                     p.online
                         && contact_filter::has_contact_identity(&p.username, &p.department)
                         && p.port != 0
                 })
                 .map(|p| PeerEntry {
-                    id: p.id.clone(), username: p.username.clone(),
+                    id: p.id.clone(),
+                    node_id: p.node_id.clone(),
+                    username: p.username.clone(),
                     department: p.department.clone(),
                     software_version: p.software_version.clone(),
                     mac_address: p.mac_address.clone(),
                     avatar_hash: p.avatar_hash.clone(),
                     avatar_updated_at: p.avatar_updated_at,
-                    ip: p.ip.to_string(), port: p.port,
+                    ip: p.ip.to_string(),
+                    port: p.port,
                 })
                 .collect();
         }
@@ -349,10 +368,14 @@ impl LanDiscovery {
         let mut burst_remaining = ANNOUNCE_BURST_COUNT;
 
         loop {
-            if cancel.load(Ordering::Relaxed) { return; }
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             if is_quiet_hours() {
                 debug!("LAN discovery announce paused during quiet hours");
-                if sleep_while_quiet(&cancel) { return; }
+                if sleep_while_quiet(&cancel) {
+                    return;
+                }
                 burst_remaining = ANNOUNCE_BURST_COUNT;
                 continue;
             }
@@ -368,7 +391,9 @@ impl LanDiscovery {
             } else {
                 random_secs(ANNOUNCE_INTERVAL_MIN_SECS, ANNOUNCE_INTERVAL_MAX_SECS)
             };
-            if sleep_cancelable(&cancel, Duration::from_secs(delay)) { return; }
+            if sleep_cancelable(&cancel, Duration::from_secs(delay)) {
+                return;
+            }
         }
     }
 
@@ -397,6 +422,7 @@ impl LanDiscovery {
             // Rebuild lightweight probe data without known peers.
             let my_info = AnnouncePacket {
                 id: my_id.clone(),
+                node_id: String::new(),
                 username: String::new(),
                 department: String::new(),
                 software_version: String::new(),
@@ -483,7 +509,12 @@ impl LanDiscovery {
                         Err(_) => continue,
                     };
 
-                    info!("UDP recv: id={} from {} ({} known_peers)", packet.id, src_addr, packet.known_peers.len());
+                    info!(
+                        "UDP recv: id={} from {} ({} known_peers)",
+                        packet.id,
+                        src_addr,
+                        packet.known_peers.len()
+                    );
 
                     // Skip self
                     if packet.id == my_info.id {
@@ -494,7 +525,10 @@ impl LanDiscovery {
                     if !contact_filter::has_contact_identity(&packet.username, &packet.department)
                         || packet.port == 0
                     {
-                        debug!("UDP recv: skipping peer without contact identity: {}", packet.id);
+                        debug!(
+                            "UDP recv: skipping peer without contact identity: {}",
+                            packet.id
+                        );
                         continue;
                     }
 
@@ -529,6 +563,7 @@ impl LanDiscovery {
                         packet.id.clone(),
                         Peer {
                             id: peer.id.clone(),
+                            node_id: packet.node_id.clone(),
                             username: peer.username.clone(),
                             department: peer.department.clone(),
                             software_version: peer.software_version.clone(),
@@ -557,23 +592,22 @@ impl LanDiscovery {
                             )
                         {
                             if let Ok(ip) = entry.ip.parse::<IpAddr>() {
-                                peers_map.insert(
+                                let mut relay_peer = Peer::with_online_avatar(
                                     entry.id.clone(),
-                                    Peer::with_online_avatar(
-                                        entry.id.clone(),
-                                        entry.username.clone(),
-                                        entry.department.clone(),
-                                        entry.software_version.clone(),
-                                        entry.mac_address.clone(),
-                                        String::new(),
-                                        entry.avatar_hash.clone(),
-                                        entry.avatar_updated_at,
-                                        ip,
-                                        entry.port,
-                                        false,
-                                        0,
-                                    ),
+                                    entry.username.clone(),
+                                    entry.department.clone(),
+                                    entry.software_version.clone(),
+                                    entry.mac_address.clone(),
+                                    String::new(),
+                                    entry.avatar_hash.clone(),
+                                    entry.avatar_updated_at,
+                                    ip,
+                                    entry.port,
+                                    false,
+                                    0,
                                 );
+                                relay_peer.node_id = entry.node_id.clone();
+                                peers_map.insert(entry.id.clone(), relay_peer);
                                 relayed.push(entry.clone());
                                 info!(
                                     "Peer relay discovered: {} ({}) @ {}:{}",
@@ -589,7 +623,8 @@ impl LanDiscovery {
                         }
                     }
                     // Collect existing contacts BEFORE dropping the write lock
-                    let existing_targets: Vec<SocketAddr> = peers_map.iter()
+                    let existing_targets: Vec<SocketAddr> = peers_map
+                        .iter()
                         .filter(|(id, p)| *id != &packet.id && p.online)
                         .map(|(_, p)| SocketAddr::new(p.ip, p.port + 2))
                         .collect();
@@ -603,12 +638,17 @@ impl LanDiscovery {
                         let remote_discovery_port = packet.port + 2;
                         let response_data = Self::build_announce_data(&my_info, &peers, true);
                         let response_target = SocketAddr::new(remote_ip, remote_discovery_port);
-                        info!("UDP response to {} ({} bytes)", response_target, response_data.len());
+                        info!(
+                            "UDP response to {} ({} bytes)",
+                            response_target,
+                            response_data.len()
+                        );
                         let _ = socket.send_to(&response_data, response_target);
 
                         // Tell ALL our existing contacts about this new peer
                         let intro = AnnouncePacket {
                             id: my_info.id.clone(),
+                            node_id: my_info.node_id.clone(),
                             username: my_info.username.clone(),
                             department: my_info.department.clone(),
                             software_version: my_info.software_version.clone(),
@@ -619,6 +659,7 @@ impl LanDiscovery {
                             port: my_info.port,
                             known_peers: vec![PeerEntry {
                                 id: peer.id.clone(),
+                                node_id: peer.node_id.clone(),
                                 username: peer.username.clone(),
                                 department: peer.department.clone(),
                                 software_version: peer.software_version.clone(),
