@@ -27,7 +27,7 @@ export interface PendingMessage {
   error?: string;
   progress?: number; // 0-100
   speed?: number; // bytes/sec
-  createdAt?: number;
+  createdAt: number;
 }
 
 // 生成唯一的客户端消息 ID
@@ -1404,6 +1404,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       msg_type: "file",
       file_name: file.name,
       file_size: file.size,
+      createdAt: Date.now(),
       status: "sending",
     }]);
 
@@ -1450,6 +1451,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       clientMsgId,
       content: trimmed,
       msg_type: "text",
+      createdAt: Date.now(),
       status: "sending"
     };
     updatePendingMessagesForKey(conversationKey, (prev) => [...prev, temp]);
@@ -1490,6 +1492,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       msg_type: "file",
       file_name: file.name,
       file_size: file.size,
+      createdAt: Date.now(),
       status: "sending",
     };
     updatePendingMessagesForKey(conversationKey, (prev) => [...prev, temp]);
@@ -1688,7 +1691,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
           const tempId = ++pendingId;
           const clientMsgId = generateClientMsgId();
           updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
-            id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, file_path: filePath, status: "sending",
+            id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, file_path: filePath, createdAt: Date.now(), status: "sending",
           }]);
           onSendFile(filePath, clientMsgId, name).catch((e) => {
             updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
@@ -1719,7 +1722,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       const tempId = ++pendingId;
       const clientMsgId = generateClientMsgId();
       updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
-        id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, file_path: filePath, status: "sending",
+        id: tempId, clientMsgId, content: `📎 ${name}`, msg_type: "file", file_name: name, file_path: filePath, createdAt: Date.now(), status: "sending",
       }]);
       onSendFile(filePath, clientMsgId, name).catch((e) => {
         updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
@@ -1833,6 +1836,17 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     }
   }, [groupActionBusy, groupInfo, onGroupUpdated, reportGroupActionError]);
 
+  const allItems = useMemo<(ChatMessage | PendingMessage)[]>(() => [
+    ...messages.filter((m) => m.msg_type !== "file_chunk" && m.msg_type !== "file_end"),
+    ...pendingMessages,
+  ].sort((a, b) => {
+    const getTime = (item: ChatMessage | PendingMessage) => {
+      if ("timestamp" in item) return new Date(item.timestamp).getTime();
+      return item.createdAt;
+    };
+    return getTime(a) - getTime(b);
+  }), [messages, pendingMessages]);
+
   if (!peer) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center bg-gray-800 text-gray-400">
@@ -1844,17 +1858,6 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       </div>
     );
   }
-
-  const allItems: (ChatMessage | PendingMessage)[] = [
-    ...messages.filter((m) => m.msg_type !== "file_chunk" && m.msg_type !== "file_end"),
-    ...pendingMessages,
-  ].sort((a, b) => {
-    const getTime = (item: ChatMessage | PendingMessage) => {
-      if ("timestamp" in item) return new Date(item.timestamp).getTime();
-      return Date.now();
-    };
-    return getTime(a) - getTime(b);
-  });
 
   const searchHits = getTextSearchHits(messages, searchQuery);
   const totalSearchHits = searchHits.length;

@@ -72,14 +72,14 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
   const [newGroupName, setNewGroupName] = useState("");
   const [newGroupMembers, setNewGroupMembers] = useState<string[]>([]);
   const [newGroupMemberQuery, setNewGroupMemberQuery] = useState("");
-  const [expandedDepts, setExpandedDepts] = useState<Set<string>>(new Set());
+  const [collapsedDepts, setCollapsedDepts] = useState<Set<string>>(new Set());
   const [groupNameError, setGroupNameError] = useState("");
   const themeMenuRef = useRef<HTMLDivElement>(null);
   const searchTimerRef = useRef<number | null>(null);
   const searchSeqRef = useRef(0);
 
   const toggleDept = useCallback((dept: string) => {
-    setExpandedDepts((prev) => {
+    setCollapsedDepts((prev) => {
       const next = new Set(prev);
       if (next.has(dept)) next.delete(dept);
       else next.add(dept);
@@ -240,28 +240,35 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
     });
   }, [groupMemberFilter, peers]);
 
-  // Group peers by department for "contacts" tab
-  const deptGroups = new Map<string, Peer[]>();
-  for (const p of visiblePeers) {
-    const dept = p.department || "未分组";
-    if (!deptGroups.has(dept)) deptGroups.set(dept, []);
-    deptGroups.get(dept)!.push(p);
-  }
-  const sortedDepts = [...deptGroups.keys()].sort((a, b) => {
-    if (a === "未分组") return 1;
-    if (b === "未分组") return -1;
-    return a.localeCompare(b);
-  });
+  // Derived contact indexes only change when their source arrays change.
+  const { deptGroups, sortedDepts } = useMemo(() => {
+    const grouped = new Map<string, Peer[]>();
+    for (const peer of visiblePeers) {
+      const department = peer.department || "未分组";
+      const departmentPeers = grouped.get(department) ?? [];
+      departmentPeers.push(peer);
+      grouped.set(department, departmentPeers);
+    }
+    const sorted = [...grouped.keys()].sort((a, b) => {
+      if (a === "未分组") return 1;
+      if (b === "未分组") return -1;
+      return a.localeCompare(b);
+    });
+    return { deptGroups: grouped, sortedDepts: sorted };
+  }, [visiblePeers]);
 
-  const unreadMap = new Map<string, number>();
-  for (const uc of unreadCounts) {
-    unreadMap.set(uc.peer_id, uc.count);
-  }
-  const peerById = new Map(peers.map((peer) => [peer.id, peer]));
-  const peerByEndpoint = new Map(
-    peers
-      .map((peer) => [peerEndpointKey(peer), peer] as const)
-      .filter(([endpoint]) => endpoint !== "")
+  const unreadMap = useMemo(
+    () => new Map(unreadCounts.map((item) => [item.peer_id, item.count])),
+    [unreadCounts],
+  );
+  const peerById = useMemo(() => new Map(peers.map((peer) => [peer.id, peer])), [peers]);
+  const peerByEndpoint = useMemo(
+    () => new Map(
+      peers
+        .map((peer) => [peerEndpointKey(peer), peer] as const)
+        .filter(([endpoint]) => endpoint !== ""),
+    ),
+    [peers],
   );
   const selectedPeerEndpoint = selectedPeer ? peerEndpointKey(selectedPeer) : "";
   const isPeerSelected = useCallback((peer: Peer, recentPeerId?: string) => {
@@ -817,7 +824,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                   </div>
                 </div>
                 {sortedDepts.map(dept => {
-                  const expanded = contactFilter ? true : expandedDepts.has(dept);
+                  const expanded = contactFilter ? true : !collapsedDepts.has(dept);
                   const deptPeers = deptGroups.get(dept) || [];
                   const onlineCount = deptPeers.filter(p => p.online).length;
                   return (

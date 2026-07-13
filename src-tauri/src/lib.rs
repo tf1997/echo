@@ -270,7 +270,7 @@ pub fn run() {
                     .expect("Failed to start runtime services")
                 });
                 if let Some(profile) = profile.as_mut() {
-                    profile.peer_id = runtime.my_id.clone();
+                    profile.peer_id = runtime.my_id();
                     profile.node_id = runtime.my_node_id.clone();
                 }
                 info!("Runtime started with saved profile: {}", saved_username);
@@ -285,6 +285,61 @@ pub fn run() {
                 profile: Mutex::new(profile),
                 runtime: RwLock::new(runtime_services),
                 relay_tx: Some(relay_tx),
+            });
+
+            // Detect DHCP / adapter changes while the app is running. RuntimeServices
+            // serializes migrations and refreshes both chat identity and LAN discovery.
+            let endpoint_app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(10));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let new_ip = match local_ip_address::local_ip() {
+                        Ok(ip) => ip,
+                        Err(error) => {
+                            log::warn!("Local IP check failed: {}", error);
+                            continue;
+                        }
+                    };
+                    let Some(state) = endpoint_app_handle.try_state::<AppState>() else {
+                        continue;
+                    };
+                    let runtime = { state.runtime.read().await.clone() };
+                    let Some(runtime) = runtime else {
+                        continue;
+                    };
+                    let expected_id = format!("{}:{}", new_ip, runtime.listen_port);
+                    if runtime.my_id() == expected_id {
+                        continue;
+                    }
+                    let profile = { state.profile.lock().await.clone() };
+                    let Some(profile) = profile else {
+                        continue;
+                    };
+                    match runtime.update_local_endpoint(&profile, new_ip).await {
+                        Ok(Some((old_id, new_id))) => {
+                            {
+                                let mut current = state.profile.lock().await;
+                                if let Some(current) = current.as_mut() {
+                                    current.peer_id = new_id.clone();
+                                }
+                            }
+                            let _ = endpoint_app_handle.emit_all(
+                                "local-peer-id-changed",
+                                serde_json::json!({
+                                    "oldPeerId": old_id,
+                                    "newPeerId": new_id,
+                                    "newIp": new_ip.to_string(),
+                                }),
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            log::error!("Failed to update runtime local endpoint: {}", error);
+                        }
+                    }
+                }
             });
 
             updater::spawn_background_update_check(app.handle().clone());

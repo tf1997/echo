@@ -297,6 +297,46 @@ impl DiscoveryService {
         }
     }
 
+    /// Rebuild LAN discovery with a new local endpoint while keeping the chat listener alive.
+    /// LanDiscovery emits its startup burst immediately, so peers learn the new route
+    /// without waiting for the normal 8-15 minute announce interval.
+    pub fn update_local_endpoint(
+        &mut self,
+        new_peer_id: &str,
+        new_ip: std::net::IpAddr,
+    ) -> Result<()> {
+        let mut previous = self.lan.lock().unwrap().take();
+        let scan_subnets = previous
+            .as_ref()
+            .map(|lan| lan.get_scan_subnets())
+            .unwrap_or_else(|| self.config.scan_subnets.clone());
+        if let Some(ref mut lan) = previous {
+            lan.shutdown();
+        }
+
+        self.config.peer_id = new_peer_id.to_string();
+        self.config.scan_subnets = scan_subnets.clone();
+        let lan_config = LanDiscoveryConfig {
+            peer_id: self.config.peer_id.clone(),
+            node_id: self.config.node_id.clone(),
+            username: self.config.username.clone(),
+            department: self.config.department.clone(),
+            software_version: self.config.software_version.clone(),
+            mac_address: self.config.mac_address.clone(),
+            avatar_hash: self.config.avatar_hash.clone(),
+            avatar_updated_at: self.config.avatar_updated_at,
+            listen_port: self.config.listen_port,
+            local_ip: new_ip,
+            scan_subnets,
+            discovery_port: self.config.listen_port + 2,
+            relay_tx: self.config.relay_tx.clone(),
+        };
+        let lan = LanDiscovery::new(lan_config, Arc::clone(&self.peers))
+            .context("Failed to restart LAN discovery after local IP change")?;
+        *self.lan.lock().unwrap() = Some(lan);
+        Ok(())
+    }
+
     pub fn stop(&self) -> Result<()> {
         info!("Stopping discovery service...");
         // Shutdown LAN discovery first (joins threads)

@@ -65,6 +65,16 @@ interface ConversationUpdatedEvent {
   message?: ChatMessage | null;
 }
 
+interface PeerIdChangedEvent {
+  oldPeerId: string;
+  newPeerId: string;
+  nodeId?: string;
+}
+
+interface LocalPeerIdChangedEvent extends PeerIdChangedEvent {
+  newIp: string;
+}
+
 interface HistorySearchRequest {
   kind: "contact" | "group";
   targetId: string;
@@ -139,6 +149,62 @@ function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
     }
   }
 
+  return true;
+}
+
+function arePeerListsEqual(left: Peer[], right: Peer[]) {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i++) {
+    const a = left[i];
+    const b = right[i];
+    if (
+      a.id !== b.id ||
+      a.username !== b.username ||
+      a.department !== b.department ||
+      a.online !== b.online ||
+      a.ip !== b.ip ||
+      a.port !== b.port ||
+      a.avatar_hash !== b.avatar_hash ||
+      a.avatar_updated_at !== b.avatar_updated_at ||
+      a.avatar_path !== b.avatar_path ||
+      a.software_version !== b.software_version ||
+      a.mac_address !== b.mac_address
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function areUnreadCountsEqual(left: UnreadCount[], right: UnreadCount[]) {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i++) {
+    if (left[i].peer_id !== right[i].peer_id || left[i].count !== right[i].count) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function areGroupListsEqual(left: GroupInfo[], right: GroupInfo[]) {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i++) {
+    const a = left[i];
+    const b = right[i];
+    if (
+      a.group_id !== b.group_id ||
+      a.name !== b.name ||
+      a.unread_count !== b.unread_count ||
+      a.last_message !== b.last_message ||
+      a.last_message_at !== b.last_message_at ||
+      a.last_message_sender !== b.last_message_sender
+    ) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -532,14 +598,25 @@ function App() {
   }, []);
 
   const loadPeerState = useCallback(async () => {
-    const [onlinePeers, storedPeers, unread] = await Promise.all([
+    const unreadRequest = getUnreadCounts()
+      .then((value) => ({ ok: true as const, value }))
+      .catch((error: unknown) => ({ ok: false as const, error }));
+    const [onlinePeers, storedPeers, unreadResult] = await Promise.all([
       getPeers(),
       listStoredPeers(),
-      getUnreadCounts(),
+      unreadRequest,
     ]);
     const mergedPeers = mergePeers(onlinePeers, storedPeers);
-    setPeers(mergedPeers);
-    setUnreadCounts(unread);
+    // Reuse the previous array reference when content is unchanged so the 2s
+    // poll doesn't force a re-render of the whole peer/message tree.
+    setPeers((prev) => (arePeerListsEqual(prev, mergedPeers) ? prev : mergedPeers));
+    if (unreadResult.ok) {
+      setUnreadCounts((prev) =>
+        areUnreadCountsEqual(prev, unreadResult.value) ? prev : unreadResult.value
+      );
+    } else {
+      console.error("Failed to load unread counts:", unreadResult.error);
+    }
     setSelectedPeer((current) => {
       if (!current) return current;
       const canonicalPeer = mergedPeers.find((peer) => peer.id === current.id);
@@ -713,7 +790,7 @@ function App() {
     if (!appInfo?.initialized) return;
     const tick = () => {
       listGroups().then((gs) => {
-        setGroups(gs);
+        setGroups((prev) => (areGroupListsEqual(prev, gs) ? prev : gs));
         setSelectedGroupId((prev) => prev && !gs.some((g) => g.group_id === prev) ? null : prev);
       }).catch(() => {});
     };
@@ -884,6 +961,7 @@ function App() {
   useEffect(() => {
     if (!appInfo?.initialized) return;
 
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     listen<ConversationUpdatedEvent>("conversation-updated", (event) => {
       const payload = event.payload;
@@ -942,14 +1020,16 @@ function App() {
       } else {
         loadPeerState().catch(console.error);
       }
-    }).then((fn) => { unlisten = fn; });
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
 
-    return () => {
-      unlisten?.();
-    };
+    return () => { disposed = true; unlisten?.(); };
   }, [appInfo?.initialized, appInfo?.peer_id, canInterruptForIncomingNudge, loadPeerState, isActiveConversation, selectIncomingNudgePeer, triggerNudge]);
 
   useEffect(() => {
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     listen<TrayUnreadItem>("tray-open-conversation", (event) => {
       const { kind, id } = event.payload;
@@ -961,8 +1041,73 @@ function App() {
         const peer = peersRef.current.find((p) => p.id === id);
         if (peer) selectPeerRef.current(peer);
       }
-    }).then((fn) => { unlisten = fn; });
-    return () => { unlisten?.(); };
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<LocalPeerIdChangedEvent>("local-peer-id-changed", (event) => {
+      const { newPeerId, newIp } = event.payload;
+      if (!newPeerId) return;
+      setAppInfo((current) => current
+        ? { ...current, peer_id: newPeerId, my_ip: newIp || current.my_ip }
+        : current
+      );
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
+
+  // A peer changed its IP (peer_id = ip:port). The backend has already migrated
+  // DB references and purged the stale in-memory entry; mirror that on the client
+  // so the open conversation continues under the new id, drafts/history reload,
+  // and the sidebar shows no duplicate. Endpoint reconciliation in mergePeers
+  // can't bridge this because the endpoint itself changed.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<PeerIdChangedEvent>("peer-id-changed", (event) => {
+      const { oldPeerId, newPeerId } = event.payload;
+      if (!oldPeerId || !newPeerId || oldPeerId === newPeerId) return;
+
+      const sep = newPeerId.lastIndexOf(":");
+      const newIp = sep > 0 ? newPeerId.slice(0, sep) : "";
+      const newPort = sep > 0 ? Number(newPeerId.slice(sep + 1)) : 0;
+
+      setPeers((current) => {
+        const withoutOld = current.filter((p) => p.id !== oldPeerId);
+        // If the new id isn't in the list yet (next poll will bring it), carry
+        // the old peer's display info forward under the new id/endpoint.
+        if (!withoutOld.some((p) => p.id === newPeerId)) {
+          const old = current.find((p) => p.id === oldPeerId);
+          if (old) {
+            withoutOld.push({ ...old, id: newPeerId, ip: newIp || old.ip, port: newPort || old.port });
+          }
+        }
+        return withoutOld;
+      });
+
+      // Repoint the active conversation so its history effect refetches the
+      // migrated rows under the new id.
+      setSelectedPeer((current) =>
+        current && current.id === oldPeerId
+          ? { ...current, id: newPeerId, ip: newIp || current.ip, port: newPort || current.port }
+          : current
+      );
+
+      setRecentRefreshKey((key) => key + 1);
+    }).then((fn) => {
+      if (disposed) { fn(); return; }
+      unlisten = fn;
+    });
+    return () => { disposed = true; unlisten?.(); };
   }, []);
 
   const handleSendMessage = useCallback(async (content: string, clientMsgId?: string) => {

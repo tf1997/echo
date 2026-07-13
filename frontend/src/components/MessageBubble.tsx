@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, memo } from "react";
 import type { ReactNode } from "react";
 import type { ChatMessage } from "../types";
 import { openFile, openFolder, saveTempFile } from "../api";
@@ -431,7 +431,7 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
   );
 }
 
-export function MessageBubble({ message, isOwn, showSender = false, highlighted = false, searchQuery = "", activeSearchHitId, selectMode = false, selected = false, onToggleSelect, onStartForward, onAddSticker }: MessageBubbleProps) {
+export function MessageBubbleImpl({ message, isOwn, showSender = false, highlighted = false, searchQuery = "", activeSearchHitId, selectMode = false, selected = false, onToggleSelect, onStartForward, onAddSticker }: MessageBubbleProps) {
   const isNudge = message.msg_type === MESSAGE_TYPE_NUDGE;
   const isRps = message.msg_type === MESSAGE_TYPE_RPS;
   const isSticker = message.msg_type === "sticker";
@@ -677,6 +677,8 @@ export function MessageBubble({ message, isOwn, showSender = false, highlighted 
     </div>
   );
 }
+
+export const MessageBubble = memo(MessageBubbleImpl);
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return bytes + " B";

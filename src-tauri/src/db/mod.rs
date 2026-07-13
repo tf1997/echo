@@ -608,6 +608,36 @@ impl Database {
         .await
         .context("Failed to create client_msg_id index")?;
 
+        // Deduplicate existing rows before adding the UNIQUE constraint, otherwise
+        // CREATE UNIQUE INDEX fails on databases upgraded from versions that allowed
+        // duplicate (sender_id, group_id, client_msg_id) rows. Keep the earliest row
+        // (MIN(id)) per dedup key. NULL/empty client_msg_id rows are left untouched.
+        sqlx::query(
+            "DELETE FROM messages
+             WHERE client_msg_id IS NOT NULL AND TRIM(client_msg_id) <> ''
+               AND id NOT IN (
+                 SELECT MIN(id) FROM messages
+                 WHERE client_msg_id IS NOT NULL AND TRIM(client_msg_id) <> ''
+                 GROUP BY sender_id, COALESCE(group_id, ''), client_msg_id
+               )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to dedup messages before unique index")?;
+
+        // Enforce dedup at the storage layer. Partial index skips legacy rows with
+        // no client_msg_id (multiple NULLs would otherwise be treated as distinct,
+        // and NULL group_id is normalized to '' so private-message keys collide
+        // correctly). This is the race backstop behind the SELECT-first dedup path.
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_dedup
+             ON messages(sender_id, COALESCE(group_id, ''), client_msg_id)
+             WHERE client_msg_id IS NOT NULL AND TRIM(client_msg_id) <> ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create unique client_msg_id dedup index")?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS pending_group_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1534,13 +1564,24 @@ impl Database {
         client_msg_id: Option<&str>,
     ) -> Result<ChatMessage> {
         let timestamp = Utc::now().to_rfc3339();
-        let id = sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO messages (sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, group_id, client_msg_id)
-             VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+             VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT DO NOTHING"
         ).bind(sender_id).bind(sender_name).bind(content).bind(msg_type)
          .bind(file_path).bind(file_name).bind(file_size).bind(&timestamp)
          .bind(if is_read { 1 } else { 0 }).bind(group_id).bind(client_msg_id)
-         .execute(&self.pool).await.context("Failed to save group message")?.last_insert_rowid();
+         .execute(&self.pool).await.context("Failed to save group message")?;
+        // Concurrent writer won the unique dedup race — return its row.
+        if result.rows_affected() == 0 {
+            if let Some(existing) = self
+                .find_message_by_client_msg_id(sender_id, Some(group_id), client_msg_id)
+                .await?
+            {
+                return Ok(existing);
+            }
+        }
+        let id = result.last_insert_rowid();
         Ok(ChatMessage {
             id,
             sender_id: sender_id.to_string(),
@@ -1971,6 +2012,14 @@ impl Database {
         Ok(())
     }
 
+    /// Public wrapper over `identity_keys_for`: returns every peer_id/node_id known
+    /// to belong to the same identity (current endpoint + historical aliases).
+    /// Used by offline delivery to redirect a stale peer_id to the node's current
+    /// endpoint after an IP change.
+    pub(crate) async fn identity_aliases(&self, identity: &str) -> Result<Vec<String>> {
+        self.identity_keys_for(identity).await
+    }
+
     async fn identity_keys_for(&self, identity: &str) -> Result<Vec<String>> {
         let identity = identity.trim();
         let mut keys = Vec::<String>::new();
@@ -2386,7 +2435,8 @@ impl Database {
 
         let result = sqlx::query(
             "INSERT INTO messages (sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+             ON CONFLICT DO NOTHING"
         )
         .bind(sender_id)
         .bind(sender_name)
@@ -2401,6 +2451,18 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("Failed to save message")?;
+
+        // A concurrent writer won the unique dedup race — return the row it wrote
+        // instead of a bogus last_insert_rowid(). The SELECT-first path in
+        // save_message_dedup handles the common case; this covers the tight race.
+        if result.rows_affected() == 0 {
+            if let Some(existing) = self
+                .find_message_by_client_msg_id(sender_id, None, client_msg_id)
+                .await?
+            {
+                return Ok(existing);
+            }
+        }
 
         Ok(ChatMessage {
             id: result.last_insert_rowid(),
@@ -2774,20 +2836,22 @@ impl Database {
         let sql = format!(
             "WITH unread AS (
                  SELECT m.sender_id,
-                        COALESCE(NULLIF(p.node_id, ''), NULLIF(pa.node_id, ''), '') AS node_id,
+                        COALESCE(NULLIF(p.node_id, ''), NULLIF(pa.node_id, ''), '') AS resolved_node_id,
                         COUNT(*) AS cnt,
                         COALESCE(NULLIF(p.username, ''), NULLIF(MAX(m.sender_name), ''), m.sender_id) AS username
                  FROM messages m
                  LEFT JOIN peers p ON m.sender_id = p.peer_id
                  LEFT JOIN peer_aliases pa ON m.sender_id = pa.alias_peer_id
                  WHERE m.receiver_id IN ({my_placeholders}) AND m.is_read = 0
-                 GROUP BY m.sender_id, node_id
+                 GROUP BY m.sender_id,
+                          COALESCE(NULLIF(p.node_id, ''), NULLIF(pa.node_id, ''), '')
              )
              SELECT COALESCE(
                         (
                             SELECT p2.peer_id
                             FROM peers p2
-                            WHERE p2.node_id = unread.node_id AND TRIM(p2.node_id) <> ''
+                            WHERE p2.node_id = unread.resolved_node_id
+                              AND TRIM(p2.node_id) <> ''
                             ORDER BY p2.is_online DESC, p2.last_seen_at DESC
                             LIMIT 1
                         ),
@@ -2796,7 +2860,10 @@ impl Database {
                     SUM(unread.cnt) AS cnt,
                     COALESCE(NULLIF(MAX(unread.username), ''), unread.sender_id) AS username
              FROM unread
-             GROUP BY CASE WHEN unread.node_id <> '' THEN unread.node_id ELSE unread.sender_id END"
+             GROUP BY CASE
+                          WHEN unread.resolved_node_id <> '' THEN unread.resolved_node_id
+                          ELSE unread.sender_id
+                      END"
         );
         let mut query = sqlx::query(&sql);
         for key in &my_keys {

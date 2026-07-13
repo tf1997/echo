@@ -49,7 +49,7 @@ fn sleep_cancelable(cancel: &AtomicBool, duration: Duration) -> bool {
         if cancel.load(Ordering::Relaxed) {
             return true;
         }
-        let step = remaining.min(30);
+        let step = remaining.min(1);
         thread::sleep(Duration::from_secs(step));
         remaining -= step;
     }
@@ -517,7 +517,11 @@ impl LanDiscovery {
                     );
 
                     // Skip self
-                    if packet.id == my_info.id {
+                    if packet.id == my_info.id
+                        || (!my_info.node_id.is_empty()
+                            && !packet.node_id.is_empty()
+                            && packet.node_id == my_info.node_id)
+                    {
                         debug!("UDP recv: skipping self");
                         continue;
                     }
@@ -582,6 +586,9 @@ impl LanDiscovery {
                     let mut relayed: Vec<PeerEntry> = Vec::new();
                     for entry in &packet.known_peers {
                         if entry.id != my_info.id
+                            && (my_info.node_id.is_empty()
+                                || entry.node_id.is_empty()
+                                || entry.node_id != my_info.node_id)
                             && !peers_map.contains_key(&entry.id)
                             && contact_filter::is_syncable_contact(
                                 &entry.id,

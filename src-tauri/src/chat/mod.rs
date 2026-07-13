@@ -521,10 +521,33 @@ struct ConversationUpdated {
     message: Option<ChatMessage>,
 }
 
+#[derive(Clone)]
+pub struct LocalPeerId(Arc<std::sync::RwLock<String>>);
+
+impl LocalPeerId {
+    pub fn new(value: String) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(value)))
+    }
+
+    pub fn get(&self) -> String {
+        self.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn set(&self, value: String) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+    }
+}
+
 pub struct ChatServer {
     app_handle: AppHandle,
     listen_port: u16,
-    my_id: String,
+    my_id: LocalPeerId,
     my_node_id: String,
     my_name: String,
     my_department: String,
@@ -539,7 +562,7 @@ impl ChatServer {
     pub fn new(
         app_handle: AppHandle,
         listen_port: u16,
-        my_id: String,
+        my_id: LocalPeerId,
         my_node_id: String,
         my_name: String,
         my_department: String,
@@ -564,8 +587,8 @@ impl ChatServer {
         }
     }
 
-    pub fn my_id(&self) -> &str {
-        &self.my_id
+    pub fn my_id(&self) -> String {
+        self.my_id.get()
     }
     pub fn my_node_id(&self) -> &str {
         &self.my_node_id
@@ -627,7 +650,7 @@ impl ChatServer {
                         let tx = incoming_tx.clone();
                         let peers = Arc::clone(&peers);
                         let app_handle = app_handle.clone();
-                        let my_id = my_id.clone();
+                        let my_id = my_id.get();
                         let my_node_id = my_node_id.clone();
                         let my_name = my_name.clone();
                         let my_department = my_department.clone();
@@ -975,6 +998,24 @@ impl ChatServer {
                                         .bind(old_peer_id)
                                         .execute(&db.pool)
                                         .await;
+
+                                    // Purge the stale in-memory entry so senders don't
+                                    // resolve the old endpoint and queue into a dead
+                                    // pending row (peer_id no longer exists in DB).
+                                    if let Ok(mut map) = peers.write() {
+                                        map.remove(old_peer_id);
+                                    }
+
+                                    // Tell the frontend to migrate any open conversation
+                                    // key / drafts / unread from old id to the new id.
+                                    let _ = app_handle.emit_all(
+                                        "peer-id-changed",
+                                        serde_json::json!({
+                                            "oldPeerId": old_peer_id,
+                                            "newPeerId": msg.sender_id,
+                                            "nodeId": msg.sender_node_id,
+                                        }),
+                                    );
                                 }
                             }
                         }
@@ -1464,12 +1505,13 @@ impl ChatServer {
         msg_type: &str,
         client_msg_id: Option<&str>,
     ) -> Result<crate::db::ChatMessage> {
-        if is_self_peer(peer, &self.my_id, self.listen_port) {
+        let my_id = self.my_id.get();
+        if is_self_peer(peer, &my_id, self.listen_port) {
             let _ = self.db.add_recent_contact(&peer.id).await;
             let mut saved = self
                 .db
                 .save_message_dedup(
-                    &self.my_id,
+                    &my_id,
                     &self.my_name,
                     &peer.id,
                     content,
@@ -1480,15 +1522,15 @@ impl ChatServer {
                     client_msg_id,
                 )
                 .await?;
-            if peer.id == self.my_id {
-                let _ = self.db.mark_read(&peer.id, &self.my_id).await;
+            if peer.id == my_id {
+                let _ = self.db.mark_read(&peer.id, &my_id).await;
                 saved.is_read = true;
             }
             return Ok(saved);
         }
 
         let msg = WireMessage {
-            sender_id: self.my_id.clone(),
+            sender_id: my_id.clone(),
             sender_node_id: self.my_node_id.clone(),
             sender_name: self.my_name.clone(),
             sender_department: self.my_department.clone(),
@@ -1550,7 +1592,7 @@ impl ChatServer {
         let saved = self
             .db
             .save_message_dedup(
-                &self.my_id,
+                &my_id,
                 &self.my_name,
                 &peer.id,
                 content,
@@ -1573,6 +1615,7 @@ impl ChatServer {
         file_name: &str,
         app_handle: tauri::AppHandle,
     ) -> Result<crate::db::ChatMessage> {
+        let my_id = self.my_id.get();
         use tokio::fs::File;
         use tokio::io::AsyncReadExt;
 
@@ -1614,7 +1657,7 @@ impl ChatServer {
 
             serialize_file_wire_message_line(
                 FileWireMessageLine {
-                    sender_id: &self.my_id,
+                    sender_id: &my_id,
                     sender_node_id: &self.my_node_id,
                     sender_name: &self.my_name,
                     sender_department: &self.my_department,
@@ -1663,7 +1706,7 @@ impl ChatServer {
         let saved = self
             .db
             .save_message_dedup(
-                &self.my_id,
+                &my_id,
                 &self.my_name,
                 &peer.id,
                 &format!("📎 {}", file_name),
@@ -1730,7 +1773,8 @@ impl ChatServer {
     /// Sends our full contact summary; the response arrives asynchronously
     /// through the normal TCP listener via `contact_sync_res`.
     pub async fn exchange_contacts(&self, target_ip: &str, target_port: u16, target_id: &str) {
-        let my_ip = self.my_id.rsplitn(2, ':').nth(1).unwrap_or("127.0.0.1");
+        let my_id = self.my_id.get();
+        let my_ip = my_id.rsplitn(2, ':').nth(1).unwrap_or("127.0.0.1");
         let target_node_id = self
             .peers
             .read()
@@ -1740,7 +1784,7 @@ impl ChatServer {
         contact_sync::exchange_with_peer(
             &self.db,
             &self.peers,
-            &self.my_id,
+            &my_id,
             &self.my_node_id,
             &self.my_name,
             &self.my_department,
@@ -2223,8 +2267,15 @@ async fn send_file_in_background_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_self_peer, safe_received_file_name, Peer};
+    use super::{is_self_peer, safe_received_file_name, LocalPeerId, Peer};
 
+    #[test]
+    fn local_peer_id_updates_all_clones() {
+        let first = LocalPeerId::new("192.168.1.8:9527".to_string());
+        let second = first.clone();
+        second.set("192.168.1.9:9527".to_string());
+        assert_eq!(first.get(), "192.168.1.9:9527");
+    }
     #[test]
     fn self_peer_matches_identity() {
         let peer = Peer::new(

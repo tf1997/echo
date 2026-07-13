@@ -1,7 +1,11 @@
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 use tauri::{AppHandle, Manager, State};
 
 use crate::chat::{
@@ -15,6 +19,19 @@ use crate::chat::{
 use crate::db::{ChatMessage, StoredPeer, UnreadCount, UserProfile};
 use crate::discovery::Peer;
 use crate::state::{AppState, RuntimeServices};
+
+static PENDING_DELIVERY_LOCKS: OnceLock<tokio::sync::Mutex<HashSet<String>>> = OnceLock::new();
+
+async fn try_begin_pending_delivery(peer_id: &str) -> bool {
+    let locks = PENDING_DELIVERY_LOCKS.get_or_init(|| tokio::sync::Mutex::new(HashSet::new()));
+    locks.lock().await.insert(peer_id.to_string())
+}
+
+async fn finish_pending_delivery(peer_id: &str) {
+    if let Some(locks) = PENDING_DELIVERY_LOCKS.get() {
+        locks.lock().await.remove(peer_id);
+    }
+}
 
 #[derive(Serialize)]
 pub struct AppInfo {
@@ -63,7 +80,7 @@ pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String>
 
         Ok(AppInfo {
             initialized: true,
-            peer_id: runtime.my_id.clone(),
+            peer_id: runtime.my_id(),
             node_id: runtime.my_node_id.clone(),
             username: profile.username,
             department: profile.department,
@@ -154,7 +171,7 @@ pub async fn save_profile(
 
     let current_runtime_id = { state.runtime.read().await.clone() }
         .as_ref()
-        .map(|runtime| runtime.my_id.clone())
+        .map(|runtime| runtime.my_id())
         .filter(|peer_id| !peer_id.is_empty());
     let existing_profile_id = state
         .profile
@@ -390,7 +407,7 @@ async fn notify_profile_updated_to_peers(
     profile: UserProfile,
 ) {
     let listen_port = runtime.listen_port;
-    let my_id = runtime.my_id.clone();
+    let my_id = runtime.my_id();
     let my_node_id = runtime.my_node_id.clone();
     let online_peers = runtime.discovery.read().await.get_peers();
     let stored = db.list_stored_peers().await.unwrap_or_default();
@@ -614,7 +631,7 @@ pub async fn request_peer_avatar(
     let mut lines = BufReader::new(reader).lines();
 
     let request = WireMessage {
-        sender_id: runtime.my_id.clone(),
+        sender_id: runtime.my_id(),
         sender_node_id: runtime.my_node_id.clone(),
         sender_name: profile.username.clone(),
         sender_department: profile.department.clone(),
@@ -735,7 +752,7 @@ pub async fn refresh_peer_profile(
         let runtime_opt = { state.runtime.read().await.clone() };
         match runtime_opt.as_ref() {
             Some(runtime) => (
-                runtime.my_id.clone(),
+                runtime.my_id(),
                 runtime.my_node_id.clone(),
                 runtime.listen_port,
             ),
@@ -993,6 +1010,7 @@ async fn send_file_with_kind(
     let Some(runtime) = runtime_opt.as_ref() else {
         return Err("应用尚未初始化用户信息".to_string());
     };
+    let my_id = runtime.my_id();
 
     let discovery = runtime.discovery.read().await;
     let peer = if let Some(peer) = discovery.get_peer(&peer_id) {
@@ -1029,16 +1047,15 @@ async fn send_file_with_kind(
     };
     drop(discovery);
 
-    let peer_is_self = is_self_peer(&peer, &runtime.my_id, runtime.listen_port);
+    let peer_is_self = is_self_peer(&peer, &my_id, runtime.listen_port);
     if !peer_is_self && !peer.online {
         return Err("对方当前离线，文件未发送。请等待对方上线后重试。".to_string());
     }
 
     // Clone what we need and release the chat lock immediately
-    let (my_id, my_node_id, my_name, my_department, listen_port, db, peers_arc) = {
+    let (my_node_id, my_name, my_department, listen_port, db, peers_arc) = {
         let chat = runtime.chat.lock().await;
         (
-            chat.my_id().to_string(),
             chat.my_node_id().to_string(),
             chat.my_name().to_string(),
             chat.my_department().to_string(),
@@ -1320,7 +1337,7 @@ pub async fn discover_by_ip(
     let (my_id, my_node_id, my_port) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         match runtime_opt.as_ref() {
-            Some(r) => (r.my_id.clone(), r.my_node_id.clone(), r.listen_port),
+            Some(r) => (r.my_id(), r.my_node_id.clone(), r.listen_port),
             None => return Err("应用尚未初始化".to_string()),
         }
     };
@@ -1678,7 +1695,7 @@ pub async fn get_conversation(
 
     state
         .db
-        .get_conversation(&peer_id, &runtime.my_id, limit)
+        .get_conversation(&peer_id, &runtime.my_id(), limit)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1692,7 +1709,7 @@ pub async fn get_unread_counts(state: State<'_, AppState>) -> Result<Vec<UnreadC
 
     state
         .db
-        .get_unread_counts(&runtime.my_id)
+        .get_unread_counts(&runtime.my_id())
         .await
         .map_err(|e| e.to_string())
 }
@@ -1714,7 +1731,7 @@ pub async fn mark_read(state: State<'_, AppState>, peer_id: String) -> Result<()
 
     state
         .db
-        .mark_read(&peer_id, &runtime.my_id)
+        .mark_read(&peer_id, &runtime.my_id())
         .await
         .map_err(|e| e.to_string())
 }
@@ -2229,21 +2246,22 @@ pub async fn search_messages(
         return Ok(vec![]);
     };
 
+    let my_id = runtime.my_id();
     let rows = state
         .db
-        .search_messages(&runtime.my_id, &query)
+        .search_messages(&my_id, &query)
         .await
         .map_err(|e| e.to_string())?;
 
     let mut groups: std::collections::BTreeMap<String, SearchResult> =
         std::collections::BTreeMap::new();
     for row in rows {
-        let peer_id = if row.sender_id == runtime.my_id {
+        let peer_id = if row.sender_id == my_id {
             row.receiver_id.clone()
         } else {
             row.sender_id.clone()
         };
-        let peer_name = if row.sender_id == runtime.my_id {
+        let peer_name = if row.sender_id == my_id {
             "我发往".to_string()
         } else {
             row.sender_name.clone()
@@ -2297,7 +2315,7 @@ pub async fn search_conversation_messages(
         .db
         .search_conversation_messages(
             &peer_id,
-            &runtime.my_id,
+            &runtime.my_id(),
             query,
             limit,
             filter.as_deref(),
@@ -2356,7 +2374,7 @@ pub async fn get_conversation_history(
         .db
         .get_conversation_history(
             &peer_id,
-            &runtime.my_id,
+            &runtime.my_id(),
             before_id,
             limit,
             filter.as_deref(),
@@ -2566,10 +2584,7 @@ pub async fn create_group(
     );
     let my_id = {
         let runtime_opt = { state.runtime.read().await.clone() };
-        runtime_opt
-            .as_ref()
-            .map(|r| r.my_id.clone())
-            .unwrap_or_default()
+        runtime_opt.as_ref().map(|r| r.my_id()).unwrap_or_default()
     };
     let mut all_members = payload.members.clone();
     if !all_members.iter().any(|m| m == &my_id) {
@@ -2645,10 +2660,7 @@ pub async fn create_group(
 pub async fn list_groups(state: State<'_, AppState>) -> Result<Vec<crate::db::GroupInfo>, String> {
     let my_id = {
         let runtime_opt = { state.runtime.read().await.clone() };
-        runtime_opt
-            .as_ref()
-            .map(|r| r.my_id.clone())
-            .unwrap_or_default()
+        runtime_opt.as_ref().map(|r| r.my_id()).unwrap_or_default()
     };
     let mut groups = state
         .db
@@ -2712,7 +2724,7 @@ pub async fn send_group_message_typed(
             .await
             .map_err(|e| e.to_string())?;
         (
-            r.my_id.clone(),
+            r.my_id(),
             r.my_node_id.clone(),
             my_name,
             my_dept,
@@ -2818,7 +2830,7 @@ pub async fn rename_group(
             .unwrap_or_default();
         let peers = r.discovery.read().await.get_peers();
         (
-            r.my_id.clone(),
+            r.my_id(),
             r.my_node_id.clone(),
             my_name,
             my_dept,
@@ -2854,23 +2866,19 @@ pub async fn invite_to_group(
     group_id: String,
     members: Vec<String>,
 ) -> Result<(), String> {
+    let runtime = { state.runtime.read().await.clone() }.ok_or("未初始化")?;
+    let my_id = runtime.my_id();
     state
         .db
         .add_group_members(&group_id, &members)
         .await
         .map_err(|e| e.to_string())?;
 
-    let groups = {
-        let my_id_opt = { state.runtime.read().await.clone() }
-            .as_ref()
-            .map(|r| r.my_id.clone());
-        let my_id = my_id_opt.unwrap_or_default();
-        state
-            .db
-            .list_groups(&my_id)
-            .await
-            .map_err(|e| e.to_string())?
-    };
+    let groups = state
+        .db
+        .list_groups(&my_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let group = groups
         .iter()
         .find(|g| g.group_id == group_id)
@@ -2883,12 +2891,9 @@ pub async fn invite_to_group(
         .map_err(|e| e.to_string())?;
     let all_member_ids: Vec<String> = member_records.iter().map(|m| m.peer_id.clone()).collect();
 
-    let (my_id, my_node_id, listen_port, online_peers) = {
-        let runtime_opt = { state.runtime.read().await.clone() };
-        let r = runtime_opt.as_ref().ok_or("未初始化")?;
-        let peers = r.discovery.read().await.get_peers();
-        (r.my_id.clone(), r.my_node_id.clone(), r.listen_port, peers)
-    };
+    let online_peers = runtime.discovery.read().await.get_peers();
+    let my_node_id = runtime.my_node_id.clone();
+    let listen_port = runtime.listen_port;
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
         p.as_ref()
@@ -2938,7 +2943,7 @@ pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result
             .map_err(|e| e.to_string())?;
         let online = r.discovery.read().await.get_peers();
         (
-            r.my_id.clone(),
+            r.my_id(),
             r.my_node_id.clone(),
             r.listen_port,
             online,
@@ -3000,7 +3005,7 @@ pub async fn dissolve_group(state: State<'_, AppState>, group_id: String) -> Res
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let peers = r.discovery.read().await.get_peers();
-        (r.my_id.clone(), r.my_node_id.clone(), r.listen_port, peers)
+        (r.my_id(), r.my_node_id.clone(), r.listen_port, peers)
     };
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
@@ -3112,7 +3117,7 @@ async fn send_group_file_with_kind(
             .await
             .map_err(|e| e.to_string())?;
         (
-            r.my_id.clone(),
+            r.my_id(),
             my_name,
             my_department,
             r.listen_port,
@@ -3514,7 +3519,7 @@ pub async fn get_group_unread_counts(
     };
     state
         .db
-        .get_group_unread_counts(&runtime.my_id)
+        .get_group_unread_counts(&runtime.my_id())
         .await
         .map_err(|e| e.to_string())
 }
@@ -3527,7 +3532,7 @@ pub async fn mark_group_read(state: State<'_, AppState>, group_id: String) -> Re
     };
     state
         .db
-        .mark_group_read(&group_id, &runtime.my_id)
+        .mark_group_read(&group_id, &runtime.my_id())
         .await
         .map_err(|e| e.to_string())
 }
@@ -3546,7 +3551,7 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
     let (_my_id, listen_port) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
-        (r.my_id.clone(), r.listen_port)
+        (r.my_id(), r.listen_port)
     };
 
     let mut delivered_ids = Vec::new();
@@ -3612,6 +3617,15 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
 
 /// Deliver pending notifications (any kind) to a peer that just came back online.
 pub async fn deliver_pending_to_peer(db: &crate::db::Database, peer_id_str: &str) {
+    if !try_begin_pending_delivery(peer_id_str).await {
+        log::debug!("Skipping concurrent pending delivery for {}", peer_id_str);
+        return;
+    }
+    deliver_pending_to_peer_inner(db, peer_id_str).await;
+    finish_pending_delivery(peer_id_str).await;
+}
+
+async fn deliver_pending_to_peer_inner(db: &crate::db::Database, peer_id_str: &str) {
     // Resolve peer address.
     let stored = match db.get_stored_peer(peer_id_str).await {
         Ok(Some(p)) => p,
@@ -3627,18 +3641,37 @@ pub async fn deliver_pending_to_peer(db: &crate::db::Database, peer_id_str: &str
     let addr = format!("{}:{}", ip, stored.port);
 
     // 1) Generic pending_notifications (preferred — payload is a full WireMessage).
-    let notifs = db
-        .get_pending_notifications(peer_id_str)
-        .await
-        .unwrap_or_default();
-    let delivered_notif_ids = deliver_pending_payloads_over_tcp(&addr, &notifs).await;
-    if !delivered_notif_ids.is_empty() {
-        let _ = db.delete_pending_notifications(&delivered_notif_ids).await;
-        log::info!(
-            "Delivered {} pending notifs to {}",
-            delivered_notif_ids.len(),
-            peer_id_str
-        );
+    //    Drain not just this peer_id's queue but any queued under historical
+    //    endpoints of the same node (aliases). After an IP change a message may
+    //    have been queued under the old peer_id, which no longer resolves to an
+    //    address on its own — redirect those to the current endpoint here instead
+    //    of leaving them stranded in a dead queue.
+    let mut queue_owner_ids = vec![peer_id_str.to_string()];
+    if let Ok(aliases) = db.identity_aliases(peer_id_str).await {
+        for alias in aliases {
+            if alias != peer_id_str && !queue_owner_ids.contains(&alias) {
+                queue_owner_ids.push(alias);
+            }
+        }
+    }
+    for owner_id in &queue_owner_ids {
+        let notifs = db
+            .get_pending_notifications(owner_id)
+            .await
+            .unwrap_or_default();
+        if notifs.is_empty() {
+            continue;
+        }
+        let delivered_notif_ids = deliver_pending_payloads_over_tcp(&addr, &notifs).await;
+        if !delivered_notif_ids.is_empty() {
+            let _ = db.delete_pending_notifications(&delivered_notif_ids).await;
+            log::info!(
+                "Delivered {} pending notifs to {} (queued under {})",
+                delivered_notif_ids.len(),
+                peer_id_str,
+                owner_id
+            );
+        }
     }
 
     // 2) Legacy pending_group_messages — still drained for backward-compat with
@@ -4263,4 +4296,23 @@ async fn build_member_directory(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod pending_delivery_tests {
+    use super::{finish_pending_delivery, try_begin_pending_delivery};
+
+    #[tokio::test]
+    async fn pending_delivery_is_single_flight_per_peer() {
+        let peer = "single-flight-test-peer";
+        let other = "single-flight-test-other";
+        assert!(try_begin_pending_delivery(peer).await);
+        assert!(!try_begin_pending_delivery(peer).await);
+        assert!(try_begin_pending_delivery(other).await);
+
+        finish_pending_delivery(peer).await;
+        finish_pending_delivery(other).await;
+        assert!(try_begin_pending_delivery(peer).await);
+        finish_pending_delivery(peer).await;
+    }
 }

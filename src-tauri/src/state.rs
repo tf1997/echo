@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use crate::chat::ChatServer;
+use crate::chat::{ChatServer, LocalPeerId};
 use crate::db::{Database, UserProfile};
 use crate::discovery::{DiscoveryConfig, DiscoveryService, PeerEntry};
 use tauri::AppHandle;
@@ -10,9 +10,11 @@ use tauri::AppHandle;
 pub struct RuntimeServices {
     pub discovery: RwLock<DiscoveryService>,
     pub chat: Mutex<ChatServer>,
-    pub my_id: String,
+    my_id: LocalPeerId,
     pub my_node_id: String,
     pub listen_port: u16,
+    db: Arc<Database>,
+    endpoint_update: Mutex<()>,
 }
 
 impl RuntimeServices {
@@ -78,11 +80,12 @@ impl RuntimeServices {
         discovery.start().await?;
 
         let peers = discovery.peers_arc();
+        let local_peer_id = LocalPeerId::new(my_id.clone());
 
         let chat = ChatServer::new(
             app_handle.clone(),
             listen_port,
-            my_id.clone(),
+            local_peer_id.clone(),
             my_node_id.clone(),
             profile.username.clone(),
             profile.department.clone(),
@@ -162,10 +165,115 @@ impl RuntimeServices {
         Ok(Self {
             discovery: RwLock::new(discovery),
             chat: Mutex::new(chat),
-            my_id,
+            my_id: local_peer_id,
             my_node_id,
             listen_port,
+            db,
+            endpoint_update: Mutex::new(()),
         })
+    }
+
+    pub fn my_id(&self) -> String {
+        self.my_id.get()
+    }
+
+    /// Publish a new local endpoint without restarting the TCP chat listener.
+    /// Database identity is persisted before the in-memory route becomes visible.
+    pub async fn update_local_endpoint(
+        &self,
+        profile: &UserProfile,
+        new_ip: std::net::IpAddr,
+    ) -> Result<Option<(String, String)>> {
+        let _update_guard = self.endpoint_update.lock().await;
+        let old_id = self.my_id();
+        let new_id = format!("{}:{}", new_ip, self.listen_port);
+        if old_id == new_id {
+            return Ok(None);
+        }
+
+        log::info!("Runtime local IP changed: {} -> {}", old_id, new_id);
+        self.db.upsert_peer_alias(&self.my_node_id, &old_id).await?;
+        self.db.upsert_peer_alias(&self.my_node_id, &new_id).await?;
+        self.db.migrate_peer_references(&old_id, &new_id).await?;
+        self.db
+            .save_user_profile(
+                &new_id,
+                &profile.username,
+                &profile.department,
+                &crate::profile_metadata::software_version(),
+                &crate::profile_metadata::mac_address(),
+            )
+            .await?;
+
+        self.my_id.set(new_id.clone());
+        if let Err(error) = self
+            .discovery
+            .write()
+            .await
+            .update_local_endpoint(&new_id, new_ip)
+        {
+            self.my_id.set(old_id.clone());
+            let _ = self.db.migrate_peer_references(&new_id, &old_id).await;
+            let _ = self
+                .db
+                .save_user_profile(
+                    &old_id,
+                    &profile.username,
+                    &profile.department,
+                    &crate::profile_metadata::software_version(),
+                    &crate::profile_metadata::mac_address(),
+                )
+                .await;
+            return Err(error);
+        }
+
+        let payload = serde_json::json!({
+            "old_peer_id": old_id,
+            "username": profile.username,
+            "department": profile.department,
+            "software_version": crate::profile_metadata::software_version(),
+            "mac_address": crate::profile_metadata::mac_address(),
+            "avatar_hash": profile.avatar_hash,
+            "avatar_updated_at": profile.avatar_updated_at,
+        })
+        .to_string();
+        let stored = self.db.list_stored_peers().await.unwrap_or_default();
+        let mut queued = 0usize;
+        for peer in stored {
+            if peer.peer_id == old_id || peer.peer_id == new_id {
+                continue;
+            }
+            let json = crate::commands::build_notification_json(
+                &new_id,
+                &self.my_node_id,
+                &profile.username,
+                &profile.department,
+                self.listen_port,
+                &peer.peer_id,
+                "",
+                &payload,
+                "profile_updated",
+                None,
+                None,
+                None,
+                &[],
+            );
+            if self
+                .db
+                .queue_pending_notification(&peer.peer_id, "profile_updated", &json)
+                .await
+                .is_ok()
+            {
+                queued += 1;
+            }
+        }
+        log::info!(
+            "Queued runtime peer_id change {} -> {} for {} peers",
+            old_id,
+            new_id,
+            queued
+        );
+        Ok(Some((old_id, new_id)))
     }
 
     #[allow(dead_code)]
