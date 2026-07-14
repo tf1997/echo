@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
 };
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
@@ -21,7 +21,8 @@ const FILE_RECEIVE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 pub const FILE_SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 const FILE_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 const TCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-const MESSAGE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(180);
+const MESSAGE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const MESSAGE_ACK_MIN_VERSION: &str = "0.2.0";
 const EVENT_CONVERSATION_UPDATED: &str = "conversation-updated";
 pub const FILE_TRANSFER_CANCELLED_MESSAGE: &str = "发送已取消";
 const AVATAR_MAX_BYTES: u64 = 5 * 1024 * 1024;
@@ -45,6 +46,29 @@ fn normalized_client_msg_id(client_msg_id: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+pub(crate) fn peer_supports_message_ack(software_version: &str) -> bool {
+    let normalized = software_version
+        .trim()
+        .strip_prefix('v')
+        .unwrap_or(software_version.trim());
+    let Ok(version) = semver::Version::parse(normalized) else {
+        return false;
+    };
+    let minimum = semver::Version::parse(MESSAGE_ACK_MIN_VERSION)
+        .expect("MESSAGE_ACK_MIN_VERSION must be valid semver");
+    version >= minimum
+}
+
+pub(crate) fn requires_message_ack(
+    client_msg_id: Option<&str>,
+    peer_software_version: &str,
+) -> bool {
+    client_msg_id
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        && peer_supports_message_ack(peer_software_version)
 }
 
 fn is_valid_relay_entry(entry: &PeerEntry, my_id: &str) -> bool {
@@ -247,9 +271,12 @@ struct IncomingFileState {
     file_name: String,
     sender_id: String,
     sender_name: String,
+    receiver_id: String,
     group_id: Option<String>,
     kind: String,
     client_msg_id: Option<String>,
+    expected_size: u64,
+    received_size: u64,
 }
 
 async fn create_received_file(filename: &str) -> Result<(tokio::fs::File, String)> {
@@ -261,8 +288,9 @@ async fn create_received_file(filename: &str) -> Result<(tokio::fs::File, String
 
     let timestamp = chrono::Utc::now().timestamp_millis();
     let file_path = files_dir.join(format!(
-        "{}_{}",
+        "{}_{}_{}",
         timestamp,
+        uuid::Uuid::new_v4(),
         safe_received_file_name(filename)
     ));
     let file = tokio::fs::File::create(&file_path).await?;
@@ -270,6 +298,9 @@ async fn create_received_file(filename: &str) -> Result<(tokio::fs::File, String
 }
 
 async fn start_incoming_file(msg: &WireMessage) -> Result<IncomingFileState> {
+    let expected_size = msg
+        .file_size
+        .context("Incoming file frame is missing file_size")?;
     let file_name = msg
         .file_name
         .as_deref()
@@ -282,20 +313,82 @@ async fn start_incoming_file(msg: &WireMessage) -> Result<IncomingFileState> {
         file_name,
         sender_id: msg.sender_id.clone(),
         sender_name: msg.sender_name.clone(),
+        receiver_id: msg.receiver_id.clone(),
         group_id: msg.group_id.clone(),
         kind: msg.file_kind.as_deref().unwrap_or("file").to_string(),
         client_msg_id: normalized_client_msg_id(msg.client_msg_id.as_deref()),
+        expected_size,
+        received_size: 0,
     })
+}
+
+fn validate_incoming_file_frame(file_state: &IncomingFileState, msg: &WireMessage) -> Result<()> {
+    let frame_file_name = msg
+        .file_name
+        .as_deref()
+        .map(safe_received_file_name)
+        .unwrap_or_else(|| "unknown".to_string());
+    let frame_kind = msg.file_kind.as_deref().unwrap_or("file");
+    let frame_client_msg_id = normalized_client_msg_id(msg.client_msg_id.as_deref());
+
+    if msg.sender_id != file_state.sender_id
+        || msg.receiver_id != file_state.receiver_id
+        || msg.group_id != file_state.group_id
+        || frame_file_name != file_state.file_name
+        || frame_kind != file_state.kind
+        || frame_client_msg_id != file_state.client_msg_id
+        || msg.file_size != Some(file_state.expected_size)
+    {
+        anyhow::bail!("Incoming file metadata changed during transfer");
+    }
+    Ok(())
+}
+
+fn checked_received_size(current: u64, chunk_len: usize, expected: u64) -> Result<u64> {
+    let chunk_len = u64::try_from(chunk_len).context("Incoming file chunk length overflow")?;
+    let next = current
+        .checked_add(chunk_len)
+        .context("Incoming file byte count overflow")?;
+    if next > expected {
+        anyhow::bail!(
+            "Incoming file exceeded declared size: received {}, expected {}",
+            next,
+            expected
+        );
+    }
+    Ok(next)
+}
+
+async fn append_incoming_file_frame(
+    file_state: &mut IncomingFileState,
+    msg: &WireMessage,
+    decode_buf: &mut Vec<u8>,
+) -> Result<()> {
+    validate_incoming_file_frame(file_state, msg)?;
+    base64_decode_into(&msg.content, decode_buf).context("Failed to decode incoming file frame")?;
+    let next_size = checked_received_size(
+        file_state.received_size,
+        decode_buf.len(),
+        file_state.expected_size,
+    )?;
+    file_state
+        .file
+        .write_all(decode_buf)
+        .await
+        .with_context(|| format!("Failed to write incoming file: {}", file_state.file_name))?;
+    file_state.received_size = next_size;
+    Ok(())
 }
 
 async fn remove_incomplete_incoming_file(file_state: IncomingFileState) {
     let path = file_state.path.clone();
     drop(file_state);
-    if let Err(error) = tokio::fs::remove_file(&path).await {
-        warn!(
-            "Failed to remove incomplete incoming file {}: {}",
-            path, error
-        );
+    remove_received_file(&path).await;
+}
+
+async fn remove_received_file(path: &str) {
+    if let Err(error) = tokio::fs::remove_file(path).await {
+        warn!("Failed to remove received file {}: {}", path, error);
     }
 }
 
@@ -404,14 +497,28 @@ async fn write_message_ack<W: AsyncWrite + Unpin>(
     writer.flush().await.context("Failed to flush message ack")
 }
 
-async fn wait_for_message_ack(stream: &mut TcpStream, client_msg_id: Option<&str>) -> bool {
+pub(crate) async fn wait_for_message_ack<R>(stream: &mut R, client_msg_id: Option<&str>) -> bool
+where
+    R: AsyncRead + Unpin,
+{
+    wait_for_message_ack_with_timeout(stream, client_msg_id, MESSAGE_ACK_TIMEOUT).await
+}
+
+async fn wait_for_message_ack_with_timeout<R>(
+    stream: &mut R,
+    client_msg_id: Option<&str>,
+    timeout: std::time::Duration,
+) -> bool
+where
+    R: AsyncRead + Unpin,
+{
     let Some(expected_client_msg_id) = normalized_client_msg_id(client_msg_id) else {
         return false;
     };
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    match tokio::time::timeout(MESSAGE_ACK_TIMEOUT, reader.read_line(&mut line)).await {
+    match tokio::time::timeout(timeout, reader.read_line(&mut line)).await {
         Ok(Ok(bytes_read)) if bytes_read > 0 => {
             let line_for_parse = line.trim_end_matches('\n').trim_end_matches('\r');
             serde_json::from_str::<WireMessage>(line_for_parse)
@@ -1184,85 +1291,70 @@ impl ChatServer {
                             if incoming_file.is_none() {
                                 incoming_file = Some(start_incoming_file(&msg).await?);
                             }
-                            let file_state = incoming_file
-                                .as_mut()
-                                .expect("incoming_file just initialized");
-                            file_state.kind = msg
-                                .file_kind
-                                .as_deref()
-                                .unwrap_or(&file_state.kind)
-                                .to_string();
-                            if file_state.client_msg_id.is_none() {
-                                file_state.client_msg_id =
-                                    normalized_client_msg_id(msg.client_msg_id.as_deref());
-                            }
-                            if let Err(error) =
-                                base64_decode_into(&msg.content, &mut incoming_decode_buf)
-                            {
-                                warn!("Failed to decode incoming file chunk: {}", error);
+                            let append_result = append_incoming_file_frame(
+                                incoming_file
+                                    .as_mut()
+                                    .expect("incoming_file just initialized"),
+                                &msg,
+                                &mut incoming_decode_buf,
+                            )
+                            .await;
+                            if let Err(error) = append_result {
+                                warn!("Failed to receive incoming file chunk: {}", error);
                                 if let Some(file_state) = incoming_file.take() {
                                     remove_incomplete_incoming_file(file_state).await;
                                 }
-                                return Err(error.context("Failed to decode incoming file chunk"));
+                                return Err(error);
                             }
-                            file_state
-                                .file
-                                .write_all(&incoming_decode_buf)
-                                .await
-                                .with_context(|| {
-                                    format!(
-                                        "Failed to write incoming file chunk: {}",
-                                        file_state.file_name
-                                    )
-                                })?;
                         }
                         "file_end" => {
                             if incoming_file.is_none() {
                                 incoming_file = Some(start_incoming_file(&msg).await?);
                             }
+                            let append_result = append_incoming_file_frame(
+                                incoming_file
+                                    .as_mut()
+                                    .expect("incoming_file just initialized"),
+                                &msg,
+                                &mut incoming_decode_buf,
+                            )
+                            .await;
+                            if let Err(error) = append_result {
+                                warn!("Failed to receive incoming file end: {}", error);
+                                if let Some(file_state) = incoming_file.take() {
+                                    remove_incomplete_incoming_file(file_state).await;
+                                }
+                                return Err(error);
+                            }
+
                             let mut file_state = incoming_file
                                 .take()
                                 .expect("incoming_file just initialized");
-                            file_state.kind = msg
-                                .file_kind
-                                .as_deref()
-                                .unwrap_or(&file_state.kind)
-                                .to_string();
-                            if file_state.client_msg_id.is_none() {
-                                file_state.client_msg_id =
-                                    normalized_client_msg_id(msg.client_msg_id.as_deref());
-                            }
-                            if let Err(error) =
-                                base64_decode_into(&msg.content, &mut incoming_decode_buf)
-                            {
-                                warn!("Failed to decode incoming file end: {}", error);
+                            if file_state.received_size != file_state.expected_size {
+                                let error = anyhow::anyhow!(
+                                    "Incoming file size mismatch: received {}, expected {}",
+                                    file_state.received_size,
+                                    file_state.expected_size
+                                );
                                 remove_incomplete_incoming_file(file_state).await;
-                                return Err(error.context("Failed to decode incoming file end"));
+                                return Err(error);
                             }
-                            file_state
-                                .file
-                                .write_all(&incoming_decode_buf)
-                                .await
-                                .with_context(|| {
-                                    format!(
-                                        "Failed to write incoming file end: {}",
-                                        file_state.file_name
-                                    )
-                                })?;
-                            file_state.file.flush().await.with_context(|| {
-                                format!("Failed to flush incoming file: {}", file_state.file_name)
-                            })?;
+                            if let Err(error) = file_state.file.flush().await {
+                                let error = anyhow::Error::from(error).context(format!(
+                                    "Failed to flush incoming file: {}",
+                                    file_state.file_name
+                                ));
+                                remove_incomplete_incoming_file(file_state).await;
+                                return Err(error);
+                            }
 
-                            let file_name_display = msg
-                                .file_name
-                                .as_deref()
-                                .map(safe_received_file_name)
-                                .unwrap_or_else(|| file_state.file_name.clone());
+                            let file_name_display = file_state.file_name.clone();
                             let saved_path = file_state.path.clone();
-
-                            let sender_id = file_state.sender_id.as_str();
-                            let sender_name = file_state.sender_name.as_str();
-                            let client_msg_id = file_state.client_msg_id.as_deref();
+                            let sender_id = file_state.sender_id.clone();
+                            let sender_name = file_state.sender_name.clone();
+                            let group_id = file_state.group_id.clone();
+                            let client_msg_id = file_state.client_msg_id.clone();
+                            let expected_size = file_state.expected_size;
                             let msg_kind = if file_state.kind == "sticker" {
                                 "sticker"
                             } else {
@@ -1273,92 +1365,96 @@ impl ChatServer {
                             } else {
                                 format!("📎 {}", file_name_display)
                             };
-                            if let Some(ref gid) = file_state.group_id {
-                                // Group file message — is_read=false so unread fires
-                                match db
-                                    .save_group_message_dedup(
-                                        gid,
-                                        sender_id,
-                                        sender_name,
-                                        &display_content,
-                                        msg_kind,
-                                        Some(&saved_path),
-                                        Some(&file_name_display),
-                                        msg.file_size.map(|s| s as i64),
-                                        false,
-                                        client_msg_id,
-                                    )
-                                    .await
-                                {
-                                    Ok(saved) => {
-                                        emit_group_message_updated(&app_handle, gid, saved);
-                                        let _ = write_message_ack(
-                                            &mut writer,
-                                            &my_id,
-                                            &my_node_id,
-                                            &my_name,
-                                            &my_department,
-                                            &my_software_version,
-                                            &my_mac_address,
-                                            my_port,
-                                            sender_id,
-                                            &msg.sender_node_id,
-                                            client_msg_id,
-                                        )
-                                        .await;
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to save incoming group file message: {}", e);
-                                    }
+                            drop(file_state);
+
+                            let stored_file_size = match i64::try_from(expected_size) {
+                                Ok(size) => size,
+                                Err(error) => {
+                                    remove_received_file(&saved_path).await;
+                                    return Err(anyhow::Error::from(error)
+                                        .context("Incoming file is too large to store"));
                                 }
+                            };
+                            let save_result = if let Some(ref gid) = group_id {
+                                // Group file message — is_read=false so unread fires
+                                db.save_group_message_dedup(
+                                    gid,
+                                    &sender_id,
+                                    &sender_name,
+                                    &display_content,
+                                    msg_kind,
+                                    Some(&saved_path),
+                                    Some(&file_name_display),
+                                    Some(stored_file_size),
+                                    false,
+                                    client_msg_id.as_deref(),
+                                )
+                                .await
                             } else {
-                                let receiver_id = &my_id;
-                                match db
-                                    .save_message_dedup(
-                                        sender_id,
-                                        sender_name,
-                                        receiver_id,
-                                        &display_content,
-                                        msg_kind,
-                                        Some(&saved_path),
-                                        Some(&file_name_display),
-                                        msg.file_size.map(|s| s as i64),
-                                        client_msg_id,
+                                db.save_message_dedup(
+                                    &sender_id,
+                                    &sender_name,
+                                    &my_id,
+                                    &display_content,
+                                    msg_kind,
+                                    Some(&saved_path),
+                                    Some(&file_name_display),
+                                    Some(stored_file_size),
+                                    client_msg_id.as_deref(),
+                                )
+                                .await
+                            };
+
+                            match save_result {
+                                Ok(saved) => {
+                                    let is_new_file =
+                                        saved.file_path.as_deref() == Some(saved_path.as_str());
+                                    if is_new_file {
+                                        if let Some(ref gid) = group_id {
+                                            emit_group_message_updated(&app_handle, gid, saved);
+                                        } else {
+                                            emit_contact_message_updated(
+                                                &app_handle,
+                                                &sender_id,
+                                                saved,
+                                            );
+                                        }
+                                        let _ = incoming_tx.send(IncomingMessage {
+                                            sender_id: sender_id.clone(),
+                                            sender_name: sender_name.clone(),
+                                            content: display_content,
+                                            msg_type: msg_kind.to_string(),
+                                            file_name: Some(file_name_display),
+                                            file_size: Some(expected_size),
+                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                        });
+                                    } else {
+                                        // The receiver already stored this client_msg_id. This
+                                        // happens when the first ACK was lost; discard the retry's
+                                        // temporary file, then ACK the existing durable row.
+                                        remove_received_file(&saved_path).await;
+                                    }
+
+                                    let _ = write_message_ack(
+                                        &mut writer,
+                                        &my_id,
+                                        &my_node_id,
+                                        &my_name,
+                                        &my_department,
+                                        &my_software_version,
+                                        &my_mac_address,
+                                        my_port,
+                                        &sender_id,
+                                        &msg.sender_node_id,
+                                        client_msg_id.as_deref(),
                                     )
-                                    .await
-                                {
-                                    Ok(saved) => {
-                                        emit_contact_message_updated(&app_handle, sender_id, saved);
-                                        let _ = write_message_ack(
-                                            &mut writer,
-                                            &my_id,
-                                            &my_node_id,
-                                            &my_name,
-                                            &my_department,
-                                            &my_software_version,
-                                            &my_mac_address,
-                                            my_port,
-                                            sender_id,
-                                            &msg.sender_node_id,
-                                            client_msg_id,
-                                        )
-                                        .await;
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to save incoming file message: {}", e);
-                                    }
+                                    .await;
+                                }
+                                Err(error) => {
+                                    remove_received_file(&saved_path).await;
+                                    return Err(error.context("Failed to save incoming file"));
                                 }
                             }
-
-                            let _ = incoming_tx.send(IncomingMessage {
-                                sender_id: sender_id.to_string(),
-                                sender_name: sender_name.to_string(),
-                                content: display_content,
-                                msg_type: msg_kind.to_string(),
-                                file_name: Some(file_name_display),
-                                file_size: msg.file_size,
-                                timestamp: chrono::Utc::now().to_rfc3339(),
-                            });
                         }
                         "group_created" | "group_dissolved" | "group_member_left"
                         | "profile_updated" | "peer_id_changed" => {
@@ -1510,7 +1606,7 @@ impl ChatServer {
             let _ = self.db.add_recent_contact(&peer.id).await;
             let mut saved = self
                 .db
-                .save_message_dedup(
+                .save_message_dedup_with_delivery(
                     &my_id,
                     &self.my_name,
                     &peer.id,
@@ -1520,6 +1616,7 @@ impl ChatServer {
                     None,
                     None,
                     client_msg_id,
+                    Some(true),
                 )
                 .await?;
             if peer.id == my_id {
@@ -1589,9 +1686,18 @@ impl ChatServer {
                 )
                 .await;
         }
+        let delivery_state = if delivered {
+            if requires_message_ack(msg.client_msg_id.as_deref(), &peer.software_version) {
+                Some(true)
+            } else {
+                None
+            }
+        } else {
+            Some(false)
+        };
         let saved = self
             .db
-            .save_message_dedup(
+            .save_message_dedup_with_delivery(
                 &my_id,
                 &self.my_name,
                 &peer.id,
@@ -1601,6 +1707,7 @@ impl ChatServer {
                 None,
                 None,
                 client_msg_id,
+                delivery_state,
             )
             .await?;
         Ok(saved)
@@ -1732,13 +1839,16 @@ impl ChatServer {
             .context("Failed to write message")?;
         stream.flush().await?;
 
-        if msg.client_msg_id.is_some()
+        if requires_message_ack(msg.client_msg_id.as_deref(), &peer.software_version)
             && !wait_for_message_ack(&mut stream, msg.client_msg_id.as_deref()).await
         {
             warn!(
-                "No message ack from {} for {:?}; treating as legacy peer success",
+                "Required message ack missing from {} for {:?}",
                 peer.id, msg.client_msg_id
             );
+            return Err(anyhow::anyhow!(
+                "未收到对方的送达确认，消息将保留并稍后重试"
+            ));
         }
 
         // TCP success = peer is definitely online
@@ -2066,6 +2176,7 @@ async fn send_file_in_background_inner(
     let sender_software_version = crate::profile_metadata::software_version();
     let sender_mac_address = crate::profile_metadata::mac_address();
     let mut i: u64 = 0;
+    let mut sent_bytes: u64 = 0;
     let start_time = std::time::Instant::now();
     let mut last_progress_emit = start_time;
 
@@ -2099,19 +2210,22 @@ async fn send_file_in_background_inner(
             .await
             .map_err(|error| file_send_connection_error(error, peer))?;
     } else {
-        loop {
+        while sent_bytes < file_size {
             wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await?;
 
+            let remaining = (file_size - sent_bytes).min(buf.len() as u64) as usize;
             let n = file
-                .read(&mut buf)
+                .read(&mut buf[..remaining])
                 .await
                 .with_context(|| format!("Failed to read file chunk {}", i))?;
             if n == 0 {
-                break;
+                return Err(anyhow::anyhow!("源文件在发送期间被截断，文件未完整发送"));
             }
 
-            let is_last =
-                n < FILE_CHUNK_SIZE || (file_size as usize) <= ((i as usize + 1) * FILE_CHUNK_SIZE);
+            sent_bytes = sent_bytes
+                .checked_add(n as u64)
+                .context("Outgoing file byte count overflow")?;
+            let is_last = sent_bytes == file_size;
             let msg_type = if is_last { "file_end" } else { "file_chunk" };
             let known_peers: &[PeerEntry] = if i == 0 { peers_list.as_slice() } else { &[] };
             base64_encode_into(&buf[..n], &mut content_buf);
@@ -2144,19 +2258,22 @@ async fn send_file_in_background_inner(
                 .map_err(|error| file_send_connection_error(error, peer))?;
             i += 1;
 
-            let sent = std::cmp::min((i as usize) * FILE_CHUNK_SIZE, file_size as usize) as u64;
             if last_progress_emit.elapsed() >= FILE_PROGRESS_INTERVAL {
                 let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
-                let speed = (sent as f64 / elapsed) as u64;
+                let speed = (sent_bytes as f64 / elapsed) as u64;
                 emit_file_progress(
                     &app_handle,
                     file_name,
                     client_msg_id.as_deref(),
-                    sent,
+                    sent_bytes,
                     file_size,
                     speed,
                 );
                 last_progress_emit = std::time::Instant::now();
+            }
+
+            if is_last {
+                break;
             }
         }
     }
@@ -2164,6 +2281,17 @@ async fn send_file_in_background_inner(
         .flush()
         .await
         .map_err(|error| file_send_connection_error(error, peer))?;
+    if requires_message_ack(client_msg_id.as_deref(), &peer.software_version)
+        && !wait_for_message_ack(&mut stream, client_msg_id.as_deref()).await
+    {
+        warn!(
+            "Required file ack missing from {} for {:?}",
+            peer.id, client_msg_id
+        );
+        return Err(anyhow::anyhow!(
+            "对方未确认文件完整接收，文件将标记为发送失败"
+        ));
+    }
 
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
     let speed = (file_size as f64 / elapsed) as u64;
@@ -2198,8 +2326,14 @@ async fn send_file_in_background_inner(
         } else {
             format!("📎 {}", file_name)
         };
+        let delivery_state =
+            if requires_message_ack(client_msg_id.as_deref(), &peer.software_version) {
+                Some(true)
+            } else {
+                None
+            };
         let saved = db
-            .save_message_dedup(
+            .save_message_dedup_with_delivery(
                 &my_id,
                 &my_name,
                 &peer.id,
@@ -2209,6 +2343,7 @@ async fn send_file_in_background_inner(
                 Some(file_name),
                 Some(file_size as i64),
                 client_msg_id.as_deref(),
+                delivery_state,
             )
             .await?;
         emit_contact_message_updated(&app_handle, &peer.id, saved.clone());
@@ -2261,13 +2396,18 @@ async fn send_file_in_background_inner(
             timestamp: chrono::Utc::now().to_rfc3339(),
             is_read: true,
             client_msg_id,
+            delivered: None,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_self_peer, safe_received_file_name, LocalPeerId, Peer};
+    use super::{
+        checked_received_size, is_self_peer, peer_supports_message_ack, requires_message_ack,
+        safe_received_file_name, wait_for_message_ack_with_timeout, LocalPeerId, Peer,
+    };
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn local_peer_id_updates_all_clones() {
@@ -2310,5 +2450,72 @@ mod tests {
             "photo.jpg"
         );
         assert_eq!(safe_received_file_name(""), "unknown");
+    }
+
+    #[test]
+    fn message_ack_capability_requires_supported_semver() {
+        assert!(!peer_supports_message_ack(""));
+        assert!(!peer_supports_message_ack("not-a-version"));
+        assert!(!peer_supports_message_ack("0.1.9"));
+        assert!(!peer_supports_message_ack("0.2.0-beta.1"));
+        assert!(peer_supports_message_ack("0.2.0"));
+        assert!(peer_supports_message_ack("v0.2.1"));
+        assert!(peer_supports_message_ack("1.0.0"));
+
+        assert!(requires_message_ack(Some("message-1"), "0.2.0"));
+        assert!(!requires_message_ack(Some("message-1"), "0.1.0"));
+        assert!(!requires_message_ack(Some("  "), "0.2.0"));
+        assert!(!requires_message_ack(None, "0.2.0"));
+    }
+
+    #[test]
+    fn incoming_file_size_cannot_exceed_declared_bytes() {
+        assert_eq!(checked_received_size(4, 6, 10).unwrap(), 10);
+        assert!(checked_received_size(4, 7, 10).is_err());
+        assert!(checked_received_size(u64::MAX, 1, u64::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn message_ack_must_match_client_msg_id() {
+        let (mut reader, mut writer) = tokio::io::duplex(2048);
+        let ack = serde_json::json!({
+            "sender_id": "peer",
+            "sender_name": "Peer",
+            "sender_department": "",
+            "sender_port": 9527,
+            "receiver_id": "me",
+            "content": "",
+            "msg_type": "message_ack",
+            "file_name": null,
+            "file_size": null,
+            "file_data": null,
+            "client_msg_id": "other-message"
+        });
+        writer
+            .write_all(format!("{}\n", ack).as_bytes())
+            .await
+            .unwrap();
+
+        assert!(
+            !wait_for_message_ack_with_timeout(
+                &mut reader,
+                Some("message-1"),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn message_ack_timeout_is_not_success() {
+        let (mut reader, _writer) = tokio::io::duplex(64);
+        assert!(
+            !wait_for_message_ack_with_timeout(
+                &mut reader,
+                Some("message-1"),
+                std::time::Duration::from_millis(10),
+            )
+            .await
+        );
     }
 }

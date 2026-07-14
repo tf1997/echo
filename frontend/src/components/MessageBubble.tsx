@@ -33,6 +33,7 @@ export interface ForwardCardItem {
 interface MessageBubbleProps {
   message: ChatMessage;
   isOwn: boolean;
+  isGroup?: boolean;
   showSender?: boolean;
   highlighted?: boolean;
   searchQuery?: string;
@@ -42,6 +43,11 @@ interface MessageBubbleProps {
   onToggleSelect?: (message: ChatMessage) => void;
   onStartForward?: (message: ChatMessage) => void;
   onAddSticker?: (message: ChatMessage) => Promise<void> | void;
+}
+
+function getDeliveryStatusText(message: ChatMessage, isGroup: boolean): string {
+  if (isGroup || message.delivered == null) return "已发送";
+  return message.delivered ? "已送达" : "等待对方上线";
 }
 
 export function DateDivider({ date }: { date: string }) {
@@ -431,7 +437,7 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
   );
 }
 
-export function MessageBubbleImpl({ message, isOwn, showSender = false, highlighted = false, searchQuery = "", activeSearchHitId, selectMode = false, selected = false, onToggleSelect, onStartForward, onAddSticker }: MessageBubbleProps) {
+export function MessageBubbleImpl({ message, isOwn, isGroup = false, showSender = false, highlighted = false, searchQuery = "", activeSearchHitId, selectMode = false, selected = false, onToggleSelect, onStartForward, onAddSticker }: MessageBubbleProps) {
   const isNudge = message.msg_type === MESSAGE_TYPE_NUDGE;
   const isRps = message.msg_type === MESSAGE_TYPE_RPS;
   const isSticker = message.msg_type === "sticker";
@@ -671,7 +677,7 @@ export function MessageBubbleImpl({ message, isOwn, showSender = false, highligh
           )}
         </div>
         <span className={`message-meta ${isOwn ? "mr-1" : "ml-1"}`}>
-          {formatTime(message.timestamp)}
+          {formatTime(message.timestamp)}{isOwn ? ` · ${getDeliveryStatusText(message, isGroup)}` : ""}
         </span>
       </div>
     </div>

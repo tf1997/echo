@@ -143,7 +143,8 @@ function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
       a.file_size !== b.file_size ||
       a.timestamp !== b.timestamp ||
       a.is_read !== b.is_read ||
-      a.client_msg_id !== b.client_msg_id
+      a.client_msg_id !== b.client_msg_id ||
+      a.delivered !== b.delivered
     ) {
       return false;
     }
@@ -982,10 +983,10 @@ function App() {
             void selectGroupRef.current(groupId);
           }
         }
-        if (activeGroup) {
-          if (payload.message) {
-            setMessages((currentMessages) => mergeMessageIntoList(currentMessages, payload.message!));
-          }
+        if (activeGroup && payload.message) {
+          setMessages((currentMessages) => mergeMessageIntoList(currentMessages, payload.message!));
+        }
+        if (activeGroup && document.hasFocus()) {
           markGroupRead(groupId)
             .then(() => listGroups())
             .then(setGroups)
@@ -1010,10 +1011,10 @@ function App() {
           void selectIncomingNudgePeer(peerId);
         }
       }
-      if (activeContact) {
-        if (payload.message) {
-          setMessages((currentMessages) => mergeMessageIntoList(currentMessages, payload.message!));
-        }
+      if (activeContact && payload.message) {
+        setMessages((currentMessages) => mergeMessageIntoList(currentMessages, payload.message!));
+      }
+      if (activeContact && document.hasFocus()) {
         markRead(peerId)
           .then(() => loadPeerState())
           .catch(console.error);

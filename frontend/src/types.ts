@@ -44,6 +44,7 @@ export interface ChatMessage {
   timestamp: string;
   is_read: boolean;
   client_msg_id?: string | null;
+  delivered?: boolean | null;
 }
 
 export interface AppInfo {

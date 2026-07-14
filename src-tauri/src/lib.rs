@@ -579,8 +579,14 @@ pub fn run() {
                                         .await;
                                     let db = state.db.clone();
                                     let pid = id.clone();
+                                    let delivery_app_handle = app_handle.clone();
                                     tauri::async_runtime::spawn(async move {
-                                        crate::commands::deliver_pending_to_peer(&db, &pid).await;
+                                        crate::commands::deliver_pending_to_peer(
+                                            &db,
+                                            &pid,
+                                            &delivery_app_handle,
+                                        )
+                                        .await;
                                     });
                                     if software_version.is_empty() || mac_address.is_empty() {
                                         let should_probe = metadata_probe_last

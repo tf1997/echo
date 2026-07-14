@@ -11,10 +11,11 @@ use tauri::{AppHandle, Manager, State};
 use crate::chat::{
     base64_encode_into, base64_encoded_capacity, cancel_outgoing_file_transfer,
     clear_outgoing_file_transfer, emit_contact_message_updated, is_self_peer,
-    pause_outgoing_file_transfer, register_outgoing_file_transfer, resume_outgoing_file_transfer,
-    send_file_in_background_with_kind, serialize_file_wire_message_line,
-    wait_for_outgoing_file_transfer, FileWireMessageLine, WireMessage, FILE_CHUNK_SIZE,
-    FILE_SOCKET_BUFFER_SIZE, FILE_TRANSFER_CANCELLED_MESSAGE,
+    pause_outgoing_file_transfer, register_outgoing_file_transfer, requires_message_ack,
+    resume_outgoing_file_transfer, send_file_in_background_with_kind,
+    serialize_file_wire_message_line, wait_for_message_ack, wait_for_outgoing_file_transfer,
+    FileWireMessageLine, WireMessage, FILE_CHUNK_SIZE, FILE_SOCKET_BUFFER_SIZE,
+    FILE_TRANSFER_CANCELLED_MESSAGE,
 };
 use crate::db::{ChatMessage, StoredPeer, UnreadCount, UserProfile};
 use crate::discovery::Peer;
@@ -1097,7 +1098,7 @@ async fn send_file_with_kind(
 
         let _ = db.add_recent_contact(&peer.id).await;
         let mut saved = db
-            .save_message_dedup(
+            .save_message_dedup_with_delivery(
                 &my_id,
                 &my_name,
                 &peer.id,
@@ -1107,6 +1108,7 @@ async fn send_file_with_kind(
                 Some(&file_name),
                 Some(file_size),
                 client_msg_id.as_deref(),
+                Some(true),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -1197,6 +1199,7 @@ async fn send_file_with_kind(
         timestamp: Utc::now().to_rfc3339(),
         is_read: true,
         client_msg_id,
+        delivered: None,
     })
 }
 
@@ -2741,30 +2744,9 @@ pub async fn send_group_message_typed(
         }
     };
 
-    let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
-    let empty_dir: Vec<crate::discovery::PeerEntry> = Vec::new();
-    let (_delivered, _queued, failed) = send_or_queue_notification(
-        state.db.as_ref(),
-        &online_peers,
-        &target_ids,
-        &my_id,
-        &my_node_id,
-        &my_name,
-        &my_department,
-        listen_port,
-        &content,
-        &msg_type,
-        Some(&group_id),
-        None,
-        Some(client_msg_id.as_str()),
-        &empty_dir,
-    )
-    .await;
-
-    if failed > 0 {
-        return Err(format!("{} 名群成员消息未能发送或入队，请稍后重试", failed));
-    }
-
+    // Persist first so a slow/offline member can never make the sender's own
+    // message disappear. Receiver-side client_msg_id dedup keeps background
+    // retries safe when an ACK is lost.
     let msg = state
         .db
         .save_group_message_dedup(
@@ -2783,6 +2765,25 @@ pub async fn send_group_message_typed(
         .map_err(|e| e.to_string())?;
 
     crate::chat::emit_group_message_updated(&app_handle, &group_id, msg.clone());
+
+    let target_ids: Vec<String> = members.iter().map(|m| m.peer_id.clone()).collect();
+    spawn_send_or_queue_notification(
+        state.db.clone(),
+        online_peers,
+        target_ids,
+        my_id,
+        my_node_id,
+        my_name,
+        my_department,
+        listen_port,
+        content,
+        msg_type,
+        Some(group_id),
+        None,
+        Some(client_msg_id),
+        Vec::new(),
+    );
+
     Ok(msg)
 }
 
@@ -3182,6 +3183,7 @@ async fn send_group_file_with_kind(
     let bg_pending_cache = pending_cache.clone();
 
     tauri::async_runtime::spawn(async move {
+        let mut had_delivery_failure = false;
         for member in bg_members {
             if member.peer_id == bg_my_id {
                 continue;
@@ -3202,17 +3204,20 @@ async fn send_group_file_with_kind(
             let target_id = member.peer_id.clone();
             let target_name = member.username.clone();
             let target_department = member.department.clone();
+            let target_software_version =
+                resolve_peer_software_version(&target_id, bg_db.as_ref(), &bg_online_peers).await;
             let resolved_addr =
                 resolve_peer_addr(&target_id, bg_db.as_ref(), &bg_online_peers).await;
 
             if let Some((ip, port)) = resolved_addr {
-                let peer = crate::discovery::Peer::new(
+                let mut peer = crate::discovery::Peer::new(
                     target_id.clone(),
                     target_name,
                     target_department,
                     ip,
                     port,
                 );
+                peer.software_version = target_software_version;
                 match send_group_file_to_peer_with_progress(
                     &bg_file_path,
                     &bg_file_name,
@@ -3243,7 +3248,16 @@ async fn send_group_file_with_kind(
                         return;
                     }
                     Err(e) => {
+                        had_delivery_failure = true;
                         log::error!("Group file send failed to {}: {}", peer.id, e);
+                        let _ = bg_error_handle.emit_all(
+                            "file-error",
+                            serde_json::json!({
+                                "fileName": bg_file_name.as_str(),
+                                "clientMsgId": bg_client_msg_id.as_deref(),
+                                "error": e.as_str(),
+                            }),
+                        );
                         if let Err(queue_err) = queue_group_file_for_peer(
                             bg_db.as_ref(),
                             &bg_file_path,
@@ -3295,6 +3309,7 @@ async fn send_group_file_with_kind(
                 )
                 .await
                 {
+                    had_delivery_failure = true;
                     log::error!("Failed to queue group file for {}: {}", target_id, e);
                     let _ = bg_error_handle.emit_all(
                         "file-error",
@@ -3354,16 +3369,18 @@ async fn send_group_file_with_kind(
         };
         crate::chat::emit_group_message_updated(&bg_handle, &bg_group_id, saved);
 
-        let _ = bg_handle.emit_all(
-            "file-progress",
-            serde_json::json!({
-                "fileName": bg_file_name.as_str(),
-                "clientMsgId": bg_client_msg_id.as_deref(),
-                "sent": file_size,
-                "total": file_size,
-                "speed": 0,
-            }),
-        );
+        if !had_delivery_failure {
+            let _ = bg_handle.emit_all(
+                "file-progress",
+                serde_json::json!({
+                    "fileName": bg_file_name.as_str(),
+                    "clientMsgId": bg_client_msg_id.as_deref(),
+                    "sent": file_size,
+                    "total": file_size,
+                    "speed": 0,
+                }),
+            );
+        }
         clear_outgoing_file_transfer(bg_client_msg_id.as_deref()).await;
     });
 
@@ -3380,6 +3397,7 @@ async fn send_group_file_with_kind(
         timestamp: Utc::now().to_rfc3339(),
         is_read: true,
         client_msg_id,
+        delivered: None,
     })
 }
 
@@ -3423,7 +3441,13 @@ async fn send_group_file_to_peer_with_progress(
         }),
     );
 
-    send_group_file_payloads_over_tcp_controlled(&peer.address(), &transfer, client_msg_id).await?;
+    send_group_file_payloads_over_tcp_controlled(
+        &peer.address(),
+        &transfer,
+        client_msg_id,
+        &peer.software_version,
+    )
+    .await?;
 
     let _ = app_handle.emit_all(
         "file-progress",
@@ -3616,16 +3640,24 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
 }
 
 /// Deliver pending notifications (any kind) to a peer that just came back online.
-pub async fn deliver_pending_to_peer(db: &crate::db::Database, peer_id_str: &str) {
+pub async fn deliver_pending_to_peer(
+    db: &crate::db::Database,
+    peer_id_str: &str,
+    app_handle: &AppHandle,
+) {
     if !try_begin_pending_delivery(peer_id_str).await {
         log::debug!("Skipping concurrent pending delivery for {}", peer_id_str);
         return;
     }
-    deliver_pending_to_peer_inner(db, peer_id_str).await;
+    deliver_pending_to_peer_inner(db, peer_id_str, app_handle).await;
     finish_pending_delivery(peer_id_str).await;
 }
 
-async fn deliver_pending_to_peer_inner(db: &crate::db::Database, peer_id_str: &str) {
+async fn deliver_pending_to_peer_inner(
+    db: &crate::db::Database,
+    peer_id_str: &str,
+    app_handle: &AppHandle,
+) {
     // Resolve peer address.
     let stored = match db.get_stored_peer(peer_id_str).await {
         Ok(Some(p)) => p,
@@ -3662,14 +3694,72 @@ async fn deliver_pending_to_peer_inner(db: &crate::db::Database, peer_id_str: &s
         if notifs.is_empty() {
             continue;
         }
-        let delivered_notif_ids = deliver_pending_payloads_over_tcp(&addr, &notifs).await;
+        let delivered_notif_ids =
+            deliver_pending_payloads_over_tcp(&addr, &notifs, &stored.software_version).await;
         if !delivered_notif_ids.is_empty() {
-            let _ = db.delete_pending_notifications(&delivered_notif_ids).await;
+            let delivered_ids: HashSet<i64> = delivered_notif_ids.iter().copied().collect();
+            let mut removable_ids = Vec::with_capacity(delivered_notif_ids.len());
+            for (id, _kind, payload) in &notifs {
+                if !delivered_ids.contains(id) {
+                    continue;
+                }
+
+                let mut delivery_state_updated = true;
+                if let Ok(wire_message) = serde_json::from_str::<WireMessage>(payload) {
+                    if wire_message.group_id.is_none() {
+                        if let Some(client_msg_id) = wire_message
+                            .client_msg_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            let delivery_state = if requires_message_ack(
+                                Some(client_msg_id),
+                                &stored.software_version,
+                            ) {
+                                Some(true)
+                            } else {
+                                None
+                            };
+                            match db
+                                .update_private_message_delivery(
+                                    &wire_message.sender_id,
+                                    client_msg_id,
+                                    delivery_state,
+                                )
+                                .await
+                            {
+                                Ok(Some(saved)) => {
+                                    emit_contact_message_updated(app_handle, peer_id_str, saved)
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    delivery_state_updated = false;
+                                    log::error!(
+                                        "Failed to update delivery state for {}: {}",
+                                        client_msg_id,
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if delivery_state_updated {
+                    removable_ids.push(*id);
+                }
+            }
+
+            if !removable_ids.is_empty() {
+                let _ = db.delete_pending_notifications(&removable_ids).await;
+            }
             log::info!(
-                "Delivered {} pending notifs to {} (queued under {})",
+                "Delivered {} pending notifs to {} (queued under {}, removed {})",
                 delivered_notif_ids.len(),
                 peer_id_str,
-                owner_id
+                owner_id,
+                removable_ids.len()
             );
         }
     }
@@ -3695,7 +3785,7 @@ async fn deliver_pending_to_peer_inner(db: &crate::db::Database, peer_id_str: &s
             "known_peers": [], "file_name": null, "file_size": null, "file_data": null,
         });
         let json = serde_json::to_string(&wm).unwrap_or_default();
-        if deliver_over_tcp(&addr, &json, None).await {
+        if deliver_over_tcp(&addr, &json, None, &stored.software_version).await {
             delivered.push(p.id);
         }
     }
@@ -3735,7 +3825,8 @@ async fn deliver_pending_file_transfers_to_peer(
             continue;
         }
 
-        let ok = send_group_file_payloads_over_tcp(&addr, &transfer).await;
+        let ok =
+            send_group_file_payloads_over_tcp(&addr, &transfer, &stored.software_version).await;
         if !ok {
             log::error!(
                 "Failed to deliver pending group file {} to {}",
@@ -3766,8 +3857,9 @@ async fn deliver_pending_file_transfers_to_peer(
 async fn send_group_file_payloads_over_tcp(
     addr: &str,
     transfer: &crate::db::PendingFileTransfer,
+    peer_software_version: &str,
 ) -> bool {
-    send_group_file_payloads_over_tcp_controlled(addr, transfer, None)
+    send_group_file_payloads_over_tcp_controlled(addr, transfer, None, peer_software_version)
         .await
         .is_ok()
 }
@@ -3776,6 +3868,7 @@ async fn send_group_file_payloads_over_tcp_controlled(
     addr: &str,
     transfer: &crate::db::PendingFileTransfer,
     client_msg_id: Option<&str>,
+    peer_software_version: &str,
 ) -> Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let stored_client_msg_id = transfer.client_msg_id.trim();
@@ -3791,6 +3884,18 @@ async fn send_group_file_payloads_over_tcp_controlled(
         .await
         .map_err(|e| e.to_string())?;
 
+    let declared_file_size =
+        u64::try_from(transfer.file_size).map_err(|_| "文件大小无效，无法发送".to_string())?;
+    let actual_file_size = tokio::fs::metadata(&transfer.file_path)
+        .await
+        .map_err(|error| error.to_string())?
+        .len();
+    if actual_file_size != declared_file_size {
+        return Err(format!(
+            "源文件大小已变化（当前 {} 字节，预期 {} 字节）",
+            actual_file_size, declared_file_size
+        ));
+    }
     let mut file = match tokio::fs::File::open(&transfer.file_path).await {
         Ok(file) => file,
         Err(error) => return Err(error.to_string()),
@@ -3813,8 +3918,8 @@ async fn send_group_file_payloads_over_tcp_controlled(
     let mut payload = Vec::with_capacity(content_buf.capacity() + 1024);
     let sender_software_version = crate::profile_metadata::software_version();
     let sender_mac_address = crate::profile_metadata::mac_address();
-    let mut chunk_index: usize = 0;
-    if transfer.file_size == 0 {
+    let mut sent_bytes: u64 = 0;
+    if declared_file_size == 0 {
         wait_for_outgoing_file_transfer(client_msg_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -3833,7 +3938,7 @@ async fn send_group_file_payloads_over_tcp_controlled(
                 content: &content_buf,
                 msg_type: "file_end",
                 file_name: &transfer.file_name,
-                file_size: 0,
+                file_size: declared_file_size,
                 file_kind: &transfer.file_kind,
                 known_peers: &[],
                 group_id: Some(&transfer.group_id),
@@ -3847,18 +3952,21 @@ async fn send_group_file_payloads_over_tcp_controlled(
             return Err(format!("Failed to write to {}", addr));
         }
     } else {
-        loop {
+        while sent_bytes < declared_file_size {
             wait_for_outgoing_file_transfer(client_msg_id)
                 .await
                 .map_err(|e| e.to_string())?;
 
-            let n = match file.read(&mut buf).await {
-                Ok(0) => break,
+            let remaining = (declared_file_size - sent_bytes).min(buf.len() as u64) as usize;
+            let n = match file.read(&mut buf[..remaining]).await {
+                Ok(0) => return Err("源文件在发送期间被截断，文件未完整发送".to_string()),
                 Ok(n) => n,
                 Err(error) => return Err(error.to_string()),
             };
-            let is_last = n < FILE_CHUNK_SIZE
-                || (transfer.file_size as usize) <= ((chunk_index + 1) * FILE_CHUNK_SIZE);
+            sent_bytes = sent_bytes
+                .checked_add(n as u64)
+                .ok_or_else(|| "文件发送字节计数溢出".to_string())?;
+            let is_last = sent_bytes == declared_file_size;
             let msg_type = if is_last { "file_end" } else { "file_chunk" };
             base64_encode_into(&buf[..n], &mut content_buf);
             if let Err(error) = serialize_file_wire_message_line(
@@ -3875,7 +3983,7 @@ async fn send_group_file_payloads_over_tcp_controlled(
                     content: &content_buf,
                     msg_type,
                     file_name: &transfer.file_name,
-                    file_size: transfer.file_size as u64,
+                    file_size: declared_file_size,
                     file_kind: &transfer.file_kind,
                     known_peers: &[],
                     group_id: Some(&transfer.group_id),
@@ -3888,11 +3996,19 @@ async fn send_group_file_payloads_over_tcp_controlled(
             if stream.write_all(&payload).await.is_err() {
                 return Err(format!("Failed to write to {}", addr));
             }
-            chunk_index += 1;
+            if is_last {
+                break;
+            }
         }
     }
 
-    stream.flush().await.map_err(|e| e.to_string())
+    stream.flush().await.map_err(|e| e.to_string())?;
+    if requires_message_ack(wire_client_msg_id, peer_software_version)
+        && !wait_for_message_ack(&mut stream, wire_client_msg_id).await
+    {
+        return Err("对方未确认文件完整接收，文件将保留并稍后重试".to_string());
+    }
+    Ok(())
 }
 
 fn emoji_dir() -> std::path::PathBuf {
@@ -3947,9 +4063,14 @@ pub(crate) fn build_notification_json(
     .to_string()
 }
 
-/// Try a TCP delivery with a 2s timeout. Returns true if the payload was written.
-/// Newer peers may respond with `message_ack`; older peers are still accepted.
-async fn deliver_over_tcp(addr: &str, json: &str, client_msg_id: Option<&str>) -> bool {
+/// Try a TCP delivery with a 2s connect timeout. ACK-capable peers must confirm
+/// messages carrying a client id; legacy peers retain write-complete semantics.
+async fn deliver_over_tcp(
+    addr: &str,
+    json: &str,
+    client_msg_id: Option<&str>,
+    peer_software_version: &str,
+) -> bool {
     match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::net::TcpStream::connect(addr),
@@ -3957,39 +4078,22 @@ async fn deliver_over_tcp(addr: &str, json: &str, client_msg_id: Option<&str>) -
     .await
     {
         Ok(Ok(mut stream)) => {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            use tokio::io::AsyncWriteExt;
             if stream.write_all(json.as_bytes()).await.is_err()
                 || stream.write_all(b"\n").await.is_err()
                 || stream.flush().await.is_err()
             {
                 return false;
             }
-            let Some(expected_client_msg_id) = client_msg_id
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
+            if !requires_message_ack(client_msg_id, peer_software_version) {
                 return true;
-            };
-            let mut reader = BufReader::new(&mut stream);
-            let mut line = String::new();
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(180),
-                reader.read_line(&mut line),
-            )
-            .await
-            {
-                Ok(Ok(bytes_read)) if bytes_read > 0 => {
-                    let line_for_parse = line.trim_end_matches('\n').trim_end_matches('\r');
-                    if let Ok(msg) = serde_json::from_str::<WireMessage>(line_for_parse) {
-                        if msg.msg_type == "message_ack"
-                            && msg.client_msg_id.as_deref() == Some(expected_client_msg_id)
-                        {
-                            log::debug!("Delivery ack received from {}", addr);
-                        }
-                    }
-                    true
-                }
-                _ => true,
+            }
+            if wait_for_message_ack(&mut stream, client_msg_id).await {
+                log::debug!("Delivery ack received from {}", addr);
+                true
+            } else {
+                log::warn!("Required delivery ack missing from {}", addr);
+                false
             }
         }
         _ => false,
@@ -3999,6 +4103,7 @@ async fn deliver_over_tcp(addr: &str, json: &str, client_msg_id: Option<&str>) -
 async fn deliver_pending_payloads_over_tcp(
     addr: &str,
     payloads: &[(i64, String, String)],
+    peer_software_version: &str,
 ) -> Vec<i64> {
     if payloads.is_empty() {
         return Vec::new();
@@ -4015,7 +4120,7 @@ async fn deliver_pending_payloads_over_tcp(
         return delivered;
     };
 
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::AsyncWriteExt;
     for (id, _kind, payload) in payloads {
         if stream.write_all(payload.as_bytes()).await.is_err()
             || stream.write_all(b"\n").await.is_err()
@@ -4033,29 +4138,19 @@ async fn deliver_pending_payloads_over_tcp(
                     .filter(|id| !id.is_empty())
                     .map(str::to_string)
             });
-        if let Some(expected_client_msg_id) = expected_client_msg_id.as_deref() {
-            let mut reader = BufReader::new(&mut stream);
-            let mut line = String::new();
-            if let Ok(Ok(bytes_read)) = tokio::time::timeout(
-                std::time::Duration::from_millis(180),
-                reader.read_line(&mut line),
-            )
-            .await
-            {
-                if bytes_read > 0 {
-                    let line_for_parse = line.trim_end_matches('\n').trim_end_matches('\r');
-                    if let Ok(msg) = serde_json::from_str::<WireMessage>(line_for_parse) {
-                        if msg.msg_type == "message_ack"
-                            && msg.client_msg_id.as_deref() == Some(expected_client_msg_id)
-                        {
-                            log::debug!(
-                                "Pending delivery ack received for {}",
-                                expected_client_msg_id
-                            );
-                        }
-                    }
-                }
+        if requires_message_ack(expected_client_msg_id.as_deref(), peer_software_version) {
+            if !wait_for_message_ack(&mut stream, expected_client_msg_id.as_deref()).await {
+                log::warn!(
+                    "Required pending delivery ack missing from {} for {:?}",
+                    addr,
+                    expected_client_msg_id
+                );
+                break;
             }
+            log::debug!(
+                "Pending delivery ack received for {}",
+                expected_client_msg_id.as_deref().unwrap_or_default()
+            );
         }
         delivered.push(*id);
     }
@@ -4103,57 +4198,68 @@ pub async fn send_or_queue_notification(
     client_msg_id: Option<&str>,
     known_peers: &[crate::discovery::PeerEntry],
 ) -> (usize, usize, usize) {
-    let mut delivered = 0usize;
-    let mut queued = 0usize;
-    let mut failed = 0usize;
+    let outcomes = futures::future::join_all(
+        target_peer_ids
+            .iter()
+            .filter(|peer_id| peer_id.as_str() != self_id)
+            .map(|peer_id| async move {
+                let receiver_node_id = resolve_peer_node_id(peer_id, db, online_peers).await;
+                let json = build_notification_json(
+                    self_id,
+                    self_node_id,
+                    self_name,
+                    self_department,
+                    self_port,
+                    peer_id,
+                    &receiver_node_id,
+                    content,
+                    kind,
+                    group_id,
+                    file_name,
+                    client_msg_id,
+                    known_peers,
+                );
 
-    for pid in target_peer_ids {
-        if pid == self_id {
-            continue;
-        }
+                let peer_software_version =
+                    resolve_peer_software_version(peer_id, db, online_peers).await;
+                let delivered = match resolve_peer_addr(peer_id, db, online_peers).await {
+                    Some((ip, port)) => {
+                        let addr = format!("{}:{}", ip, port);
+                        deliver_over_tcp(&addr, &json, client_msg_id, &peer_software_version).await
+                    }
+                    None => false,
+                };
 
-        let receiver_node_id = resolve_peer_node_id(pid, db, online_peers).await;
-        let json = build_notification_json(
-            self_id,
-            self_node_id,
-            self_name,
-            self_department,
-            self_port,
-            pid,
-            &receiver_node_id,
-            content,
-            kind,
-            group_id,
-            file_name,
-            client_msg_id,
-            known_peers,
-        );
-
-        let ok = match resolve_peer_addr(pid, db, online_peers).await {
-            Some((ip, port)) => {
-                let addr = format!("{}:{}", ip, port);
-                deliver_over_tcp(&addr, &json, client_msg_id).await
-            }
-            None => false,
-        };
-
-        if ok {
-            delivered += 1;
-        } else {
-            match db.queue_pending_notification(pid, kind, &json).await {
-                Ok(()) => queued += 1,
-                Err(error) => {
-                    failed += 1;
-                    log::error!(
-                        "Failed to queue notification '{}' for {}: {}",
-                        kind,
-                        pid,
-                        error
-                    );
+                if delivered {
+                    return (1usize, 0usize, 0usize);
                 }
-            }
-        }
-    }
+
+                match db.queue_pending_notification(peer_id, kind, &json).await {
+                    Ok(()) => (0, 1, 0),
+                    Err(error) => {
+                        log::error!(
+                            "Failed to queue notification '{}' for {}: {}",
+                            kind,
+                            peer_id,
+                            error
+                        );
+                        (0, 0, 1)
+                    }
+                }
+            }),
+    )
+    .await;
+
+    let (delivered, queued, failed) = outcomes.into_iter().fold(
+        (0usize, 0usize, 0usize),
+        |(delivered, queued, failed), (next_delivered, next_queued, next_failed)| {
+            (
+                delivered + next_delivered,
+                queued + next_queued,
+                failed + next_failed,
+            )
+        },
+    );
 
     if queued > 0 || failed > 0 {
         log::info!(
@@ -4182,6 +4288,24 @@ async fn resolve_peer_node_id(
         .ok()
         .flatten()
         .map(|peer| peer.node_id)
+        .unwrap_or_default()
+}
+
+async fn resolve_peer_software_version(
+    peer_id: &str,
+    db: &crate::db::Database,
+    online_peers: &[Peer],
+) -> String {
+    if let Some(peer) = online_peers.iter().find(|peer| peer.id == peer_id) {
+        if !peer.software_version.trim().is_empty() {
+            return peer.software_version.clone();
+        }
+    }
+    db.get_stored_peer(peer_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|peer| peer.software_version)
         .unwrap_or_default()
 }
 
@@ -4300,7 +4424,55 @@ async fn build_member_directory(
 
 #[cfg(test)]
 mod pending_delivery_tests {
-    use super::{finish_pending_delivery, try_begin_pending_delivery};
+    use super::{
+        deliver_over_tcp, deliver_pending_payloads_over_tcp, finish_pending_delivery,
+        send_group_file_payloads_over_tcp_controlled, send_or_queue_notification,
+        try_begin_pending_delivery,
+    };
+    use crate::{
+        db::{Database, PendingFileTransfer},
+        discovery::Peer,
+    };
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::Barrier;
+
+    fn message_payload(client_msg_id: &str) -> String {
+        serde_json::json!({
+            "sender_id": "sender",
+            "sender_name": "Sender",
+            "sender_department": "",
+            "sender_port": 9527,
+            "receiver_id": "receiver",
+            "content": "hello",
+            "msg_type": "text",
+            "file_name": null,
+            "file_size": null,
+            "file_data": null,
+            "client_msg_id": client_msg_id
+        })
+        .to_string()
+    }
+
+    fn ack_payload(client_msg_id: &str) -> Vec<u8> {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "sender_id": "receiver",
+                "sender_name": "Receiver",
+                "sender_department": "",
+                "sender_port": 9527,
+                "receiver_id": "sender",
+                "content": "",
+                "msg_type": "message_ack",
+                "file_name": null,
+                "file_size": null,
+                "file_data": null,
+                "client_msg_id": client_msg_id
+            })
+        )
+        .into_bytes()
+    }
 
     #[tokio::test]
     async fn pending_delivery_is_single_flight_per_peer() {
@@ -4314,5 +4486,212 @@ mod pending_delivery_tests {
         finish_pending_delivery(other).await;
         assert!(try_begin_pending_delivery(peer).await);
         finish_pending_delivery(peer).await;
+    }
+
+    #[tokio::test]
+    async fn ack_capable_delivery_rejects_wrong_ack() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            reader
+                .get_mut()
+                .write_all(&ack_payload("another-message"))
+                .await
+                .unwrap();
+        });
+
+        assert!(
+            !deliver_over_tcp(
+                &addr,
+                &message_payload("message-1"),
+                Some("message-1"),
+                "0.2.0"
+            )
+            .await
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_delivery_succeeds_without_ack() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+        });
+
+        assert!(
+            deliver_over_tcp(
+                &addr,
+                &message_payload("message-1"),
+                Some("message-1"),
+                "0.1.0"
+            )
+            .await
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_delivery_only_marks_matching_acks_as_delivered() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            for ack_id in ["message-1", "wrong-message"] {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                reader
+                    .get_mut()
+                    .write_all(&ack_payload(ack_id))
+                    .await
+                    .unwrap();
+            }
+        });
+        let payloads = vec![
+            (1, "text".to_string(), message_payload("message-1")),
+            (2, "text".to_string(), message_payload("message-2")),
+        ];
+
+        let delivered = deliver_pending_payloads_over_tcp(&addr, &payloads, "0.2.0").await;
+
+        assert_eq!(delivered, vec![1]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_file_delivery_waits_for_matching_ack() {
+        let file_path =
+            std::env::temp_dir().join(format!("echo-task10-file-{}.txt", uuid::Uuid::new_v4()));
+        tokio::fs::write(&file_path, b"verified file bytes")
+            .await
+            .unwrap();
+        let transfer = PendingFileTransfer {
+            id: 1,
+            group_id: "group-1".to_string(),
+            peer_id: "receiver".to_string(),
+            sender_id: "sender".to_string(),
+            sender_name: "Sender".to_string(),
+            sender_department: "研发部".to_string(),
+            sender_port: 9527,
+            file_path: file_path.to_string_lossy().to_string(),
+            file_name: "verified.txt".to_string(),
+            file_size: 19,
+            file_kind: "file".to_string(),
+            client_msg_id: "file-message-1".to_string(),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let payload: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(payload["msg_type"], "file_end");
+            assert_eq!(payload["file_size"], 19);
+            reader
+                .get_mut()
+                .write_all(&ack_payload("file-message-1"))
+                .await
+                .unwrap();
+        });
+
+        let result = send_group_file_payloads_over_tcp_controlled(
+            &addr,
+            &transfer,
+            Some("file-message-1"),
+            "0.2.0",
+        )
+        .await;
+
+        assert!(result.is_ok());
+        server.await.unwrap();
+        let _ = tokio::fs::remove_file(file_path).await;
+    }
+
+    #[tokio::test]
+    async fn notification_fanout_connects_to_members_concurrently() {
+        let barrier = Arc::new(Barrier::new(2));
+        let mut peers = Vec::new();
+        let mut servers = Vec::new();
+
+        for index in 0..2 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let peer_id = format!("fanout-peer-{index}");
+            peers.push(Peer::new_with_profile(
+                peer_id,
+                format!("Peer {index}"),
+                String::new(),
+                "0.2.0".to_string(),
+                String::new(),
+                addr.ip(),
+                addr.port(),
+            ));
+
+            let server_barrier = Arc::clone(&barrier);
+            servers.push(tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let payload: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                let client_msg_id = payload["client_msg_id"].as_str().unwrap().to_string();
+
+                // Neither server ACKs until both connections have delivered their
+                // payload. A serial fanout would deadlock here until its ACK timeout.
+                server_barrier.wait().await;
+                reader
+                    .get_mut()
+                    .write_all(&ack_payload(&client_msg_id))
+                    .await
+                    .unwrap();
+            }));
+        }
+
+        let db_path =
+            std::env::temp_dir().join(format!("echo-task13-fanout-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(db_path.to_str().unwrap()).await.unwrap();
+        let target_ids: Vec<String> = peers.iter().map(|peer| peer.id.clone()).collect();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            send_or_queue_notification(
+                &db,
+                &peers,
+                &target_ids,
+                "sender",
+                "sender-node",
+                "Sender",
+                "研发部",
+                9527,
+                "hello group",
+                "text",
+                Some("group-1"),
+                None,
+                Some("fanout-message"),
+                &[],
+            ),
+        )
+        .await
+        .expect("fanout should not wait for members serially");
+
+        assert_eq!(result, (2, 0, 0));
+        for server in servers {
+            server.await.unwrap();
+        }
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
     }
 }

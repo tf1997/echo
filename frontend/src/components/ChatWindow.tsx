@@ -430,6 +430,9 @@ function getPendingStatusText(message: PendingMessage): string {
   if (message.status === "failed") {
     return message.error ? `发送失败：${message.error}` : "发送失败";
   }
+  if (message.status === "sent") {
+    return "发送完成，正在保存...";
+  }
   if (message.msg_type === "file" && message.progress !== undefined) {
     const speed = formatSpeed(message.speed);
     return speed ? `${message.progress}% ${speed}` : `${message.progress}%`;
@@ -645,24 +648,6 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       return changed ? nextMap : prev;
     });
   }, []);
-  const removePendingMessagesEverywhere = useCallback((matches: (message: PendingMessage) => boolean) => {
-    setPendingByConversation((prev) => {
-      let changed = false;
-      const nextMap = new Map(prev);
-      for (const [conversationKey, list] of prev) {
-        const nextList = list.filter((message) => !matches(message));
-        if (nextList.length !== list.length) {
-          changed = true;
-          if (nextList.length === 0) {
-            nextMap.delete(conversationKey);
-          } else {
-            nextMap.set(conversationKey, nextList);
-          }
-        }
-      }
-      return changed ? nextMap : prev;
-    });
-  }, []);
   const [showEmoji, setShowEmoji] = useState(false);
   const [emojiTab, setEmojiTab] = useState<"default" | "custom">("default");
   const [customEmojis, setCustomEmojis] = useState<string[]>([]);
@@ -801,8 +786,6 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   // 核心去重逻辑：通过 client_msg_id 自动清理已保存的 pending 消息
   useEffect(() => {
     setPendingMessages((prev) => prev.filter((p) => {
-      if (p.status === "failed") return true; // 保留失败的消息
-
       // 检查是否已经在数据库消息中（通过 client_msg_id 精确匹配）
       const exists = messages.some((m) =>
         m.client_msg_id && m.client_msg_id === p.clientMsgId
@@ -880,12 +863,6 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
           matchesFile,
           (message) => ({ ...message, progress: pct, speed, status: pct >= 100 ? "sent" as const : message.status })
         );
-        // Remove pending after 2s (real message will be in DB by then)
-        if (pct >= 100) {
-          setTimeout(() => {
-            removePendingMessagesEverywhere(matchesFile);
-          }, 2000);
-        }
       }).then(trackUnlisten);
 
       listen<{ fileName: string; clientMsgId?: string | null; error: string }>("file-error", (event) => {
@@ -901,7 +878,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       disposed = true;
       for (const unlisten of unlisteners.splice(0)) unlisten();
     };
-  }, [removePendingMessagesEverywhere, updatePendingMessagesEverywhere]);
+  }, [updatePendingMessagesEverywhere]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLDivElement>(null);
@@ -1187,36 +1164,32 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
 
   const retryText = useCallback(async (pending: PendingMessage) => {
     const conversationKey = pendingConversationKeyRef.current;
-    updatePendingMessagesForKey(conversationKey, (prev) => prev.filter((p) => p.id !== pending.id));
-    const newClientMsgId = generateClientMsgId();
+    updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
+      p.id === pending.id ? { ...p, status: "sending", error: undefined } : p
+    ));
     try {
-      await onSendMessage(pending.content, newClientMsgId);
-    } catch {
-      updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
-        ...pending,
-        id: ++pendingId,
-        clientMsgId: newClientMsgId,
-        status: "failed",
-        error: "重试失败",
-      }]);
+      await onSendMessage(pending.content, pending.clientMsgId);
+    } catch (error) {
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
+        p.id === pending.id ? { ...p, status: "failed", error: String(error || "重试失败") } : p
+      ));
     }
   }, [onSendMessage, updatePendingMessagesForKey]);
 
   const retryFile = useCallback(async (pending: PendingMessage) => {
     if (!pending.file_path) return;
     const conversationKey = pendingConversationKeyRef.current;
-    updatePendingMessagesForKey(conversationKey, (prev) => prev.filter((p) => p.id !== pending.id));
-    const newClientMsgId = generateClientMsgId();
+    updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
+      p.id === pending.id
+        ? { ...p, status: "sending", error: undefined, progress: 0, speed: undefined }
+        : p
+    ));
     try {
-      await onSendFile(pending.file_path, newClientMsgId, pending.file_name);
-    } catch {
-      updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
-        ...pending,
-        id: ++pendingId,
-        clientMsgId: newClientMsgId,
-        status: "failed",
-        error: "重试失败",
-      }]);
+      await onSendFile(pending.file_path, pending.clientMsgId, pending.file_name);
+    } catch (error) {
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
+        p.id === pending.id ? { ...p, status: "failed", error: String(error || "重试失败") } : p
+      ));
     }
   }, [onSendFile, updatePendingMessagesForKey]);
 
@@ -1265,29 +1238,22 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     if (!pending.file_path) return;
     const conversationKey = pendingConversationKeyRef.current;
     const name = pending.file_name || pending.file_path.replace(/\\/g, "/").split("/").pop() || "sticker";
-    updatePendingMessagesForKey(conversationKey, (prev) => prev.filter((p) => p.id !== pending.id));
-    const tempId = ++pendingId;
-    const newClientMsgId = generateClientMsgId();
-    updatePendingMessagesForKey(conversationKey, (prev) => [...prev, {
-      ...pending,
-      id: tempId,
-      clientMsgId: newClientMsgId,
-      file_name: name,
-      createdAt: Date.now(),
-      status: "sending",
-      error: undefined,
-    }]);
+    updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
+      p.id === pending.id
+        ? { ...p, file_name: name, status: "sending", error: undefined, progress: 0, speed: undefined }
+        : p
+    ));
     if (!isGroup && !peer?.online) {
       updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
-        p.id === tempId ? { ...p, status: "failed", error: "对方离线" } : p
+        p.id === pending.id ? { ...p, status: "failed", error: "对方离线" } : p
       ));
       return;
     }
     try {
-      await onSendSticker(pending.file_path, newClientMsgId);
+      await onSendSticker(pending.file_path, pending.clientMsgId);
     } catch (e) {
       updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
-        p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
+        p.id === pending.id ? { ...p, status: "failed", error: String(e) } : p
       ));
     }
   }, [isGroup, peer?.online, onSendSticker, updatePendingMessagesForKey]);
@@ -2171,6 +2137,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                   <MessageBubble
                     message={item}
                     isOwn={item.sender_id === myId}
+                    isGroup={isGroup}
                     showSender={isGroup}
                     highlighted={(searchMatchIds.has(item.id) && item.id === highlightedId) || contextHighlightId === item.id}
                     searchQuery={searchMatchIds.has(item.id) ? searchQuery : ""}

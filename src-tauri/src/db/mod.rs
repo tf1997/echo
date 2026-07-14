@@ -123,6 +123,11 @@ pub struct ChatMessage {
     pub is_read: bool,
     #[serde(default)]
     pub client_msg_id: Option<String>,
+    /// `Some(true)` means an ACK-capable peer confirmed persistence,
+    /// `Some(false)` means queued for retry, and `None` is legacy/unknown
+    /// write-complete semantics (shown as "sent", never "delivered").
+    #[serde(default)]
+    pub delivered: Option<bool>,
 }
 
 pub struct Database {
@@ -232,6 +237,7 @@ fn chat_message_from_row(row: &SqliteRow) -> ChatMessage {
         timestamp: row.get("timestamp"),
         is_read: row.get::<bool, _>("is_read"),
         client_msg_id: row.try_get("client_msg_id").ok(),
+        delivered: row.try_get("delivered").unwrap_or(None),
     }
 }
 
@@ -479,7 +485,8 @@ impl Database {
                 file_name TEXT,
                 file_size INTEGER,
                 timestamp TEXT NOT NULL,
-                is_read INTEGER NOT NULL DEFAULT 0
+                is_read INTEGER NOT NULL DEFAULT 0,
+                delivered INTEGER
             )",
         )
         .execute(&self.pool)
@@ -597,6 +604,19 @@ impl Database {
             let msg = error.to_string();
             if !msg.contains("duplicate column name") {
                 return Err(error).context("Failed to add client_msg_id to messages");
+            }
+        }
+
+        // Nullable tri-state delivery marker:
+        //   1 = ACK-confirmed, 0 = queued, NULL = legacy/unknown write-complete.
+        // Keeping historical rows NULL avoids claiming that old messages were delivered.
+        if let Err(error) = sqlx::query("ALTER TABLE messages ADD COLUMN delivered INTEGER")
+            .execute(&self.pool)
+            .await
+        {
+            let msg = error.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(error).context("Failed to add delivered to messages");
             }
         }
 
@@ -1485,7 +1505,7 @@ impl Database {
 
         let row = if let Some(group_id) = group_id {
             sqlx::query(
-                "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+                "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
                  FROM messages
                  WHERE sender_id = ? AND group_id = ? AND client_msg_id = ?
                  ORDER BY id ASC
@@ -1499,7 +1519,7 @@ impl Database {
             .context("Failed to find group message by client_msg_id")?
         } else {
             sqlx::query(
-                "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+                "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
                  FROM messages
                  WHERE sender_id = ? AND (group_id IS NULL OR group_id = '') AND client_msg_id = ?
                  ORDER BY id ASC
@@ -1595,6 +1615,7 @@ impl Database {
             timestamp,
             is_read,
             client_msg_id: client_msg_id.map(|s| s.to_string()),
+            delivered: None,
         })
     }
 
@@ -1634,9 +1655,9 @@ impl Database {
     ) -> Result<Vec<ChatMessage>> {
         let limit = normalize_message_limit(limit);
         let rows = sqlx::query(
-            "SELECT id, sender_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+            "SELECT id, sender_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM (
-                 SELECT id, sender_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+                 SELECT id, sender_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
                  FROM messages WHERE group_id = ? ORDER BY id DESC LIMIT ?
              ) AS recent_messages
              ORDER BY id ASC"
@@ -1656,6 +1677,7 @@ impl Database {
                 timestamp: r.get("timestamp"),
                 is_read: r.get::<bool, _>("is_read"),
                 client_msg_id: r.try_get("client_msg_id").ok(),
+                delivered: r.try_get("delivered").unwrap_or(None),
             })
             .collect())
     }
@@ -2398,14 +2420,7 @@ impl Database {
         file_size: Option<i64>,
         client_msg_id: Option<&str>,
     ) -> Result<ChatMessage> {
-        if let Some(existing) = self
-            .find_message_by_client_msg_id(sender_id, None, client_msg_id)
-            .await?
-        {
-            return Ok(existing);
-        }
-
-        self.save_message(
+        self.save_message_dedup_with_delivery(
             sender_id,
             sender_name,
             receiver_id,
@@ -2415,10 +2430,59 @@ impl Database {
             file_name,
             file_size,
             client_msg_id,
+            None,
         )
         .await
     }
 
+    pub async fn save_message_dedup_with_delivery(
+        &self,
+        sender_id: &str,
+        sender_name: &str,
+        receiver_id: &str,
+        content: &str,
+        msg_type: &str,
+        file_path: Option<&str>,
+        file_name: Option<&str>,
+        file_size: Option<i64>,
+        client_msg_id: Option<&str>,
+        delivered: Option<bool>,
+    ) -> Result<ChatMessage> {
+        if let Some(mut existing) = self
+            .find_message_by_client_msg_id(sender_id, None, client_msg_id)
+            .await?
+        {
+            // A retry may turn an already persisted queued row into an
+            // ACK-confirmed row. `None` never overwrites a known state because
+            // it represents legacy/unknown semantics rather than a transition.
+            if delivered.is_some() && existing.delivered != delivered {
+                sqlx::query("UPDATE messages SET delivered = ? WHERE id = ?")
+                    .bind(delivered)
+                    .bind(existing.id)
+                    .execute(&self.pool)
+                    .await
+                    .context("Failed to update deduplicated message delivery state")?;
+                existing.delivered = delivered;
+            }
+            return Ok(existing);
+        }
+
+        self.save_message_with_delivery(
+            sender_id,
+            sender_name,
+            receiver_id,
+            content,
+            msg_type,
+            file_path,
+            file_name,
+            file_size,
+            client_msg_id,
+            delivered,
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
     pub async fn save_message(
         &self,
         sender_id: &str,
@@ -2431,11 +2495,39 @@ impl Database {
         file_size: Option<i64>,
         client_msg_id: Option<&str>,
     ) -> Result<ChatMessage> {
+        self.save_message_with_delivery(
+            sender_id,
+            sender_name,
+            receiver_id,
+            content,
+            msg_type,
+            file_path,
+            file_name,
+            file_size,
+            client_msg_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn save_message_with_delivery(
+        &self,
+        sender_id: &str,
+        sender_name: &str,
+        receiver_id: &str,
+        content: &str,
+        msg_type: &str,
+        file_path: Option<&str>,
+        file_name: Option<&str>,
+        file_size: Option<i64>,
+        client_msg_id: Option<&str>,
+        delivered: Option<bool>,
+    ) -> Result<ChatMessage> {
         let timestamp = Utc::now().to_rfc3339();
 
         let result = sqlx::query(
-            "INSERT INTO messages (sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            "INSERT INTO messages (sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
              ON CONFLICT DO NOTHING"
         )
         .bind(sender_id)
@@ -2448,6 +2540,7 @@ impl Database {
         .bind(file_size)
         .bind(&timestamp)
         .bind(client_msg_id)
+        .bind(delivered)
         .execute(&self.pool)
         .await
         .context("Failed to save message")?;
@@ -2456,10 +2549,19 @@ impl Database {
         // instead of a bogus last_insert_rowid(). The SELECT-first path in
         // save_message_dedup handles the common case; this covers the tight race.
         if result.rows_affected() == 0 {
-            if let Some(existing) = self
+            if let Some(mut existing) = self
                 .find_message_by_client_msg_id(sender_id, None, client_msg_id)
                 .await?
             {
+                if delivered.is_some() && existing.delivered != delivered {
+                    sqlx::query("UPDATE messages SET delivered = ? WHERE id = ?")
+                        .bind(delivered)
+                        .bind(existing.id)
+                        .execute(&self.pool)
+                        .await
+                        .context("Failed to update raced message delivery state")?;
+                    existing.delivered = delivered;
+                }
                 return Ok(existing);
             }
         }
@@ -2477,7 +2579,68 @@ impl Database {
             timestamp,
             is_read: false,
             client_msg_id: client_msg_id.map(|s| s.to_string()),
+            delivered,
         })
+    }
+
+    /// Update an outgoing private message after a queued payload is retried.
+    /// `Some(true)` is only written after a matching ACK; `None` records the
+    /// legacy write-complete path without claiming end-to-end delivery.
+    pub async fn update_private_message_delivery(
+        &self,
+        sender_id: &str,
+        client_msg_id: &str,
+        delivered: Option<bool>,
+    ) -> Result<Option<ChatMessage>> {
+        let client_msg_id = client_msg_id.trim();
+        if client_msg_id.is_empty() {
+            return Ok(None);
+        }
+
+        let sender_keys = self.identity_keys_for(sender_id).await?;
+        let sender_placeholders = Self::placeholders(sender_keys.len());
+        let update_sql = format!(
+            "UPDATE messages
+             SET delivered = ?
+             WHERE sender_id IN ({sender_placeholders})
+               AND (group_id IS NULL OR group_id = '')
+               AND client_msg_id = ?"
+        );
+        let mut update = sqlx::query(&update_sql).bind(delivered);
+        for key in &sender_keys {
+            update = update.bind(key);
+        }
+        let result = update
+            .bind(client_msg_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update private message delivery state")?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        let select_sql = format!(
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type,
+                    file_path, file_name, file_size, timestamp, is_read,
+                    client_msg_id, delivered
+             FROM messages
+             WHERE sender_id IN ({sender_placeholders})
+               AND (group_id IS NULL OR group_id = '')
+               AND client_msg_id = ?
+             ORDER BY id ASC
+             LIMIT 1"
+        );
+        let mut select = sqlx::query(&select_sql);
+        for key in &sender_keys {
+            select = select.bind(key);
+        }
+        let row = select
+            .bind(client_msg_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to load updated private message delivery state")?;
+        Ok(row.as_ref().map(chat_message_from_row))
     }
 
     pub async fn get_conversation(
@@ -2493,9 +2656,9 @@ impl Database {
         let peer_placeholders = Self::placeholders(peer_keys.len());
         let my_placeholders = Self::placeholders(my_keys.len());
         let sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM (
-                 SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+                 SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
                  FROM messages
                  WHERE (sender_id IN ({my_placeholders}) AND receiver_id IN ({peer_placeholders}))
                     OR (sender_id IN ({peer_placeholders}) AND receiver_id IN ({my_placeholders}))
@@ -2537,6 +2700,7 @@ impl Database {
                 timestamp: row.get("timestamp"),
                 is_read: row.get::<bool, _>("is_read"),
                 client_msg_id: row.try_get("client_msg_id").ok(),
+                delivered: row.try_get("delivered").unwrap_or(None),
             })
             .collect();
 
@@ -2570,9 +2734,9 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM (
-                 SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+                 SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
                  FROM messages
                  WHERE ((sender_id IN ({my_placeholders}) AND receiver_id IN ({peer_placeholders}))
                     OR (sender_id IN ({peer_placeholders}) AND receiver_id IN ({my_placeholders})))
@@ -2633,9 +2797,9 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM (
-                 SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+                 SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
                  FROM messages
                  WHERE group_id = ?
                    {before_clause}
@@ -2684,7 +2848,7 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM messages
              WHERE ((sender_id IN ({my_placeholders}) AND receiver_id IN ({peer_placeholders}))
                 OR (sender_id IN ({peer_placeholders}) AND receiver_id IN ({my_placeholders})))
@@ -2738,7 +2902,7 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM messages
              WHERE group_id = ?
                AND (content LIKE ? OR file_name LIKE ?)
@@ -2768,7 +2932,7 @@ impl Database {
         let my_keys = self.identity_keys_for(my_id).await?;
         let my_placeholders = Self::placeholders(my_keys.len());
         let sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id
+            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM messages
              WHERE (sender_id IN ({my_placeholders}) OR receiver_id IN ({my_placeholders}))
                AND (content LIKE ? OR file_name LIKE ?)
@@ -2984,6 +3148,67 @@ mod tests {
 
         assert_eq!(group_first.id, group_duplicate.id);
         assert_eq!(group_first.content, group_duplicate.content);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn queued_private_message_transitions_to_acknowledged_delivery() {
+        let db_path = temp_db_path("delivery-state");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+
+        let queued = db
+            .save_message_dedup_with_delivery(
+                "me",
+                "Me",
+                "peer",
+                "queued message",
+                "text",
+                None,
+                None,
+                None,
+                Some("delivery-client-1"),
+                Some(false),
+            )
+            .await
+            .expect("queued message should save");
+        assert_eq!(queued.delivered, Some(false));
+
+        let acknowledged = db
+            .update_private_message_delivery("me", "delivery-client-1", Some(true))
+            .await
+            .expect("delivery state should update")
+            .expect("updated message should be returned");
+        assert_eq!(acknowledged.id, queued.id);
+        assert_eq!(acknowledged.delivered, Some(true));
+
+        let legacy = db
+            .save_message_dedup(
+                "me",
+                "Me",
+                "peer",
+                "legacy message",
+                "text",
+                None,
+                None,
+                None,
+                Some("delivery-client-legacy"),
+            )
+            .await
+            .expect("legacy message should save");
+        assert_eq!(legacy.delivered, None);
+
+        let conversation = db
+            .get_conversation("peer", "me", Some(10))
+            .await
+            .expect("conversation should load");
+        assert_eq!(conversation.len(), 2);
+        assert_eq!(conversation[0].delivered, Some(true));
+        assert_eq!(conversation[1].delivered, None);
 
         drop(db);
         let _ = std::fs::remove_file(db_path);
