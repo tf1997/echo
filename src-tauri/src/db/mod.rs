@@ -4,7 +4,7 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use sqlx::{
     sqlite::{SqlitePoolOptions, SqliteRow},
-    Pool, Row, Sqlite,
+    Pool, Row, Sqlite, SqliteConnection,
 };
 use std::net::IpAddr;
 
@@ -132,6 +132,36 @@ pub struct ChatMessage {
 
 pub struct Database {
     pub(crate) pool: Pool<Sqlite>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AliasBindOutcome {
+    Bound,
+    Conflict { owner_node_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteMigrationDecision {
+    AllowedNode,
+    AllowedLegacy,
+    AllowedLegacyUpgrade,
+    RejectConflict,
+    RejectDowngrade,
+    RejectInvalidEndpoint,
+    RejectLegacyIdentity,
+    RejectLocalIdentity,
+    RejectNewEndpointOwned,
+    RejectOwnership,
+    RejectUnknownOld,
+}
+
+impl RemoteMigrationDecision {
+    pub(crate) fn is_allowed(self) -> bool {
+        matches!(
+            self,
+            Self::AllowedNode | Self::AllowedLegacy | Self::AllowedLegacyUpgrade
+        )
+    }
 }
 
 const DEFAULT_MESSAGE_LIMIT: i64 = 500;
@@ -361,7 +391,7 @@ impl Database {
                 return Err(error)
                     .context("Failed to add avatar_updated_at column to user_profile");
             }
-        }
+        };
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS peers (
@@ -1000,8 +1030,19 @@ impl Database {
                         self.migrate_self_endpoint_peer(old_peer_id, peer_id)
                             .await?;
                     } else {
-                        self.upsert_peer_alias(node_id, old_peer_id).await?;
-                        self.upsert_peer_alias(node_id, peer_id).await?;
+                        for alias_peer_id in [old_peer_id, peer_id] {
+                            match self
+                                .bind_peer_alias_checked(node_id, alias_peer_id)
+                                .await?
+                            {
+                                AliasBindOutcome::Bound => {}
+                                AliasBindOutcome::Conflict { owner_node_id } => log::warn!(
+                                    "Local endpoint {} conflicts with historical node {}; profile update will continue without rebinding",
+                                    alias_peer_id,
+                                    owner_node_id
+                                ),
+                            }
+                        }
                     }
                 }
             }
@@ -1292,11 +1333,7 @@ impl Database {
         sqlx::query("INSERT OR IGNORE INTO groups (group_id, name, creator_id, created_at) VALUES (?, ?, ?, ?)")
             .bind(group_id).bind(name).bind(creator_id).bind(&now)
             .execute(&self.pool).await.context("Failed to create group")?;
-        for mid in member_ids {
-            sqlx::query("INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at) VALUES (?, ?, ?)")
-                .bind(group_id).bind(mid).bind(&now)
-                .execute(&self.pool).await.ok();
-        }
+        self.add_group_members(group_id, member_ids).await?;
         Ok(())
     }
 
@@ -1362,22 +1399,22 @@ impl Database {
     }
 
     pub async fn get_group_members(&self, group_id: &str) -> Result<Vec<StoredPeer>> {
-        sqlx::query(
-            "INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at)
-             SELECT DISTINCT group_id, sender_id, timestamp
-             FROM messages
-             WHERE group_id = ? AND sender_id <> ''",
-        )
-        .bind(group_id)
-        .execute(&self.pool)
-        .await
-        .context("Failed to repair group members from messages")?;
+        let repair_rows = sqlx::query("SELECT peer_id FROM group_members WHERE group_id = ?")
+            .bind(group_id)
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to load group members for alias repair")?;
+        let repair_ids = repair_rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("peer_id"))
+            .collect::<Vec<_>>();
+        self.add_group_members(group_id, &repair_ids).await?;
 
         // Always return gm.peer_id (never NULL) so callers don't see phantom rows.
         // For "myself" we have no row in `peers` — fall back to `user_profile`.
         let rows = sqlx::query(
             "SELECT gm.peer_id AS peer_id,
-                    COALESCE(NULLIF(p.node_id, ''), up.node_id, '') AS node_id,
+                    COALESCE(NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') AS node_id,
                     COALESCE(NULLIF(p.username, ''), up.username, '') AS username,
                     COALESCE(NULLIF(p.department, ''), up.department, '') AS department,
                     COALESCE(NULLIF(p.software_version, ''), up.software_version, '') AS software_version,
@@ -1393,6 +1430,7 @@ impl Database {
                     CASE WHEN up.peer_id IS NOT NULL THEN 1 ELSE 0 END AS is_self
              FROM group_members gm
              LEFT JOIN peers p ON gm.peer_id = p.peer_id
+             LEFT JOIN peer_aliases pa ON gm.peer_id = pa.alias_peer_id
              LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = gm.peer_id
              WHERE gm.group_id = ?"
         ).bind(group_id).fetch_all(&self.pool).await.context("Failed to get group members")?;
@@ -1436,12 +1474,14 @@ impl Database {
                 .then_with(|| b.is_online.cmp(&a.is_online))
                 .then_with(|| b.last_seen_at.cmp(&a.last_seen_at))
         });
-        members.dedup_by(|a, b| {
-            if a.username.is_empty() || b.username.is_empty() {
-                a.peer_id == b.peer_id
+        let mut seen_identities = std::collections::HashSet::new();
+        members.retain(|member| {
+            let identity = if member.node_id.trim().is_empty() {
+                format!("peer:{}", member.peer_id)
             } else {
-                a.username == b.username && a.department == b.department
-            }
+                format!("node:{}", member.node_id)
+            };
+            seen_identities.insert(identity)
         });
 
         Ok(members)
@@ -1458,21 +1498,248 @@ impl Database {
     }
 
     pub async fn add_group_members(&self, group_id: &str, member_ids: &[String]) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        for mid in member_ids {
-            sqlx::query("INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at) VALUES (?, ?, ?)")
-                .bind(group_id).bind(mid).bind(&now).execute(&self.pool).await.ok();
+        for member_id in member_ids {
+            let member_id = member_id.trim();
+            if member_id.is_empty() {
+                continue;
+            }
+            match self.resolve_peer_node_id(member_id).await {
+                Ok(Some(node_id)) => {
+                    let current_peer_id = self
+                        .current_peer_id_for_node(&node_id)
+                        .await?
+                        .unwrap_or_else(|| member_id.to_string());
+                    self.upsert_group_member_identity(group_id, &current_peer_id, &node_id)
+                        .await?;
+                }
+                Ok(None) => {
+                    self.upsert_group_member_identity(group_id, member_id, "")
+                        .await?;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Keeping conflicting group member {} endpoint-scoped: {}",
+                        member_id,
+                        error
+                    );
+                    self.upsert_group_member_identity(group_id, member_id, "")
+                        .await?;
+                }
+            }
         }
         Ok(())
     }
 
-    pub async fn remove_group_member(&self, group_id: &str, peer_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM group_members WHERE group_id = ? AND peer_id = ?")
+    async fn current_peer_id_for_node(&self, node_id: &str) -> Result<Option<String>> {
+        if node_id.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let self_peer_id = sqlx::query_scalar::<_, String>(
+            "SELECT peer_id FROM user_profile
+             WHERE id = 1 AND node_id = ? AND TRIM(COALESCE(peer_id, '')) <> ''",
+        )
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to resolve current self endpoint for node")?;
+        if self_peer_id.is_some() {
+            return Ok(self_peer_id);
+        }
+
+        sqlx::query_scalar::<_, String>(
+            "SELECT peer_id FROM peers
+             WHERE node_id = ?
+             ORDER BY is_online DESC, last_seen_at DESC
+             LIMIT 1",
+        )
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to resolve current peer endpoint for node")
+    }
+
+    pub(crate) async fn upsert_group_member_identity(
+        &self,
+        group_id: &str,
+        peer_id: &str,
+        node_id: &str,
+    ) -> Result<()> {
+        let group_id = group_id.trim();
+        let peer_id = peer_id.trim();
+        let node_id = node_id.trim();
+        if group_id.is_empty() || peer_id.is_empty() {
+            return Ok(());
+        }
+
+        if node_id.is_empty() {
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                "INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at)
+                 VALUES (?, ?, ?)",
+            )
             .bind(group_id)
             .bind(peer_id)
+            .bind(now)
             .execute(&self.pool)
             .await
-            .context("Failed to remove group member")?;
+            .context("Failed to add legacy group member")?;
+            return Ok(());
+        }
+
+        if let Some(local_peer_id) = sqlx::query_scalar::<_, String>(
+            "SELECT peer_id FROM user_profile
+             WHERE id = 1 AND node_id = ? AND TRIM(COALESCE(peer_id, '')) <> ''",
+        )
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to validate local group identity")?
+        {
+            if local_peer_id != peer_id {
+                anyhow::bail!(
+                    "Refusing to replace local group identity {local_peer_id} with {peer_id}"
+                );
+            }
+        }
+
+        match self.resolve_peer_node_id(peer_id).await {
+            Ok(Some(owner)) if owner != node_id => anyhow::bail!(
+                "Group member endpoint {peer_id} belongs to node {owner}, not {node_id}"
+            ),
+            Ok(None) => {
+                anyhow::bail!("Group member endpoint {peer_id} is not verified for node {node_id}")
+            }
+            Err(error) => return Err(error).context("Conflicting group member identity"),
+            _ => {}
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to begin group member identity update")?;
+
+        let existing_joined_at = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT MIN(gm.joined_at)
+             FROM group_members gm
+             LEFT JOIN peers p ON p.peer_id = gm.peer_id
+             LEFT JOIN peer_aliases pa ON pa.alias_peer_id = gm.peer_id
+             LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = gm.peer_id
+             WHERE gm.group_id = ?
+               AND COALESCE(NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') = ?",
+        )
+        .bind(group_id)
+        .bind(node_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("Failed to load group identity join time")?;
+        let joined_at = existing_joined_at.unwrap_or_else(|| Utc::now().to_rfc3339());
+
+        sqlx::query(
+            "INSERT INTO group_members (group_id, peer_id, joined_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(group_id, peer_id) DO UPDATE SET
+                joined_at = CASE
+                    WHEN excluded.joined_at < group_members.joined_at THEN excluded.joined_at
+                    ELSE group_members.joined_at
+                END",
+        )
+        .bind(group_id)
+        .bind(peer_id)
+        .bind(&joined_at)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to upsert group member identity")?;
+
+        sqlx::query(
+            "DELETE FROM group_members
+             WHERE group_id = ? AND peer_id <> ? AND peer_id IN (
+                SELECT gm.peer_id
+                FROM group_members gm
+                LEFT JOIN peers p ON p.peer_id = gm.peer_id
+                LEFT JOIN peer_aliases pa ON pa.alias_peer_id = gm.peer_id
+                LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = gm.peer_id
+                WHERE gm.group_id = ?
+                  AND COALESCE(NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') = ?
+             )",
+        )
+        .bind(group_id)
+        .bind(peer_id)
+        .bind(group_id)
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to remove stale group identity aliases")?;
+        tx.commit()
+            .await
+            .context("Failed to commit group member identity update")?;
+        Ok(())
+    }
+
+    pub async fn remove_group_member(&self, group_id: &str, peer_id: &str) -> Result<()> {
+        let node_id = self
+            .resolve_peer_node_id(peer_id)
+            .await?
+            .unwrap_or_default();
+        self.remove_group_member_identity(group_id, peer_id, &node_id)
+            .await
+    }
+
+    pub(crate) async fn remove_group_member_identity(
+        &self,
+        group_id: &str,
+        peer_id: &str,
+        node_id: &str,
+    ) -> Result<()> {
+        let verified_node = if node_id.trim().is_empty() {
+            None
+        } else {
+            match self.resolve_peer_node_id(peer_id).await {
+                Ok(Some(owner)) if owner == node_id.trim() => Some(owner),
+                Ok(_) => None,
+                Err(error) => {
+                    log::warn!(
+                        "Removing only exact group endpoint {} because identity is conflicting: {}",
+                        peer_id,
+                        error
+                    );
+                    None
+                }
+            }
+        };
+
+        let Some(verified_node) = verified_node else {
+            sqlx::query("DELETE FROM group_members WHERE group_id = ? AND peer_id = ?")
+                .bind(group_id)
+                .bind(peer_id)
+                .execute(&self.pool)
+                .await
+                .context("Failed to remove legacy group member")?;
+            return Ok(());
+        };
+
+        sqlx::query(
+            "DELETE FROM group_members
+             WHERE group_id = ? AND (
+                peer_id = ? OR peer_id IN (
+                    SELECT gm.peer_id
+                    FROM group_members gm
+                    LEFT JOIN peers p ON p.peer_id = gm.peer_id
+                    LEFT JOIN peer_aliases pa ON pa.alias_peer_id = gm.peer_id
+                    LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = gm.peer_id
+                    WHERE gm.group_id = ?
+                      AND COALESCE(NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') = ?
+                )
+             )",
+        )
+        .bind(group_id)
+        .bind(peer_id)
+        .bind(group_id)
+        .bind(&verified_node)
+        .execute(&self.pool)
+        .await
+        .context("Failed to remove group member identity")?;
         Ok(())
     }
 
@@ -1803,9 +2070,97 @@ impl Database {
         let canonical_peer_id = canonicalize_endpoint_peer_id(incoming_peer_id, ip, port);
         let peer_id = canonical_peer_id.as_str();
 
+        let endpoint_owners = self.identity_node_owners(peer_id).await?;
+        if endpoint_owners.len() > 1 {
+            anyhow::bail!("Conflicting node ownership for endpoint {peer_id}");
+        }
+
+        if node_id.is_empty() {
+            if endpoint_owners.first().is_some() {
+                if !self
+                    .stored_peer_profile_matches(peer_id, username, department, mac_address)
+                    .await?
+                {
+                    anyhow::bail!(
+                        "Refusing node-less identity overwrite for owned endpoint {peer_id}"
+                    );
+                }
+
+                let now = Utc::now().to_rfc3339();
+                sqlx::query(
+                    "UPDATE peers
+                     SET ip = ?, port = ?, is_online = ?, last_seen_at = ?
+                     WHERE peer_id = ?",
+                )
+                .bind(ip)
+                .bind(port as i64)
+                .bind(if is_online { 1 } else { 0 })
+                .bind(now)
+                .bind(peer_id)
+                .execute(&self.pool)
+                .await
+                .context("Failed to refresh legacy observation for owned endpoint")?;
+                return Ok(());
+            }
+        } else {
+            if endpoint_owners
+                .first()
+                .is_some_and(|owner| owner != node_id)
+            {
+                anyhow::bail!(
+                    "Refusing to overwrite node ownership for endpoint {peer_id} with {node_id}"
+                );
+            }
+
+            if endpoint_owners.is_empty() {
+                let existing_identity_endpoint = sqlx::query(
+                    "SELECT peer_id AS identity FROM peers
+                     WHERE node_id = ? AND peer_id <> ?
+                     UNION
+                     SELECT alias_peer_id AS identity FROM peer_aliases
+                     WHERE node_id = ? AND alias_peer_id <> ?
+                     UNION
+                     SELECT peer_id AS identity FROM user_profile
+                     WHERE node_id = ? AND peer_id <> ?
+                     LIMIT 1",
+                )
+                .bind(node_id)
+                .bind(peer_id)
+                .bind(node_id)
+                .bind(peer_id)
+                .bind(node_id)
+                .bind(peer_id)
+                .fetch_optional(&self.pool)
+                .await
+                .context("Failed to check existing node endpoints")?;
+                if existing_identity_endpoint.is_some() {
+                    anyhow::bail!(
+                        "Refusing unverified relocation of node {node_id} to endpoint {peer_id}"
+                    );
+                }
+            }
+        }
+
         if incoming_peer_id != peer_id {
-            self.migrate_legacy_endpoint_peer(incoming_peer_id, peer_id)
-                .await?;
+            if self
+                .peer_matches_incoming_identity(
+                    incoming_peer_id,
+                    node_id,
+                    username,
+                    department,
+                    mac_address,
+                )
+                .await?
+            {
+                self.migrate_legacy_endpoint_peer(incoming_peer_id, peer_id)
+                    .await?;
+            } else {
+                log::warn!(
+                    "Ignoring unverified endpoint drift {} -> {}",
+                    incoming_peer_id,
+                    peer_id
+                );
+            }
         }
 
         if !contact_filter::has_contact_identity(username, department) {
@@ -1829,20 +2184,6 @@ impl Database {
 
         let now = Utc::now().to_rfc3339();
 
-        let existing_node_peer_ids = if node_id.is_empty() {
-            Vec::new()
-        } else {
-            sqlx::query("SELECT peer_id FROM peers WHERE node_id = ? AND peer_id <> ?")
-                .bind(node_id)
-                .bind(peer_id)
-                .fetch_all(&self.pool)
-                .await
-                .context("Failed to load existing peers for node_id")?
-                .into_iter()
-                .map(|row| row.get::<String, _>("peer_id"))
-                .collect::<Vec<_>>()
-        };
-
         // Check for same-identity peer at this endpoint (IP changed, old client didn't broadcast)
         if !username.is_empty() && !department.is_empty() {
             let existing_at_endpoint = sqlx::query(
@@ -1862,21 +2203,32 @@ impl Database {
 
             if let Some(row) = existing_at_endpoint {
                 let old_peer_id: String = row.get("peer_id");
-                log::info!(
-                    "Same identity ({} {}) moved from {} to {} at {}:{} - migrating references",
-                    username,
-                    department,
-                    old_peer_id,
-                    peer_id,
-                    ip,
-                    port
-                );
-                self.migrate_peer_references(&old_peer_id, peer_id).await?;
-                sqlx::query("DELETE FROM peers WHERE peer_id = ?")
-                    .bind(&old_peer_id)
-                    .execute(&self.pool)
-                    .await
-                    .context("Failed to remove old peer_id after identity match")?;
+                if self
+                    .peer_matches_incoming_identity(
+                        &old_peer_id,
+                        node_id,
+                        username,
+                        department,
+                        mac_address,
+                    )
+                    .await?
+                {
+                    log::info!(
+                        "Same identity ({} {}) moved from {} to {} at {}:{} - migrating references",
+                        username,
+                        department,
+                        old_peer_id,
+                        peer_id,
+                        ip,
+                        port
+                    );
+                    self.migrate_peer_references(&old_peer_id, peer_id).await?;
+                    sqlx::query("DELETE FROM peers WHERE peer_id = ?")
+                        .bind(&old_peer_id)
+                        .execute(&self.pool)
+                        .await
+                        .context("Failed to remove old peer_id after identity match")?;
+                }
             }
         }
 
@@ -1890,17 +2242,31 @@ impl Database {
                 .context("Failed to load stale peer endpoints")?;
         for row in endpoint_duplicates {
             let old_peer_id: String = row.get("peer_id");
-            self.migrate_peer_references(&old_peer_id, peer_id).await?;
+            if self
+                .peer_matches_incoming_identity(
+                    &old_peer_id,
+                    node_id,
+                    username,
+                    department,
+                    mac_address,
+                )
+                .await?
+            {
+                self.migrate_peer_references(&old_peer_id, peer_id).await?;
+                sqlx::query("DELETE FROM peers WHERE peer_id = ?")
+                    .bind(&old_peer_id)
+                    .execute(&self.pool)
+                    .await
+                    .context("Failed to remove verified stale peer endpoint")?;
+            } else {
+                log::warn!(
+                    "Keeping conflicting peer {} at reused endpoint {}:{}",
+                    old_peer_id,
+                    ip,
+                    port
+                );
+            }
         }
-
-        // Cleanup duplicates at the same endpoint (different peer_id, same ip:port).
-        sqlx::query("DELETE FROM peers WHERE ip = ? AND port = ? AND peer_id <> ?")
-            .bind(ip)
-            .bind(port as i64)
-            .bind(peer_id)
-            .execute(&self.pool)
-            .await
-            .context("Failed to remove stale peer endpoints")?;
 
         // With node_id present, endpoint changes are tracked as aliases; same-name legacy peers stay separate.
         // Upsert. Preserve existing non-empty username/department when the incoming row has
@@ -1910,7 +2276,11 @@ impl Database {
             "INSERT INTO peers (peer_id, node_id, username, department, software_version, mac_address, avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online, first_seen_at, last_seen_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(peer_id) DO UPDATE SET
-                node_id = CASE WHEN excluded.node_id = '' THEN peers.node_id ELSE excluded.node_id END,
+                node_id = CASE
+                    WHEN excluded.node_id = '' THEN peers.node_id
+                    WHEN peers.node_id = '' OR peers.node_id = excluded.node_id THEN excluded.node_id
+                    ELSE peers.node_id
+                END,
                 username = CASE WHEN TRIM(excluded.username) = '' THEN peers.username ELSE excluded.username END,
                 department = CASE WHEN TRIM(excluded.department) = '' THEN peers.department ELSE excluded.department END,
                 software_version = CASE WHEN excluded.software_version = '' THEN peers.software_version ELSE excluded.software_version END,
@@ -1955,43 +2325,405 @@ impl Database {
 
         if !node_id.is_empty() {
             self.upsert_peer_alias(node_id, peer_id).await?;
-            for old_peer_id in existing_node_peer_ids {
-                self.upsert_peer_alias(node_id, &old_peer_id).await?;
-                self.move_recent_contact_reference(&old_peer_id, peer_id)
-                    .await?;
-                sqlx::query("DELETE FROM peers WHERE peer_id = ?")
-                    .bind(&old_peer_id)
-                    .execute(&self.pool)
-                    .await
-                    .context("Failed to remove stale peer row for node_id")?;
-            }
         }
 
         Ok(())
     }
 
-    pub async fn upsert_peer_alias(&self, node_id: &str, alias_peer_id: &str) -> Result<()> {
+    async fn identity_node_owners(&self, identity: &str) -> Result<Vec<String>> {
+        let identity = identity.trim();
+        if identity.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query(
+            "SELECT node_id FROM peers WHERE peer_id = ? AND TRIM(node_id) <> ''
+             UNION
+             SELECT node_id FROM peer_aliases WHERE alias_peer_id = ? AND TRIM(node_id) <> ''
+             UNION
+             SELECT node_id FROM user_profile
+             WHERE (peer_id = ? OR node_id = ?) AND TRIM(node_id) <> ''",
+        )
+        .bind(identity)
+        .bind(identity)
+        .bind(identity)
+        .bind(identity)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to resolve peer node ownership")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("node_id"))
+            .collect())
+    }
+
+    pub(crate) async fn resolve_peer_node_id(&self, identity: &str) -> Result<Option<String>> {
+        let owners = self.identity_node_owners(identity).await?;
+        match owners.as_slice() {
+            [] => Ok(None),
+            [owner] => Ok(Some(owner.clone())),
+            _ => anyhow::bail!("Conflicting node ownership for peer identity {identity}"),
+        }
+    }
+
+    pub(crate) async fn direct_sender_endpoint_is_compatible(
+        &self,
+        peer_id: &str,
+        claimed_node_id: &str,
+        username: &str,
+        department: &str,
+        mac_address: &str,
+    ) -> Result<bool> {
+        let owners = self.identity_node_owners(peer_id).await?;
+        if owners.len() > 1 {
+            return Ok(false);
+        }
+        let Some(owner) = owners.first() else {
+            return Ok(true);
+        };
+        if !claimed_node_id.trim().is_empty() {
+            return Ok(owner == claimed_node_id.trim());
+        }
+        if !contact_filter::has_contact_identity(username, department) {
+            // Legacy system notifications historically omitted profile text. The
+            // exact observed endpoint may still issue them, but the later upsert
+            // path will not be allowed to overwrite the owned peer profile.
+            return Ok(true);
+        }
+
+        self.stored_peer_profile_matches(peer_id, username, department, mac_address)
+            .await
+    }
+
+    pub(crate) async fn validated_group_sender_node_id(
+        &self,
+        peer_id: &str,
+        claimed_node_id: &str,
+    ) -> Result<String> {
+        let claimed_node_id = claimed_node_id.trim();
+        if claimed_node_id.is_empty() {
+            return Ok(String::new());
+        }
+
+        match self.resolve_peer_node_id(peer_id).await {
+            Ok(Some(owner)) if owner == claimed_node_id => Ok(owner),
+            _ => Ok(String::new()),
+        }
+    }
+
+    pub(crate) async fn bind_peer_alias_checked(
+        &self,
+        node_id: &str,
+        alias_peer_id: &str,
+    ) -> Result<AliasBindOutcome> {
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .context("Failed to acquire peer alias connection")?;
+        Self::bind_peer_alias_in_connection(&mut connection, node_id, alias_peer_id).await
+    }
+
+    async fn bind_peer_alias_in_connection(
+        connection: &mut SqliteConnection,
+        node_id: &str,
+        alias_peer_id: &str,
+    ) -> Result<AliasBindOutcome> {
         let node_id = node_id.trim();
         let alias_peer_id = alias_peer_id.trim();
         if node_id.is_empty() || alias_peer_id.is_empty() {
-            return Ok(());
+            return Ok(AliasBindOutcome::Bound);
         }
+
+        let established_owners = sqlx::query_scalar::<_, String>(
+            "SELECT node_id FROM peers WHERE peer_id = ? AND TRIM(node_id) <> ''
+             UNION
+             SELECT node_id FROM user_profile
+             WHERE peer_id = ? AND TRIM(node_id) <> ''",
+        )
+        .bind(alias_peer_id)
+        .bind(alias_peer_id)
+        .fetch_all(&mut *connection)
+        .await
+        .context("Failed to check established peer alias ownership")?;
+        if let Some(owner_node_id) = established_owners
+            .into_iter()
+            .find(|owner| owner != node_id)
+        {
+            return Ok(AliasBindOutcome::Conflict { owner_node_id });
+        }
+
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO peer_aliases (alias_peer_id, node_id, created_at, last_seen_at)
              VALUES (?, ?, ?, ?)
              ON CONFLICT(alias_peer_id) DO UPDATE SET
-                node_id = excluded.node_id,
-                last_seen_at = excluded.last_seen_at",
+                last_seen_at = excluded.last_seen_at
+              WHERE peer_aliases.node_id = excluded.node_id",
         )
         .bind(alias_peer_id)
         .bind(node_id)
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *connection)
         .await
         .context("Failed to upsert peer alias")?;
-        Ok(())
+
+        if result.rows_affected() > 0 {
+            return Ok(AliasBindOutcome::Bound);
+        }
+
+        let owner_node_id = sqlx::query_scalar::<_, String>(
+            "SELECT node_id FROM peer_aliases WHERE alias_peer_id = ?",
+        )
+        .bind(alias_peer_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .context("Failed to load conflicting peer alias owner")?
+        .unwrap_or_default();
+        Ok(AliasBindOutcome::Conflict { owner_node_id })
+    }
+
+    pub async fn upsert_peer_alias(&self, node_id: &str, alias_peer_id: &str) -> Result<()> {
+        match self.bind_peer_alias_checked(node_id, alias_peer_id).await? {
+            AliasBindOutcome::Bound => Ok(()),
+            AliasBindOutcome::Conflict { owner_node_id } => anyhow::bail!(
+                "Peer alias {alias_peer_id} belongs to node {owner_node_id}, not {node_id}"
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn validate_remote_peer_migration(
+        &self,
+        old_peer_id: &str,
+        new_peer_id: &str,
+        sender_node_id: &str,
+        sender_name: &str,
+        sender_department: &str,
+        sender_mac_address: &str,
+        local_peer_id: &str,
+        local_node_id: &str,
+    ) -> Result<RemoteMigrationDecision> {
+        let old_peer_id = old_peer_id.trim();
+        let new_peer_id = new_peer_id.trim();
+        let sender_node_id = sender_node_id.trim();
+        let local_node_id = local_node_id.trim();
+
+        if old_peer_id.is_empty()
+            || new_peer_id.is_empty()
+            || old_peer_id == new_peer_id
+            || !is_endpoint_peer_id(old_peer_id)
+            || !is_endpoint_peer_id(new_peer_id)
+        {
+            return Ok(RemoteMigrationDecision::RejectInvalidEndpoint);
+        }
+
+        let old_owners = self.identity_node_owners(old_peer_id).await?;
+        let new_owners = self.identity_node_owners(new_peer_id).await?;
+        if old_owners.len() > 1 || new_owners.len() > 1 {
+            return Ok(RemoteMigrationDecision::RejectConflict);
+        }
+        let old_owner = old_owners.first().map(String::as_str);
+        let new_owner = new_owners.first().map(String::as_str);
+
+        if old_peer_id == local_peer_id
+            || new_peer_id == local_peer_id
+            || (!local_node_id.is_empty()
+                && (sender_node_id == local_node_id
+                    || old_owner == Some(local_node_id)
+                    || new_owner == Some(local_node_id)))
+        {
+            return Ok(RemoteMigrationDecision::RejectLocalIdentity);
+        }
+
+        if let Some(owner) = new_owner {
+            if sender_node_id.is_empty() || owner != sender_node_id {
+                return Ok(RemoteMigrationDecision::RejectNewEndpointOwned);
+            }
+        }
+
+        if let Some(owner) = old_owner {
+            if sender_node_id.is_empty() {
+                return Ok(RemoteMigrationDecision::RejectDowngrade);
+            }
+            return Ok(if owner == sender_node_id {
+                RemoteMigrationDecision::AllowedNode
+            } else {
+                RemoteMigrationDecision::RejectOwnership
+            });
+        }
+
+        let old_peer = sqlx::query(
+            "SELECT username, department, mac_address, ip, port
+             FROM peers WHERE peer_id = ?",
+        )
+        .bind(old_peer_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to load legacy peer for migration validation")?;
+        let Some(old_peer) = old_peer else {
+            return Ok(RemoteMigrationDecision::RejectUnknownOld);
+        };
+
+        let old_username: String = old_peer.try_get("username").unwrap_or_default();
+        let old_department: String = old_peer.try_get("department").unwrap_or_default();
+        let old_mac_address: String = old_peer.try_get("mac_address").unwrap_or_default();
+        let old_ip: String = old_peer.try_get("ip").unwrap_or_default();
+        let old_port = old_peer.try_get::<i64, _>("port").unwrap_or_default() as u16;
+        let identity_matches = contact_filter::has_contact_identity(sender_name, sender_department)
+            && old_username.trim() == sender_name.trim()
+            && old_department.trim() == sender_department.trim()
+            && (old_mac_address.trim().is_empty()
+                || sender_mac_address.trim().is_empty()
+                || old_mac_address
+                    .trim()
+                    .eq_ignore_ascii_case(sender_mac_address.trim()))
+            && endpoint_peer_id(&old_ip, old_port) == old_peer_id;
+
+        if !identity_matches {
+            return Ok(RemoteMigrationDecision::RejectLegacyIdentity);
+        }
+
+        Ok(if sender_node_id.is_empty() {
+            RemoteMigrationDecision::AllowedLegacy
+        } else {
+            RemoteMigrationDecision::AllowedLegacyUpgrade
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn apply_verified_remote_migration(
+        &self,
+        old_peer_id: &str,
+        new_peer_id: &str,
+        sender_node_id: &str,
+        sender_name: &str,
+        sender_department: &str,
+        sender_mac_address: &str,
+        local_peer_id: &str,
+        local_node_id: &str,
+    ) -> Result<RemoteMigrationDecision> {
+        let decision = self
+            .validate_remote_peer_migration(
+                old_peer_id,
+                new_peer_id,
+                sender_node_id,
+                sender_name,
+                sender_department,
+                sender_mac_address,
+                local_peer_id,
+                local_node_id,
+            )
+            .await?;
+        if !decision.is_allowed() {
+            return Ok(decision);
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to begin verified peer migration")?;
+        if !sender_node_id.trim().is_empty() {
+            for alias_peer_id in [old_peer_id, new_peer_id] {
+                match Self::bind_peer_alias_in_connection(
+                    &mut tx,
+                    sender_node_id,
+                    alias_peer_id,
+                )
+                .await?
+                {
+                    AliasBindOutcome::Bound => {}
+                    AliasBindOutcome::Conflict { owner_node_id } => anyhow::bail!(
+                        "Peer alias {alias_peer_id} belongs to node {owner_node_id}, not {sender_node_id}"
+                    ),
+                }
+            }
+        }
+
+        self.migrate_peer_references_in_connection(&mut tx, old_peer_id, new_peer_id)
+            .await?;
+        sqlx::query("DELETE FROM peers WHERE peer_id = ?")
+            .bind(old_peer_id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to remove migrated peer endpoint")?;
+        tx.commit()
+            .await
+            .context("Failed to commit verified peer migration")?;
+        Ok(decision)
+    }
+
+    async fn peer_matches_incoming_identity(
+        &self,
+        peer_id: &str,
+        node_id: &str,
+        username: &str,
+        department: &str,
+        mac_address: &str,
+    ) -> Result<bool> {
+        let owners = self.identity_node_owners(peer_id).await?;
+        if owners.len() > 1 {
+            return Ok(false);
+        }
+        if let Some(owner) = owners.first() {
+            return Ok(!node_id.trim().is_empty() && owner == node_id.trim());
+        }
+
+        let row = sqlx::query(
+            "SELECT username, department, mac_address, ip, port
+             FROM peers WHERE peer_id = ?",
+        )
+        .bind(peer_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to load peer identity for merge validation")?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+
+        let stored_username: String = row.try_get("username").unwrap_or_default();
+        let stored_department: String = row.try_get("department").unwrap_or_default();
+        let stored_mac: String = row.try_get("mac_address").unwrap_or_default();
+        let stored_ip: String = row.try_get("ip").unwrap_or_default();
+        let stored_port = row.try_get::<i64, _>("port").unwrap_or_default() as u16;
+        Ok(contact_filter::has_contact_identity(username, department)
+            && stored_username.trim() == username.trim()
+            && stored_department.trim() == department.trim()
+            && (stored_mac.trim().is_empty()
+                || mac_address.trim().is_empty()
+                || stored_mac.trim().eq_ignore_ascii_case(mac_address.trim()))
+            && endpoint_peer_id(&stored_ip, stored_port) == peer_id)
+    }
+
+    async fn stored_peer_profile_matches(
+        &self,
+        peer_id: &str,
+        username: &str,
+        department: &str,
+        mac_address: &str,
+    ) -> Result<bool> {
+        let row =
+            sqlx::query("SELECT username, department, mac_address FROM peers WHERE peer_id = ?")
+                .bind(peer_id)
+                .fetch_optional(&self.pool)
+                .await
+                .context("Failed to load owned peer profile")?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+
+        let stored_username: String = row.try_get("username").unwrap_or_default();
+        let stored_department: String = row.try_get("department").unwrap_or_default();
+        let stored_mac: String = row.try_get("mac_address").unwrap_or_default();
+        Ok(contact_filter::has_contact_identity(username, department)
+            && stored_username.trim() == username.trim()
+            && stored_department.trim() == department.trim()
+            && (stored_mac.trim().is_empty()
+                || mac_address.trim().is_empty()
+                || stored_mac.trim().eq_ignore_ascii_case(mac_address.trim())))
     }
 
     #[allow(dead_code)]
@@ -2007,31 +2739,6 @@ impl Database {
             .into_iter()
             .map(|row| row.get("alias_peer_id"))
             .collect())
-    }
-
-    async fn move_recent_contact_reference(
-        &self,
-        old_peer_id: &str,
-        new_peer_id: &str,
-    ) -> Result<()> {
-        if old_peer_id == new_peer_id {
-            return Ok(());
-        }
-        sqlx::query(
-            "INSERT OR IGNORE INTO recent_contacts (peer_id, added_at)
-             SELECT ?, added_at FROM recent_contacts WHERE peer_id = ?",
-        )
-        .bind(new_peer_id)
-        .bind(old_peer_id)
-        .execute(&self.pool)
-        .await
-        .context("Failed to move recent contact reference")?;
-        sqlx::query("DELETE FROM recent_contacts WHERE peer_id = ?")
-            .bind(old_peer_id)
-            .execute(&self.pool)
-            .await
-            .context("Failed to remove old recent contact reference")?;
-        Ok(())
     }
 
     /// Public wrapper over `identity_keys_for`: returns every peer_id/node_id known
@@ -2063,6 +2770,14 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .context("Failed to resolve identity node_id")?;
+
+        if node_rows.len() > 1 {
+            log::warn!(
+                "Refusing to merge aliases for {} because multiple node owners were found",
+                identity
+            );
+            return Ok(keys);
+        }
 
         for row in node_rows {
             let node_id: String = row.get("node_id");
@@ -2111,21 +2826,31 @@ impl Database {
             return Ok(());
         }
 
-        sqlx::query(
-            "INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at)
-             SELECT group_id, ?, joined_at FROM group_members WHERE peer_id = ?",
-        )
-        .bind(new_peer_id)
-        .bind(old_peer_id)
-        .execute(&self.pool)
-        .await
-        .context("Failed to migrate group members")?;
-
-        sqlx::query("DELETE FROM group_members WHERE peer_id = ?")
-            .bind(old_peer_id)
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .context("Failed to remove stale group member refs")?;
+            .context("Failed to begin peer reference migration")?;
+        self.migrate_peer_references_in_connection(&mut tx, old_peer_id, new_peer_id)
+            .await?;
+        tx.commit()
+            .await
+            .context("Failed to commit peer reference migration")?;
+        Ok(())
+    }
+
+    async fn migrate_peer_references_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        old_peer_id: &str,
+        new_peer_id: &str,
+    ) -> Result<()> {
+        if old_peer_id == new_peer_id {
+            return Ok(());
+        }
+
+        Self::migrate_group_member_references_in_connection(connection, old_peer_id, new_peer_id)
+            .await?;
 
         sqlx::query(
             "INSERT OR IGNORE INTO recent_contacts (peer_id, added_at)
@@ -2133,85 +2858,140 @@ impl Database {
         )
         .bind(new_peer_id)
         .bind(old_peer_id)
-        .execute(&self.pool)
+        .execute(&mut *connection)
         .await
         .context("Failed to migrate recent contacts")?;
 
         sqlx::query("DELETE FROM recent_contacts WHERE peer_id = ?")
             .bind(old_peer_id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await
             .context("Failed to remove stale recent contacts")?;
 
         sqlx::query("UPDATE pending_group_messages SET peer_id = ? WHERE peer_id = ?")
             .bind(new_peer_id)
             .bind(old_peer_id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await
             .context("Failed to migrate pending group messages")?;
 
         sqlx::query("UPDATE pending_group_messages SET sender_id = ? WHERE sender_id = ?")
             .bind(new_peer_id)
             .bind(old_peer_id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await
             .context("Failed to migrate pending group message senders")?;
 
         sqlx::query("UPDATE pending_notifications SET peer_id = ? WHERE peer_id = ?")
             .bind(new_peer_id)
             .bind(old_peer_id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await
             .context("Failed to migrate pending notifications")?;
 
-        self.migrate_pending_notification_payloads(old_peer_id, new_peer_id)
-            .await?;
+        Self::migrate_pending_notification_payloads_in_connection(
+            connection,
+            old_peer_id,
+            new_peer_id,
+        )
+        .await?;
 
         sqlx::query("UPDATE pending_file_transfers SET peer_id = ? WHERE peer_id = ?")
             .bind(new_peer_id)
             .bind(old_peer_id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await
             .context("Failed to migrate pending file transfers")?;
 
         sqlx::query("UPDATE pending_file_transfers SET sender_id = ? WHERE sender_id = ?")
             .bind(new_peer_id)
             .bind(old_peer_id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await
             .context("Failed to migrate pending file transfer senders")?;
 
         sqlx::query("UPDATE messages SET sender_id = ? WHERE sender_id = ?")
             .bind(new_peer_id)
             .bind(old_peer_id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await
             .context("Failed to migrate message senders")?;
 
         sqlx::query("UPDATE messages SET receiver_id = ? WHERE receiver_id = ?")
             .bind(new_peer_id)
             .bind(old_peer_id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await
             .context("Failed to migrate message receivers")?;
 
         sqlx::query("UPDATE groups SET creator_id = ? WHERE creator_id = ?")
             .bind(new_peer_id)
             .bind(old_peer_id)
-            .execute(&self.pool)
+            .execute(&mut *connection)
             .await
             .context("Failed to migrate group creators")?;
 
         Ok(())
     }
 
-    async fn migrate_pending_notification_payloads(
-        &self,
+    async fn migrate_group_member_references_in_connection(
+        connection: &mut SqliteConnection,
+        old_peer_id: &str,
+        new_peer_id: &str,
+    ) -> Result<()> {
+        if old_peer_id == new_peer_id {
+            return Ok(());
+        }
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at)
+             SELECT group_id, ?, joined_at FROM group_members WHERE peer_id = ?",
+        )
+        .bind(new_peer_id)
+        .bind(old_peer_id)
+        .execute(&mut *connection)
+        .await
+        .context("Failed to migrate group members")?;
+
+        sqlx::query(
+            "UPDATE group_members
+             SET joined_at = (
+                SELECT MIN(gm.joined_at)
+                FROM group_members gm
+                WHERE gm.group_id = group_members.group_id
+                  AND gm.peer_id IN (?, ?)
+             )
+             WHERE peer_id = ?
+               AND EXISTS (
+                    SELECT 1 FROM group_members old_member
+                    WHERE old_member.group_id = group_members.group_id
+                      AND old_member.peer_id = ?
+               )",
+        )
+        .bind(old_peer_id)
+        .bind(new_peer_id)
+        .bind(new_peer_id)
+        .bind(old_peer_id)
+        .execute(&mut *connection)
+        .await
+        .context("Failed to preserve group member join time")?;
+
+        sqlx::query("DELETE FROM group_members WHERE peer_id = ?")
+            .bind(old_peer_id)
+            .execute(&mut *connection)
+            .await
+            .context("Failed to remove stale group member refs")?;
+
+        Ok(())
+    }
+
+    async fn migrate_pending_notification_payloads_in_connection(
+        connection: &mut SqliteConnection,
         old_peer_id: &str,
         new_peer_id: &str,
     ) -> Result<()> {
         let rows = sqlx::query("SELECT id, payload FROM pending_notifications")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *connection)
             .await
             .context("Failed to load pending notification payloads")?;
 
@@ -2232,7 +3012,7 @@ impl Database {
             sqlx::query("UPDATE pending_notifications SET payload = ? WHERE id = ?")
                 .bind(updated)
                 .bind(id)
-                .execute(&self.pool)
+                .execute(&mut *connection)
                 .await
                 .context("Failed to update pending notification payload")?;
         }
@@ -3051,7 +3831,8 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::Database;
+    use super::{AliasBindOutcome, Database, RemoteMigrationDecision};
+    use sqlx::Row;
 
     fn temp_db_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -3399,10 +4180,10 @@ mod tests {
 
         db.upsert_peer_with_avatar(
             "10.0.0.2:9527",
-            "",
-            "",
-            "",
-            "",
+            "Alice",
+            "Ops",
+            "1.0.0",
+            "aa:bb:cc",
             "",
             "avatar-new",
             20,
@@ -3714,6 +4495,10 @@ mod tests {
         .await
         .expect("message to old endpoint should save");
 
+        db.upsert_peer_alias("node-alice", "10.0.0.9:9527")
+            .await
+            .expect("verified migration should pre-bind the new endpoint");
+
         db.upsert_peer_with_node_id_avatar(
             "10.0.0.9:9527",
             "node-alice",
@@ -3786,6 +4571,10 @@ mod tests {
         )
         .await
         .expect("old endpoint message should save");
+
+        db.upsert_peer_alias("node-alice", "10.0.0.9:9527")
+            .await
+            .expect("verified migration should pre-bind the new endpoint");
 
         db.upsert_peer_with_node_id_avatar(
             "10.0.0.9:9527",
@@ -3871,6 +4660,718 @@ mod tests {
 
         assert_eq!(profile.node_id, first_node_id);
         assert_eq!(profile.peer_id, "10.0.0.9:9527");
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn alias_conflict_does_not_reassign_owner() {
+        let db_path = temp_db_path("alias-owner-conflict");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+
+        db.upsert_peer_alias("node-a", "10.0.0.2:9527")
+            .await
+            .expect("first alias owner should bind");
+        let outcome = db
+            .bind_peer_alias_checked("node-b", "10.0.0.2:9527")
+            .await
+            .expect("conflict lookup should succeed");
+        assert_eq!(
+            outcome,
+            AliasBindOutcome::Conflict {
+                owner_node_id: "node-a".to_string()
+            }
+        );
+        assert_eq!(
+            db.resolve_peer_node_id("10.0.0.2:9527")
+                .await
+                .expect("owner should resolve"),
+            Some("node-a".to_string())
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn remote_migration_requires_matching_node_and_rejects_downgrade() {
+        let db_path = temp_db_path("remote-migration-node-owner");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        db.upsert_peer_with_node_id_avatar(
+            "10.0.0.2:9527",
+            "node-a",
+            "Alice",
+            "Ops",
+            "0.2.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.2",
+            9527,
+            true,
+        )
+        .await
+        .expect("owned peer should persist");
+
+        let matching = db
+            .validate_remote_peer_migration(
+                "10.0.0.2:9527",
+                "10.0.0.9:9527",
+                "node-a",
+                "Alice",
+                "Ops",
+                "aa:bb:cc",
+                "10.0.0.100:9527",
+                "node-local",
+            )
+            .await
+            .expect("matching migration should validate");
+        assert_eq!(matching, RemoteMigrationDecision::AllowedNode);
+
+        let forged = db
+            .validate_remote_peer_migration(
+                "10.0.0.2:9527",
+                "10.0.0.9:9527",
+                "node-b",
+                "Alice",
+                "Ops",
+                "aa:bb:cc",
+                "10.0.0.100:9527",
+                "node-local",
+            )
+            .await
+            .expect("forged migration should be rejected cleanly");
+        assert_eq!(forged, RemoteMigrationDecision::RejectOwnership);
+
+        let downgrade = db
+            .validate_remote_peer_migration(
+                "10.0.0.2:9527",
+                "10.0.0.9:9527",
+                "",
+                "Alice",
+                "Ops",
+                "aa:bb:cc",
+                "10.0.0.100:9527",
+                "node-local",
+            )
+            .await
+            .expect("downgrade should be rejected cleanly");
+        assert_eq!(downgrade, RemoteMigrationDecision::RejectDowngrade);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn legacy_remote_migration_requires_exact_identity() {
+        let db_path = temp_db_path("remote-migration-legacy");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        db.upsert_peer_with_avatar(
+            "10.0.0.2:9527",
+            "Alice",
+            "Ops",
+            "0.1.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.2",
+            9527,
+            true,
+        )
+        .await
+        .expect("legacy peer should persist");
+
+        let legacy = db
+            .validate_remote_peer_migration(
+                "10.0.0.2:9527",
+                "10.0.0.9:9527",
+                "",
+                "Alice",
+                "Ops",
+                "aa:bb:cc",
+                "10.0.0.100:9527",
+                "node-local",
+            )
+            .await
+            .expect("legacy migration should validate");
+        assert_eq!(legacy, RemoteMigrationDecision::AllowedLegacy);
+
+        let upgrade = db
+            .validate_remote_peer_migration(
+                "10.0.0.2:9527",
+                "10.0.0.9:9527",
+                "node-a",
+                "Alice",
+                "Ops",
+                "aa:bb:cc",
+                "10.0.0.100:9527",
+                "node-local",
+            )
+            .await
+            .expect("legacy upgrade should validate");
+        assert_eq!(upgrade, RemoteMigrationDecision::AllowedLegacyUpgrade);
+
+        for (name, department, mac) in [
+            ("Mallory", "Ops", "aa:bb:cc"),
+            ("Alice", "Other", "aa:bb:cc"),
+            ("Alice", "Ops", "dd:ee:ff"),
+        ] {
+            let rejected = db
+                .validate_remote_peer_migration(
+                    "10.0.0.2:9527",
+                    "10.0.0.9:9527",
+                    "",
+                    name,
+                    department,
+                    mac,
+                    "10.0.0.100:9527",
+                    "node-local",
+                )
+                .await
+                .expect("legacy mismatch should be rejected cleanly");
+            assert_eq!(rejected, RemoteMigrationDecision::RejectLegacyIdentity);
+        }
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn endpoint_owner_cannot_be_overwritten_by_another_node() {
+        let db_path = temp_db_path("endpoint-owner-overwrite");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        db.upsert_peer_with_node_id_avatar(
+            "10.0.0.2:9527",
+            "node-a",
+            "Alice",
+            "Ops",
+            "0.2.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.2",
+            9527,
+            true,
+        )
+        .await
+        .expect("first endpoint owner should persist");
+
+        let overwrite = db
+            .upsert_peer_with_node_id_avatar(
+                "10.0.0.2:9527",
+                "node-b",
+                "Bob",
+                "Ops",
+                "0.2.0",
+                "dd:ee:ff",
+                "",
+                "",
+                0,
+                "10.0.0.2",
+                9527,
+                true,
+            )
+            .await;
+        assert!(overwrite.is_err());
+
+        let stored = db
+            .get_stored_peer("10.0.0.2:9527")
+            .await
+            .expect("peer lookup should succeed")
+            .expect("original peer should remain");
+        assert_eq!(stored.node_id, "node-a");
+        assert_eq!(stored.username, "Alice");
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn node_bound_endpoint_rejects_node_less_identity_overwrite() {
+        let db_path = temp_db_path("node-bound-legacy-overwrite");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        db.upsert_peer_with_node_id_avatar(
+            "10.0.0.2:9527",
+            "node-a",
+            "Alice",
+            "Ops",
+            "0.2.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.2",
+            9527,
+            true,
+        )
+        .await
+        .expect("owned peer should persist");
+
+        let overwrite = db
+            .upsert_peer_with_node_id_avatar(
+                "10.0.0.2:9527",
+                "",
+                "Mallory",
+                "Other",
+                "0.1.0",
+                "dd:ee:ff",
+                "",
+                "",
+                0,
+                "10.0.0.2",
+                9527,
+                true,
+            )
+            .await;
+        assert!(overwrite.is_err());
+
+        db.upsert_peer_with_node_id_avatar(
+            "10.0.0.2:9527",
+            "",
+            "Alice",
+            "Ops",
+            "0.1.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.2",
+            9527,
+            true,
+        )
+        .await
+        .expect("matching legacy observation may refresh route state");
+
+        let stored = db
+            .get_stored_peer("10.0.0.2:9527")
+            .await
+            .expect("peer lookup should succeed")
+            .expect("owned peer should remain");
+        assert_eq!(stored.node_id, "node-a");
+        assert_eq!(stored.username, "Alice");
+        assert_eq!(stored.department, "Ops");
+        assert_eq!(stored.software_version, "0.2.0");
+        assert_eq!(stored.mac_address, "aa:bb:cc");
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn ordinary_upsert_cannot_relocate_an_existing_node() {
+        let db_path = temp_db_path("unverified-node-relocation");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        db.upsert_peer_with_node_id_avatar(
+            "10.0.0.2:9527",
+            "node-a",
+            "Alice",
+            "Ops",
+            "0.2.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.2",
+            9527,
+            true,
+        )
+        .await
+        .expect("old endpoint should persist");
+        db.add_recent_contact("10.0.0.2:9527")
+            .await
+            .expect("recent contact should persist");
+        db.create_group(
+            "group-relocation",
+            "Relocation Group",
+            "10.0.0.2:9527",
+            &["10.0.0.2:9527".to_string()],
+        )
+        .await
+        .expect("group should persist");
+
+        let relocation = db
+            .upsert_peer_with_node_id_avatar(
+                "10.0.0.9:9527",
+                "node-a",
+                "Alice",
+                "Ops",
+                "0.2.0",
+                "aa:bb:cc",
+                "",
+                "",
+                0,
+                "10.0.0.9",
+                9527,
+                true,
+            )
+            .await;
+        assert!(relocation.is_err());
+        assert_eq!(
+            db.validated_group_sender_node_id("10.0.0.9:9527", "node-a")
+                .await
+                .expect("group sender claim should validate safely"),
+            ""
+        );
+        assert!(db
+            .get_stored_peer("10.0.0.2:9527")
+            .await
+            .expect("old peer lookup should succeed")
+            .is_some());
+        assert!(db
+            .get_stored_peer("10.0.0.9:9527")
+            .await
+            .expect("new peer lookup should succeed")
+            .is_none());
+        let group_peer_id: String = sqlx::query_scalar(
+            "SELECT peer_id FROM group_members WHERE group_id = 'group-relocation'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("group member should remain");
+        assert_eq!(group_peer_id, "10.0.0.2:9527");
+        let recent_peer_id: String =
+            sqlx::query_scalar("SELECT peer_id FROM recent_contacts LIMIT 1")
+                .fetch_one(&db.pool)
+                .await
+                .expect("recent contact should remain");
+        assert_eq!(recent_peer_id, "10.0.0.2:9527");
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn verified_migration_rolls_back_every_table_on_unique_conflict() {
+        let db_path = temp_db_path("verified-migration-rollback");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        db.upsert_peer_with_node_id_avatar(
+            "10.0.0.2:9527",
+            "node-a",
+            "Alice",
+            "Ops",
+            "0.2.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.2",
+            9527,
+            true,
+        )
+        .await
+        .expect("old endpoint should persist");
+        db.add_recent_contact("10.0.0.2:9527")
+            .await
+            .expect("recent contact should persist");
+        db.create_group(
+            "group-rollback",
+            "Rollback Group",
+            "10.0.0.2:9527",
+            &["10.0.0.2:9527".to_string()],
+        )
+        .await
+        .expect("group should persist");
+        db.save_message_dedup(
+            "10.0.0.2:9527",
+            "Alice",
+            "me",
+            "old",
+            "text",
+            None,
+            None,
+            None,
+            Some("same-client-id"),
+        )
+        .await
+        .expect("old endpoint message should persist");
+        db.save_message_dedup(
+            "10.0.0.9:9527",
+            "Alice",
+            "me",
+            "new",
+            "text",
+            None,
+            None,
+            None,
+            Some("same-client-id"),
+        )
+        .await
+        .expect("new endpoint conflict row should persist");
+
+        let migration = db
+            .apply_verified_remote_migration(
+                "10.0.0.2:9527",
+                "10.0.0.9:9527",
+                "node-a",
+                "Alice",
+                "Ops",
+                "aa:bb:cc",
+                "10.0.0.100:9527",
+                "node-local",
+            )
+            .await;
+        assert!(migration.is_err());
+
+        assert!(db
+            .get_stored_peer("10.0.0.2:9527")
+            .await
+            .expect("old peer lookup should succeed")
+            .is_some());
+        let aliases = db
+            .list_peer_aliases("node-a")
+            .await
+            .expect("aliases should load");
+        assert!(aliases.iter().any(|alias| alias == "10.0.0.2:9527"));
+        assert!(!aliases.iter().any(|alias| alias == "10.0.0.9:9527"));
+        let group_peer_id: String = sqlx::query_scalar(
+            "SELECT peer_id FROM group_members WHERE group_id = 'group-rollback'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("group member should remain");
+        assert_eq!(group_peer_id, "10.0.0.2:9527");
+        let recent_peer_id: String =
+            sqlx::query_scalar("SELECT peer_id FROM recent_contacts LIMIT 1")
+                .fetch_one(&db.pool)
+                .await
+                .expect("recent contact should remain");
+        assert_eq!(recent_peer_id, "10.0.0.2:9527");
+        let sender_ids: Vec<String> =
+            sqlx::query_scalar("SELECT sender_id FROM messages ORDER BY sender_id")
+                .fetch_all(&db.pool)
+                .await
+                .expect("messages should remain");
+        assert_eq!(
+            sender_ids,
+            vec!["10.0.0.2:9527".to_string(), "10.0.0.9:9527".to_string()]
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn group_member_identity_replaces_alias_and_preserves_join_time() {
+        let db_path = temp_db_path("group-member-identity");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        db.upsert_peer_with_node_id_avatar(
+            "10.0.0.2:9527",
+            "node-a",
+            "Alice",
+            "Ops",
+            "0.2.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.2",
+            9527,
+            true,
+        )
+        .await
+        .expect("old endpoint should persist");
+        db.create_group(
+            "group-identity",
+            "Identity Group",
+            "10.0.0.2:9527",
+            &["10.0.0.2:9527".to_string()],
+        )
+        .await
+        .expect("group should persist");
+        let joined_at: String = sqlx::query_scalar(
+            "SELECT joined_at FROM group_members WHERE group_id = ? AND peer_id = ?",
+        )
+        .bind("group-identity")
+        .bind("10.0.0.2:9527")
+        .fetch_one(&db.pool)
+        .await
+        .expect("old join time should load");
+
+        db.upsert_peer_alias("node-a", "10.0.0.9:9527")
+            .await
+            .expect("verified migration should bind the new member endpoint");
+
+        db.upsert_group_member_identity("group-identity", "10.0.0.9:9527", "node-a")
+            .await
+            .expect("direct sender observation should replace old alias");
+
+        let rows = sqlx::query(
+            "SELECT peer_id, joined_at FROM group_members WHERE group_id = ? ORDER BY peer_id",
+        )
+        .bind("group-identity")
+        .fetch_all(&db.pool)
+        .await
+        .expect("group members should load");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<String, _>("peer_id"), "10.0.0.9:9527");
+        assert_eq!(rows[0].get::<String, _>("joined_at"), joined_at);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn historical_messages_do_not_restore_a_removed_group_member() {
+        let db_path = temp_db_path("removed-group-member-history");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        for (peer_id, node_id, username, ip) in [
+            ("10.0.0.2:9527", "node-a", "Alice", "10.0.0.2"),
+            ("10.0.0.3:9527", "node-b", "Bob", "10.0.0.3"),
+        ] {
+            db.upsert_peer_with_node_id_avatar(
+                peer_id, node_id, username, "Ops", "0.2.0", "", "", "", 0, ip, 9527, true,
+            )
+            .await
+            .expect("peer should persist");
+        }
+        db.create_group(
+            "group-leave-history",
+            "Leave History Group",
+            "10.0.0.2:9527",
+            &["10.0.0.2:9527".to_string(), "10.0.0.3:9527".to_string()],
+        )
+        .await
+        .expect("group should persist");
+        db.save_group_message(
+            "group-leave-history",
+            "10.0.0.3:9527",
+            "Bob",
+            "message before leaving",
+            "text",
+            None,
+            None,
+            None,
+            false,
+            Some("leave-history-message"),
+        )
+        .await
+        .expect("historical group message should persist");
+        db.remove_group_member("group-leave-history", "10.0.0.3:9527")
+            .await
+            .expect("member should leave");
+
+        let members = db
+            .get_group_members("group-leave-history")
+            .await
+            .expect("members should load without repairing from history");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].peer_id, "10.0.0.2:9527");
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn mismatched_node_cannot_remove_all_group_member_aliases() {
+        let db_path = temp_db_path("group-remove-node-mismatch");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        db.upsert_peer_with_node_id_avatar(
+            "10.0.0.9:9527",
+            "node-a",
+            "Alice",
+            "Ops",
+            "0.2.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.9",
+            9527,
+            true,
+        )
+        .await
+        .expect("current peer should persist");
+        db.upsert_peer_alias("node-a", "10.0.0.2:9527")
+            .await
+            .expect("old alias should persist");
+        db.create_group(
+            "group-remove-mismatch",
+            "Remove Mismatch Group",
+            "10.0.0.9:9527",
+            &["10.0.0.9:9527".to_string()],
+        )
+        .await
+        .expect("group should persist");
+        sqlx::query(
+            "INSERT INTO group_members (group_id, peer_id, joined_at)
+             VALUES ('group-remove-mismatch', '10.0.0.2:9527', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&db.pool)
+        .await
+        .expect("old alias member should persist");
+
+        db.remove_group_member_identity("group-remove-mismatch", "10.0.0.9:9527", "node-b")
+            .await
+            .expect("mismatch should remove only the exact endpoint");
+        let remaining: Vec<String> = sqlx::query_scalar(
+            "SELECT peer_id FROM group_members WHERE group_id = 'group-remove-mismatch'",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("remaining members should load");
+        assert_eq!(remaining, vec!["10.0.0.2:9527".to_string()]);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn same_named_members_with_different_nodes_remain_distinct() {
+        let db_path = temp_db_path("group-same-name-different-node");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        for (peer_id, node_id, ip) in [
+            ("10.0.0.2:9527", "node-a", "10.0.0.2"),
+            ("10.0.0.3:9527", "node-b", "10.0.0.3"),
+        ] {
+            db.upsert_peer_with_node_id_avatar(
+                peer_id, node_id, "Alex", "Ops", "0.2.0", "", "", "", 0, ip, 9527, true,
+            )
+            .await
+            .expect("peer should persist");
+        }
+        db.create_group(
+            "group-same-name",
+            "Same Name Group",
+            "10.0.0.2:9527",
+            &["10.0.0.2:9527".to_string(), "10.0.0.3:9527".to_string()],
+        )
+        .await
+        .expect("group should persist");
+
+        let members = db
+            .get_group_members("group-same-name")
+            .await
+            .expect("members should load");
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().any(|member| member.node_id == "node-a"));
+        assert!(members.iter().any(|member| member.node_id == "node-b"));
 
         drop(db);
         let _ = std::fs::remove_file(db_path);

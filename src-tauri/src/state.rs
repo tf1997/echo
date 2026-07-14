@@ -1,11 +1,115 @@
 use anyhow::Result;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::chat::{ChatServer, LocalPeerId};
-use crate::db::{Database, UserProfile};
-use crate::discovery::{DiscoveryConfig, DiscoveryService, PeerEntry};
+use crate::db::{AliasBindOutcome, Database, UserProfile};
+use crate::discovery::{DiscoveryConfig, DiscoveryService, Peer, PeerEntry};
 use tauri::AppHandle;
+
+async fn bind_local_alias_best_effort(db: &Database, node_id: &str, peer_id: &str) -> bool {
+    match db.bind_peer_alias_checked(node_id, peer_id).await {
+        Ok(AliasBindOutcome::Bound) => true,
+        Ok(AliasBindOutcome::Conflict { owner_node_id }) => {
+            log::warn!(
+                "Local endpoint {} conflicts with historical node {}; keeping ownership isolated",
+                peer_id,
+                owner_node_id
+            );
+            false
+        }
+        Err(error) => {
+            log::warn!(
+                "Failed to record local endpoint alias {} for node {}: {}",
+                peer_id,
+                node_id,
+                error
+            );
+            false
+        }
+    }
+}
+
+fn peer_id_change_targets<'a>(
+    stored_peer_ids: impl IntoIterator<Item = &'a str>,
+    online_peers: &[Peer],
+    old_id: &str,
+    new_id: &str,
+) -> Vec<String> {
+    let mut targets: HashSet<String> = stored_peer_ids.into_iter().map(str::to_string).collect();
+    targets.extend(
+        online_peers
+            .iter()
+            .filter(|peer| peer.online)
+            .map(|peer| peer.id.clone()),
+    );
+    targets.remove(old_id);
+    targets.remove(new_id);
+
+    let mut targets: Vec<String> = targets.into_iter().collect();
+    targets.sort();
+    targets
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_peer_id_change_notification(
+    db: &Database,
+    online_peers: &[Peer],
+    old_id: &str,
+    new_id: &str,
+    node_id: &str,
+    username: &str,
+    department: &str,
+    listen_port: u16,
+    avatar_hash: &str,
+    avatar_updated_at: i64,
+) {
+    let stored = db.list_stored_peers().await.unwrap_or_default();
+    let targets = peer_id_change_targets(
+        stored.iter().map(|peer| peer.peer_id.as_str()),
+        online_peers,
+        old_id,
+        new_id,
+    );
+    let payload = serde_json::json!({
+        "old_peer_id": old_id,
+        "node_id": node_id,
+        "username": username,
+        "department": department,
+        "software_version": crate::profile_metadata::software_version(),
+        "mac_address": crate::profile_metadata::mac_address(),
+        "avatar_hash": avatar_hash,
+        "avatar_updated_at": avatar_updated_at,
+    })
+    .to_string();
+
+    let (delivered, queued, failed) = crate::commands::send_or_queue_notification(
+        db,
+        online_peers,
+        &targets,
+        new_id,
+        node_id,
+        username,
+        department,
+        listen_port,
+        &payload,
+        "profile_updated",
+        None,
+        None,
+        None,
+        &[],
+    )
+    .await;
+    log::info!(
+        "Published peer_id change {} -> {} to {} peers (delivered={}, queued={}, failed={})",
+        old_id,
+        new_id,
+        targets.len(),
+        delivered,
+        queued,
+        failed
+    );
+}
 
 pub struct RuntimeServices {
     pub discovery: RwLock<DiscoveryService>,
@@ -46,8 +150,8 @@ impl RuntimeServices {
                 my_id,
                 my_node_id
             );
-            db.upsert_peer_alias(&my_node_id, &old_peer_id).await?;
-            db.upsert_peer_alias(&my_node_id, &my_id).await?;
+            let _ = bind_local_alias_best_effort(db.as_ref(), &my_node_id, &old_peer_id).await;
+            let _ = bind_local_alias_best_effort(db.as_ref(), &my_node_id, &my_id).await;
         }
 
         // Persist peer_id for profile
@@ -80,6 +184,7 @@ impl RuntimeServices {
         discovery.start().await?;
 
         let peers = discovery.peers_arc();
+        let notification_peers = Arc::clone(&peers);
         let local_peer_id = LocalPeerId::new(my_id.clone());
 
         let chat = ChatServer::new(
@@ -116,49 +221,23 @@ impl RuntimeServices {
             // It will be handled by the startup sequence after RuntimeServices is registered
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-                let stored = db_clone.list_stored_peers().await.unwrap_or_default();
-                let targets: Vec<String> = stored.iter().map(|p| p.peer_id.clone()).collect();
-
-                // Use profile_updated with old_peer_id for backward compatibility
-                let payload = serde_json::json!({
-                    "old_peer_id": old_id,  // NEW field - old versions ignore it
-                    "username": username,
-                    "department": department,
-                    "software_version": crate::profile_metadata::software_version(),
-                    "mac_address": crate::profile_metadata::mac_address(),
-                    "avatar_hash": avatar_hash,
-                    "avatar_updated_at": avatar_updated_at,
-                })
-                .to_string();
-
-                for peer_id in &targets {
-                    if peer_id == &new_id {
-                        continue;
-                    }
-                    let json = crate::commands::build_notification_json(
-                        &new_id,
-                        &node_id,
-                        &username,
-                        &department,
-                        listen_port,
-                        peer_id,
-                        "",
-                        &payload,
-                        "profile_updated",
-                        None,
-                        None,
-                        None,
-                        &[],
-                    );
-                    let _ = db_clone
-                        .queue_pending_notification(peer_id, "profile_updated", &json)
-                        .await;
-                }
-                log::info!(
-                    "Queued profile_updated (with peer_id change) for {} peers",
-                    targets.len()
-                );
+                let online_peers = notification_peers
+                    .read()
+                    .map(|peers| peers.values().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                send_peer_id_change_notification(
+                    db_clone.as_ref(),
+                    &online_peers,
+                    &old_id,
+                    &new_id,
+                    &node_id,
+                    &username,
+                    &department,
+                    listen_port,
+                    &avatar_hash,
+                    avatar_updated_at,
+                )
+                .await;
             });
         }
 
@@ -192,9 +271,20 @@ impl RuntimeServices {
         }
 
         log::info!("Runtime local IP changed: {} -> {}", old_id, new_id);
-        self.db.upsert_peer_alias(&self.my_node_id, &old_id).await?;
-        self.db.upsert_peer_alias(&self.my_node_id, &new_id).await?;
-        self.db.migrate_peer_references(&old_id, &new_id).await?;
+        let old_alias_bound =
+            bind_local_alias_best_effort(self.db.as_ref(), &self.my_node_id, &old_id).await;
+        let new_alias_bound =
+            bind_local_alias_best_effort(self.db.as_ref(), &self.my_node_id, &new_id).await;
+        let references_migrated = old_alias_bound && new_alias_bound;
+        if references_migrated {
+            self.db.migrate_peer_references(&old_id, &new_id).await?;
+        } else {
+            log::warn!(
+                "Skipping local reference migration {} -> {} because endpoint ownership is conflicting",
+                old_id,
+                new_id
+            );
+        }
         self.db
             .save_user_profile(
                 &new_id,
@@ -213,7 +303,9 @@ impl RuntimeServices {
             .update_local_endpoint(&new_id, new_ip)
         {
             self.my_id.set(old_id.clone());
-            let _ = self.db.migrate_peer_references(&new_id, &old_id).await;
+            if references_migrated {
+                let _ = self.db.migrate_peer_references(&new_id, &old_id).await;
+            }
             let _ = self
                 .db
                 .save_user_profile(
@@ -227,52 +319,20 @@ impl RuntimeServices {
             return Err(error);
         }
 
-        let payload = serde_json::json!({
-            "old_peer_id": old_id,
-            "username": profile.username,
-            "department": profile.department,
-            "software_version": crate::profile_metadata::software_version(),
-            "mac_address": crate::profile_metadata::mac_address(),
-            "avatar_hash": profile.avatar_hash,
-            "avatar_updated_at": profile.avatar_updated_at,
-        })
-        .to_string();
-        let stored = self.db.list_stored_peers().await.unwrap_or_default();
-        let mut queued = 0usize;
-        for peer in stored {
-            if peer.peer_id == old_id || peer.peer_id == new_id {
-                continue;
-            }
-            let json = crate::commands::build_notification_json(
-                &new_id,
-                &self.my_node_id,
-                &profile.username,
-                &profile.department,
-                self.listen_port,
-                &peer.peer_id,
-                "",
-                &payload,
-                "profile_updated",
-                None,
-                None,
-                None,
-                &[],
-            );
-            if self
-                .db
-                .queue_pending_notification(&peer.peer_id, "profile_updated", &json)
-                .await
-                .is_ok()
-            {
-                queued += 1;
-            }
-        }
-        log::info!(
-            "Queued runtime peer_id change {} -> {} for {} peers",
-            old_id,
-            new_id,
-            queued
-        );
+        let online_peers = self.discovery.read().await.get_peers();
+        send_peer_id_change_notification(
+            self.db.as_ref(),
+            &online_peers,
+            &old_id,
+            &new_id,
+            &self.my_node_id,
+            &profile.username,
+            &profile.department,
+            self.listen_port,
+            &profile.avatar_hash,
+            profile.avatar_updated_at,
+        )
+        .await;
         Ok(Some((old_id, new_id)))
     }
 
@@ -300,4 +360,44 @@ pub struct AppState {
     pub runtime: RwLock<Option<Arc<RuntimeServices>>>,
     /// Channel to forward UDP-relayed peers to the async contact-sync processor.
     pub relay_tx: Option<mpsc::UnboundedSender<Vec<PeerEntry>>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{peer_id_change_targets, Peer};
+
+    fn peer(id: &str, online: bool) -> Peer {
+        let mut peer = Peer::new(
+            id.to_string(),
+            id.to_string(),
+            "研发部".to_string(),
+            "127.0.0.1".parse().unwrap(),
+            9527,
+        );
+        peer.online = online;
+        peer
+    }
+
+    #[test]
+    fn peer_id_change_targets_merge_dedupe_and_exclude_self() {
+        let stored = ["stored", "overlap", "old-self", "new-self"];
+        let online = vec![
+            peer("online-only", true),
+            peer("overlap", true),
+            peer("offline-only", false),
+            peer("old-self", true),
+            peer("new-self", true),
+        ];
+
+        let targets = peer_id_change_targets(stored, &online, "old-self", "new-self");
+
+        assert_eq!(
+            targets,
+            vec![
+                "online-only".to_string(),
+                "overlap".to_string(),
+                "stored".to_string(),
+            ]
+        );
+    }
 }

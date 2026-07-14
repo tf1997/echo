@@ -613,7 +613,9 @@ impl LanDiscovery {
                                     false,
                                     0,
                                 );
-                                relay_peer.node_id = entry.node_id.clone();
+                                // Relayed peers are routing hints only. Do not trust a
+                                // third party to establish endpoint -> node ownership.
+                                relay_peer.node_id.clear();
                                 peers_map.insert(entry.id.clone(), relay_peer);
                                 relayed.push(entry.clone());
                                 info!(

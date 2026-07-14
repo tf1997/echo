@@ -72,7 +72,13 @@ pub(crate) fn requires_message_ack(
 }
 
 fn is_valid_relay_entry(entry: &PeerEntry, my_id: &str) -> bool {
+    let canonical_endpoint = entry
+        .ip
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| format!("{}:{}", ip, entry.port));
     entry.id != my_id
+        && canonical_endpoint.as_deref() == Some(entry.id.as_str())
         && crate::contact_filter::is_syncable_contact(
             &entry.id,
             &entry.username,
@@ -90,6 +96,19 @@ fn is_syncable_peer(peer: &Peer) -> bool {
         &peer.ip.to_string(),
         peer.port,
     )
+}
+
+fn observed_sender_endpoint(peer_addr: std::net::SocketAddr, sender_port: u16) -> String {
+    format!("{}:{}", peer_addr.ip(), sender_port)
+}
+
+fn migration_payload_node_matches(sender_node_id: &str, payload: &serde_json::Value) -> bool {
+    payload
+        .get("node_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|node_id| !node_id.is_empty())
+        .is_none_or(|node_id| node_id == sender_node_id.trim())
 }
 
 pub fn is_self_peer(peer: &Peer, my_id: &str, listen_port: u16) -> bool {
@@ -829,6 +848,31 @@ impl ChatServer {
             match serde_json::from_str::<WireMessage>(line_for_parse) {
                 Ok(msg) => {
                     let msg_type = msg.msg_type.as_str();
+                    let observed_sender_id = observed_sender_endpoint(peer_addr, msg.sender_port);
+                    if msg.sender_id != observed_sender_id {
+                        warn!(
+                            "Rejected wire message from {} claiming sender endpoint {}",
+                            observed_sender_id, msg.sender_id
+                        );
+                        continue;
+                    }
+                    if !db
+                        .direct_sender_endpoint_is_compatible(
+                            &msg.sender_id,
+                            &msg.sender_node_id,
+                            &msg.sender_name,
+                            &msg.sender_department,
+                            &msg.sender_mac_address,
+                        )
+                        .await
+                        .unwrap_or(false)
+                    {
+                        warn!(
+                            "Rejected wire message from {} because endpoint ownership conflicts with the claimed identity",
+                            msg.sender_id
+                        );
+                        continue;
+                    }
 
                     // ── Contact sync delegation ──────────────────────────
                     if msg_type == "contact_summary" {
@@ -1008,7 +1052,10 @@ impl ChatServer {
                         let _ = db
                             .upsert_peer_with_node_id_avatar(
                                 &entry.id,
-                                &entry.node_id,
+                                // Relayed directory data is useful for routing/profile hints,
+                                // but it must not establish node ownership. A direct packet or
+                                // discovery observation will bind the endpoint later.
+                                "",
                                 &entry.username,
                                 &entry.department,
                                 &entry.software_version,
@@ -1022,6 +1069,11 @@ impl ChatServer {
                             )
                             .await;
                     }
+
+                    let group_sender_node_id = db
+                        .validated_group_sender_node_id(&msg.sender_id, &msg.sender_node_id)
+                        .await
+                        .unwrap_or_default();
 
                     // Auto-join/discover group for system messages
                     if let Some(ref gid) = msg.group_id {
@@ -1048,6 +1100,13 @@ impl ChatServer {
                                 .await;
                             // Always add members (covers re-broadcast after invite_to_group)
                             let _ = db.add_group_members(gid, &all_members).await;
+                            let _ = db
+                                .upsert_group_member_identity(
+                                    gid,
+                                    &msg.sender_id,
+                                    &group_sender_node_id,
+                                )
+                                .await;
                             info!(
                                 "Synced group {} ({} members)",
                                 group_name,
@@ -1068,10 +1127,22 @@ impl ChatServer {
                             info!("Group {} dissolved — removed", gid);
                         } else if msg.msg_type == "group_member_left" {
                             // sender_id is the leaving member's peer_id
-                            let _ = db.remove_group_member(gid, &msg.sender_id).await;
+                            let _ = db
+                                .remove_group_member_identity(
+                                    gid,
+                                    &msg.sender_id,
+                                    &group_sender_node_id,
+                                )
+                                .await;
                             info!("Member {} left group {}", msg.sender_id, gid);
                         } else if msg.sender_id != my_id {
-                            let _ = db.add_group_members(gid, &[msg.sender_id.clone()]).await;
+                            let _ = db
+                                .upsert_group_member_identity(
+                                    gid,
+                                    &msg.sender_id,
+                                    &group_sender_node_id,
+                                )
+                                .await;
                         }
                     }
 
@@ -1093,36 +1164,72 @@ impl ChatServer {
                             if let Some(old_peer_id) =
                                 payload.get("old_peer_id").and_then(|v| v.as_str())
                             {
+                                let old_peer_id = old_peer_id.trim();
+                                let observed_sender_id =
+                                    observed_sender_endpoint(peer_addr, msg.sender_port);
                                 if old_peer_id != msg.sender_id {
-                                    info!(
-                                        "Peer ID changed: {} -> {} ({})",
-                                        old_peer_id, msg.sender_id, msg.sender_name
-                                    );
-                                    let _ = db
-                                        .migrate_peer_references(old_peer_id, &msg.sender_id)
-                                        .await;
-                                    let _ = sqlx::query("DELETE FROM peers WHERE peer_id = ?")
-                                        .bind(old_peer_id)
-                                        .execute(&db.pool)
-                                        .await;
+                                    if msg.sender_id != observed_sender_id {
+                                        warn!(
+                                            "Rejected peer migration {} -> {}: sender endpoint does not match TCP source {}",
+                                            old_peer_id, msg.sender_id, observed_sender_id
+                                        );
+                                    } else if !migration_payload_node_matches(
+                                        &msg.sender_node_id,
+                                        &payload,
+                                    ) {
+                                        warn!(
+                                            "Rejected peer migration {} -> {}: payload node_id does not match wire sender_node_id",
+                                            old_peer_id, msg.sender_id
+                                        );
+                                    } else {
+                                        match db
+                                            .apply_verified_remote_migration(
+                                                old_peer_id,
+                                                &observed_sender_id,
+                                                &msg.sender_node_id,
+                                                &msg.sender_name,
+                                                &msg.sender_department,
+                                                &msg.sender_mac_address,
+                                                &my_id,
+                                                &my_node_id,
+                                            )
+                                            .await
+                                        {
+                                            Ok(decision) if decision.is_allowed() => {
+                                                info!(
+                                                    "Peer ID changed: {} -> {} ({}, {:?})",
+                                                    old_peer_id,
+                                                    msg.sender_id,
+                                                    msg.sender_name,
+                                                    decision
+                                                );
+                                                // The database transaction has committed, so it is
+                                                // now safe to purge the stale in-memory route.
+                                                if let Ok(mut map) = peers.write() {
+                                                    map.remove(old_peer_id);
+                                                }
 
-                                    // Purge the stale in-memory entry so senders don't
-                                    // resolve the old endpoint and queue into a dead
-                                    // pending row (peer_id no longer exists in DB).
-                                    if let Ok(mut map) = peers.write() {
-                                        map.remove(old_peer_id);
+                                                // Tell the frontend to migrate any open conversation
+                                                // key / drafts / unread from old id to the new id.
+                                                let _ = app_handle.emit_all(
+                                                    "peer-id-changed",
+                                                    serde_json::json!({
+                                                        "oldPeerId": old_peer_id,
+                                                        "newPeerId": msg.sender_id,
+                                                        "nodeId": msg.sender_node_id,
+                                                    }),
+                                                );
+                                            }
+                                            Ok(decision) => warn!(
+                                                "Rejected peer migration {} -> {}: {:?}",
+                                                old_peer_id, msg.sender_id, decision
+                                            ),
+                                            Err(error) => error!(
+                                                "Failed to validate peer migration {} -> {}: {}",
+                                                old_peer_id, msg.sender_id, error
+                                            ),
+                                        }
                                     }
-
-                                    // Tell the frontend to migrate any open conversation
-                                    // key / drafts / unread from old id to the new id.
-                                    let _ = app_handle.emit_all(
-                                        "peer-id-changed",
-                                        serde_json::json!({
-                                            "oldPeerId": old_peer_id,
-                                            "newPeerId": msg.sender_id,
-                                            "nodeId": msg.sender_node_id,
-                                        }),
-                                    );
                                 }
                             }
                         }
@@ -1164,8 +1271,41 @@ impl ChatServer {
                         )
                         .await
                     {
-                        error!("Failed to upsert sender peer: {}", e);
+                        warn!(
+                            "Failed to bind sender {} to claimed node {}; keeping endpoint-scoped: {}",
+                            msg.sender_id, msg.sender_node_id, e
+                        );
+                        if !msg.sender_node_id.trim().is_empty() {
+                            if let Err(fallback_error) = db
+                                .upsert_peer_with_node_id_avatar(
+                                    &msg.sender_id,
+                                    "",
+                                    &msg.sender_name,
+                                    &msg.sender_department,
+                                    &msg.sender_software_version,
+                                    &msg.sender_mac_address,
+                                    "",
+                                    &sender_avatar_hash,
+                                    sender_avatar_updated_at,
+                                    &peer_addr.ip().to_string(),
+                                    msg.sender_port,
+                                    true,
+                                )
+                                .await
+                            {
+                                error!(
+                                    "Failed to upsert endpoint-scoped sender {}: {}",
+                                    msg.sender_id, fallback_error
+                                );
+                            }
+                        }
                     }
+                    let persisted_sender_node_id = db
+                        .resolve_peer_node_id(&msg.sender_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
 
                     // Also register in the in-memory peers map so UI picks it up immediately.
                     if contact_filter::has_contact_identity(
@@ -1189,7 +1329,7 @@ impl ChatServer {
                             remote_ip,
                             msg.sender_port,
                         );
-                        new_peer.node_id = msg.sender_node_id.clone();
+                        new_peer.node_id = persisted_sender_node_id.clone();
                         if let Ok(mut map) = peers.write() {
                             let is_new = !map.contains_key(&pid);
                             let already = map
@@ -1226,6 +1366,7 @@ impl ChatServer {
                                         existing.avatar_hash = sender_avatar_hash.clone();
                                         existing.avatar_updated_at = sender_avatar_updated_at;
                                     }
+                                    existing.node_id = persisted_sender_node_id.clone();
                                     existing.online = true;
                                 }
                             }
@@ -1250,7 +1391,7 @@ impl ChatServer {
                                             false,
                                             0,
                                         );
-                                        relay.node_id = entry.node_id.clone();
+                                        relay.node_id.clear();
                                         map.insert(entry.id.clone(), relay.clone());
                                         info!(
                                             "Chat relay: discovered {} via {}",
@@ -1270,7 +1411,7 @@ impl ChatServer {
                             let _ = db
                                 .upsert_peer_with_node_id_avatar(
                                     &entry.id,
-                                    &entry.node_id,
+                                    "",
                                     &entry.username,
                                     &entry.department,
                                     &entry.software_version,
@@ -2404,7 +2545,8 @@ async fn send_file_in_background_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_received_size, is_self_peer, peer_supports_message_ack, requires_message_ack,
+        checked_received_size, is_self_peer, migration_payload_node_matches,
+        observed_sender_endpoint, peer_supports_message_ack, requires_message_ack,
         safe_received_file_name, wait_for_message_ack_with_timeout, LocalPeerId, Peer,
     };
     use tokio::io::AsyncWriteExt;
@@ -2415,6 +2557,25 @@ mod tests {
         let second = first.clone();
         second.set("192.168.1.9:9527".to_string());
         assert_eq!(first.get(), "192.168.1.9:9527");
+    }
+
+    #[test]
+    fn migration_sender_must_match_observed_endpoint_and_payload_node() {
+        let observed = observed_sender_endpoint("192.168.1.9:53124".parse().unwrap(), 9527);
+        assert_eq!(observed, "192.168.1.9:9527");
+
+        assert!(migration_payload_node_matches(
+            "node-a",
+            &serde_json::json!({"node_id": "node-a"}),
+        ));
+        assert!(migration_payload_node_matches(
+            "node-a",
+            &serde_json::json!({}),
+        ));
+        assert!(!migration_payload_node_matches(
+            "node-a",
+            &serde_json::json!({"node_id": "node-b"}),
+        ));
     }
     #[test]
     fn self_peer_matches_identity() {

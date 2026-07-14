@@ -364,7 +364,7 @@ pub fn run() {
                         let _ = processor_db
                             .upsert_peer_with_node_id_avatar(
                                 &entry.id,
-                                &entry.node_id,
+                                "",
                                 &entry.username,
                                 &entry.department,
                                 &entry.software_version,

@@ -2598,7 +2598,15 @@ pub async fn create_group(
         .create_group(&gid, &payload.name, &my_id, &all_members)
         .await
         .map_err(|e| e.to_string())?;
-    let members = state.db.get_group_members(&gid).await.unwrap_or_default();
+    let members = state
+        .db
+        .get_group_members(&gid)
+        .await
+        .map_err(|error| error.to_string())?;
+    let all_members: Vec<String> = members
+        .iter()
+        .map(|member| member.peer_id.clone())
+        .collect();
 
     let (my_node_id, listen_port, online_peers) = {
         let runtime_opt = { state.runtime.read().await.clone() };

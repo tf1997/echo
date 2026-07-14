@@ -201,9 +201,6 @@ fn merge_into_memory(
     if let Ok(ip) = entry.ip.parse::<std::net::IpAddr>() {
         if let Ok(mut map) = peers_map.write() {
             if let Some(existing) = map.get_mut(&entry.peer_id) {
-                if !entry.node_id.is_empty() {
-                    existing.node_id = entry.node_id.clone();
-                }
                 if !entry.username.is_empty() {
                     existing.username = entry.username.clone();
                 }
@@ -245,7 +242,7 @@ fn merge_into_memory(
                         false,
                         entry.version,
                     );
-                    peer.node_id = entry.node_id.clone();
+                    peer.node_id.clear();
                     peer
                 });
             }
@@ -309,7 +306,7 @@ pub async fn handle_contact_summary(
         let _ = db
             .upsert_peer_with_node_id_avatar(
                 &entry.peer_id,
-                &entry.node_id,
+                "",
                 &entry.username,
                 &entry.department,
                 &entry.software_version,
@@ -428,7 +425,7 @@ pub async fn handle_contact_sync_res(
         let _ = db
             .upsert_peer_with_node_id_avatar(
                 &entry.peer_id,
-                &entry.node_id,
+                "",
                 &entry.username,
                 &entry.department,
                 &entry.software_version,
@@ -454,7 +451,7 @@ pub async fn handle_contact_sync_res(
         let _ = db
             .upsert_peer_with_node_id_avatar(
                 &entry.peer_id,
-                &entry.node_id,
+                "",
                 &entry.username,
                 &entry.department,
                 &entry.software_version,
