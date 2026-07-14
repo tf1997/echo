@@ -43,11 +43,11 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 |---|---|---|---|---|
 | M1 | 本地止血（零协议风险） | 8 | 8 | ✅ |
 | M2 | 送达可靠性（能力门控） | 5 | 5 | ✅ |
-| M3 | 身份健壮性（换 IP） | 4 | 1 | 🟡 |
+| M3 | 身份健壮性（换 IP） | 4 | 4 | ✅ |
 | M4 | 体验与大文件安全网 | 9 | 0 | ⬜ |
 | M5 | 根治：node_id 提主键 | 1 | 0 | ⬜ |
 | — | 文档同步 | 1 | 0 | ⬜ |
-| **合计** | | **28** | **14** | **50%** |
+| **合计** | | **28** | **17** | **61%** |
 
 ---
 
@@ -232,25 +232,28 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 ### TASK-14 · 迁移加 node_id 归属校验 + 旧版本降级 — P0（D2）
 - **问题**：`migrate_peer_references` 只判 `old != sender`，不校验 old_peer_id 的 node_id 归属 → 可被主动嫁接历史；DHCP 端点重用会自动把两人会话串到一个 node。
 - **改动**：`peer_id_changed` 携带 `node_id`；接收端仅当 `old_peer_id` 当前解析到的 node_id == 发送者 node_id 时才迁移；无 node_id（旧版本）回退现有 username+department+endpoint 启发式。`upsert_peer_alias` 改写归属前先校验冲突。
-- **文件**：`src-tauri/src/chat/mod.rs`（960-981）、`src-tauri/src/db/mod.rs`（1800-1817、1910-1932）。
+- **文件**：`src-tauri/src/chat/mod.rs`、`src-tauri/src/db/mod.rs`、`src-tauri/src/contact_sync.rs`、`src-tauri/src/discovery/broadcast.rs`、`src-tauri/src/lib.rs`。
 - **兼容**：铁律 2，安全性随旧版本淘汰收敛。
 - **验收**：伪造 `peer_id_changed{old: 他人id}` 被拒绝；DHCP 重用场景下 A、C 会话不再串。
-- 状态：⬜ · 负责人：— · 完成日期：— · Commit：—
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-14 · Commit：107ba5c
+- 备注：接收端统一校验 TCP 实际来源 endpoint、payload/wire `node_id` 一致性和 old/new endpoint 归属；已绑定 node 不允许无 node 来包降级，纯旧版仅在 endpoint、用户名、部门及可用 MAC 严格吻合时迁移。alias 使用条件 UPSERT，跨 node 冲突不再改写；迁移、alias、全表引用更新和旧 peer 删除纳入同一事务，任一步失败全部回滚。普通消息、联系人 relay 和 UDP relay 不能旁路建立已有 node 的新 endpoint 归属。测试覆盖同 node、跨 node 嫁接、降级、legacy、alias 冲突、普通 upsert 绕过、node-less 覆盖和事务回滚。当前 `node_id` 仍是公开标识，无法抵御攻击者完整复制受害者 node/profile；真正的主动身份认证需后续引入签名密钥。
 
 ### TASK-15 · 换 IP 通知改直发 + 覆盖在线 peer — P1（D4）
 - **问题**：换 IP 通知只 `queue_pending_notification` 且仅发 `list_stored_peers`；对方用旧 id 探测不到新 IP 的我，补发触发不了；双方同时换 IP 永久互相失联。
 - **改动**：对当前在线（内存 map）peer 直接 TCP 推 `peer_id_changed`，失败再入队；目标集合并入内存在线 peer。
-- **文件**：`src-tauri/src/state.rs`（114-159）。
+- **文件**：`src-tauri/src/state.rs`、`src-tauri/src/commands.rs`。
 - **兼容**：payload 仍用 `profile_updated` 夹带（铁律 4）；旧版本收到当新 peer（其固有局限）。
 - **验收**：两台新版本同时换 IP 后仍能互相发现并继续会话。
-- 状态：⬜ · 负责人：— · 完成日期：— · Commit：—
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-14 · Commit：107ba5c
+- 备注：启动期与运行期共用换 IP 发布路径，目标集合合并 stored peer 与内存在线 peer、去重并排除新旧本机 endpoint；复用并发 `send_or_queue_notification`，在线先 TCP 直发，失败才写 pending。兼容 payload 继续使用 `profile_updated`，同时在 wire 与 payload 携带稳定 `node_id`。已补目标合并/去重/排除离线与 self 的纯函数测试。
 
 ### TASK-16 · 群成员换 IP 后的迁移与分身清理 — P1（D5）
 - **问题**：`group_members.peer_id` 存 endpoint；第三方换 IP 通知到不了时，成员列表残留旧 id，且新 id 消息触发 auto-join 追加成员 → 同人两条成员记录。
 - **改动**：auto-join 前用 node_id/alias 判重，命中同 node 则更新而非新增；成员解析统一走 `identity_keys_for`。
-- **文件**：`src-tauri/src/chat/mod.rs`（943-944）、`src-tauri/src/db/mod.rs`。
+- **文件**：`src-tauri/src/chat/mod.rs`、`src-tauri/src/db/mod.rs`、`src-tauri/src/commands.rs`。
 - **验收**：群成员换 IP 后成员数不虚增，@ 与已读统计正确。
-- 状态：⬜ · 负责人：— · 完成日期：— · Commit：—
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-14 · Commit：107ba5c
+- 备注：新增基于已确认 `endpoint → node` 关系的群成员原子 upsert/remove：同 node 切换 endpoint 时保留最早 `joined_at` 并删除旧 alias；成员读取先规范化现有 `group_members`，不再从历史消息复活已退群成员；返回结果按 node（旧版按 endpoint）去重，同名同部门的不同 node 保持独立。auto-join、建群、退群及 fanout 统一使用规范化成员。未预绑定的新 endpoint 不会仅凭 wire 中可伪造的 node/profile 合并成员，而是先保持 endpoint 隔离，待可信迁移通知建立 alias 后自动收敛。
 
 ### TASK-17 · 前端 peer_id_changed 完整处理 — P1（D1 前端侧）
 - **问题**：前端 `frontend/src` 中 grep 不到任何 `peer_id_changed` 处理。
@@ -259,6 +262,35 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 - **验收**：对方换 IP 时前端无重复联系人、正开会话无缝续接、草稿不丢。
 - 状态：✅ · 负责人：Claude · 完成日期：2026-07-11 · Commit：627b264
 - 备注：`App.tsx` 新增 `peer-id-changed` 监听（disposed 模式）：从 `peers` 移除旧 id（必要时以旧信息补建新 id 条目）、把 `selectedPeer` 从旧 id 重指到新 id 触发历史重载、`recentRefreshKey+1`。新增 `PeerIdChangedEvent` 类型。tsc/lint 通过（无新增告警）。草稿隔离依赖 TASK-22，此处先保证会话 key 迁移。
+
+**自动验证（2026-07-14）**：`cargo fmt --check`、`cargo check`、`cargo test --no-run`、前端生产构建和 `git diff --check` 通过。Rust 测试二进制实际启动仍被本机既有 `0xc0000139 STATUS_ENTRYPOINT_NOT_FOUND` 阻断。ESLint 仍有仓库既有的 3 个 Fast Refresh error（`MessageBubble.tsx` 2 个、`main.tsx` 1 个）和 `ChatWindow.tsx` 1 个 Hook warning，本批未改前端且未新增 lint 项。
+
+### M3 手动验收清单（发布前）
+
+- **人工验收状态**：⬜ 未开始（全部通过后改为 ✅）
+- **建议环境**：同一局域网的新版本 A/B/C，另准备旧版本 D；每个实例使用独立数据目录。测试前备份数据库，并记录版本、commit、node_id、IP、日志和数据库路径。涉及伪造包时仅在隔离测试网执行。
+
+| 编号 | 关联任务 | 手动操作 | 通过标准 | 状态 / 证据 |
+|---|---|---|---|---|
+| M3-MAN-01 | TASK-14 / TASK-17 | A/B 已有私聊、未读和最近联系人；A 更换 IP 后重启或触发运行期热迁移，B 保持运行并打开与 A 的会话。 | B 只保留一个 A；会话自动切到新 endpoint，历史、未读、最近联系人和草稿 key 不丢；继续双向发送成功。 | ⬜ |
+| M3-MAN-02 | TASK-14 | 在隔离环境构造 `profile_updated`：发送者 node-B，`old_peer_id` 指向 node-A；再分别测试 payload/wire node 不一致、sender_id 与 TCP 来源不一致。 | 全部被拒绝并记录明确日志；A 的 messages、group_members、recent/pending、peer/alias 均不改变，前端不触发 `peer-id-changed`。 | ⬜ |
+| M3-MAN-03 | TASK-14 | 先让 A 从旧 IP 迁到新 IP，再让 node-C 复用 A 的旧 IP/port 并向 B 发消息。 | B 不把 C 写入 A 的 node/alias，不把 C 的消息并入 A 历史；冲突 endpoint 被隔离或拒绝，不发生串人。 | ⬜ |
+| M3-MAN-04 | TASK-14 | 准备 legacy 联系人记录：无 node_id、用户名/部门/endpoint 已知；分别发送身份完全一致、用户名不同、部门不同及 MAC 冲突的换 IP 通知。 | 仅严格一致的 legacy 通知允许降级迁移；任一身份冲突均拒绝，已绑定 node 的联系人不能被无 node 通知降级。 | ⬜ |
+| M3-MAN-05 | TASK-15 | A/B 在线但尚未产生最近会话，确认双方仅存在于内存发现列表；A 更换 IP。随后用防火墙临时阻断一次直发再恢复。 | 在线内存 peer 也收到通知；正常路径立即直达，阻断时只生成一条 pending，恢复后补发并清队列。 | ⬜ |
+| M3-MAN-06 | TASK-15 | A/B 两台新版本尽量同时切换网络或 DHCP 地址，保持进程运行；持续观察发现日志并双向发送。 | 双方通过新 endpoint 重新发现并继续原会话；无永久互相失联、无重复联系人，失败通知可由 pending 补发。 | ⬜ |
+| M3-MAN-07 | TASK-16 | 建立含 A/B/C 的群；记录成员数与 joined_at。让 C 换 IP，并让迁移通知先失败入队；恢复网络使通知补发，再由 C 发送群消息。 | alias 建立后成员从旧 endpoint 原子切到新 endpoint，成员总数不虚增、joined_at 不变；群消息 fanout 对 C 只投递一次。 | ⬜ |
+| M3-MAN-08 | TASK-16 | 创建两个用户名和部门完全相同、node_id 不同的成员加入同一群；其中一人换 IP，再让另一人退群。 | 两人始终是两条独立成员；换 IP 只收敛同 node alias；退群后即使保留历史消息也不会被成员读取重新加入或继续收到 fanout。 | ⬜ |
+| M3-MAN-09 | 兼容/回归 | 新版本 A 与旧版本 D 测试私聊、群聊、离线恢复和 D 换 IP；随后重启所有实例，检查私聊历史、群成员、未读、最近联系人和 pending。 | 缺少 node_id 时按 legacy 规则降级且基础通信不劣化；重启后数据不丢、不串人，群成员和未读统计稳定。 | ⬜ |
+
+**测试记录**：
+
+- 测试人：—
+- 日期：—
+- A/B/C/D 版本与 commit：—
+- A/B/C/D node_id、IP 与网络环境：—
+- 结果：⬜ 未开始 / 🟡 部分通过 / ✅ 全部通过
+- 日志、数据库查询、截图或录屏路径：—
+- 失败项与问题链接：—
 
 ---
 
@@ -402,3 +434,4 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 | 2026-07-13 | 修复“最近有会话但联系人为空”：`get_unread_counts` 的 `node_id` 分组歧义导致整组 `Promise.all` 失败；后端改用 `resolved_node_id`，前端将未读加载降级为独立容错，避免辅助查询阻断联系人列表 | Codex |
 | 2026-07-13 | 回填 M1 / TASK-17 提交号 `627b264`；完成 M2 TASK-09～13：`0.2.0` 能力门控与硬 ACK、文件字节校验/半包清理、投递三态与补发回写、失焦保留未读、群消息后台并发 fanout | Codex |
 | 2026-07-13 | 补充 M2 发布前手动验收清单：ACK 丢失与进程崩溃、文件完整性/中断、新旧版本降级、投递状态、失焦未读和含离线成员群发 | Codex |
+| 2026-07-14 | 完成 M3 TASK-14～16：换 IP 迁移归属校验与事务回滚、在线 peer 直发失败入队、群成员按可信 node/alias 原子收敛；封堵普通 upsert、node-less 覆盖及 TCP/联系人/UDP relay 旁路，并补充 M3 发布前手动验收清单 | Codex |
