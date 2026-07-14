@@ -42,12 +42,12 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 | 里程碑 | 主题 | 任务数 | 完成 | 状态 |
 |---|---|---|---|---|
 | M1 | 本地止血（零协议风险） | 8 | 8 | ✅ |
-| M2 | 送达可靠性（能力门控） | 5 | 0 | ⬜ |
+| M2 | 送达可靠性（能力门控） | 5 | 5 | ✅ |
 | M3 | 身份健壮性（换 IP） | 4 | 1 | 🟡 |
 | M4 | 体验与大文件安全网 | 9 | 0 | ⬜ |
 | M5 | 根治：node_id 提主键 | 1 | 0 | ⬜ |
 | — | 文档同步 | 1 | 0 | ⬜ |
-| **合计** | | **28** | **9** | **32%** |
+| **合计** | | **28** | **14** | **50%** |
 
 ---
 
@@ -63,7 +63,7 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 - **文件**：`src-tauri/src/chat/mod.rs`（迁移调用点 960-981）、`src-tauri/src/discovery/service.rs`、`frontend/src/App.tsx`。
 - **兼容**：纯本地 + 新增事件，旧版本不受影响。
 - **验收**：A 换 IP 重启 → B 正开着与 A 的会话 → B 无需重启即可继续给 A 发消息且送达；B 侧栏无重复的 A 条目。
-- 状态：✅ · 负责人：Claude · 完成日期：2026-07-11 · Commit：（待提交）
+- 状态：✅ · 负责人：Claude · 完成日期：2026-07-11 · Commit：627b264
 - 备注：已完成后端（`chat/mod.rs` 迁移点后 `map.remove(old)` + `emit_all("peer-id-changed", {oldPeerId,newPeerId,nodeId})`）。静态验证通过（cargo build / tsc / lint）。多实例运行时验收待做。
 
 ### TASK-02 · 死队列 alias 兜底重定向 — P0（D1）
@@ -72,7 +72,7 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 - **文件**：`src-tauri/src/commands.rs`、`src-tauri/src/db/mod.rs`。
 - **兼容**：对有 node_id 关联的 peer 生效；纯旧版本无 alias 则维持现状，不劣化。
 - **验收**：构造一条 `peer_id=旧id` 的 pending，A 以新 id 上线后该消息能被投出并从队列删除。
-- 状态：✅ · 负责人：Claude · 完成日期：2026-07-11 · Commit：（待提交）
+- 状态：✅ · 负责人：Claude · 完成日期：2026-07-11 · Commit：627b264
 - 备注：`deliver_pending_to_peer` 现遍历 `db.identity_aliases(peer_id)` 解析出的全部历史 endpoint，把各自 `pending_notifications` 队列投递到当前地址。新增 `Database::identity_aliases`（`identity_keys_for` 的 pub 包装）。静态验证通过。
 
 ### TASK-03 · client_msg_id 唯一索引 + 存量去重 — P0（通信 3）
@@ -81,7 +81,7 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 - **文件**：`src-tauri/src/db/mod.rs`（schema 490-527、save_message* 2340+/1488+）。
 - **兼容/雷区**：历史 `client_msg_id` 多为 NULL——SQLite 多个 NULL 不冲突，天然安全，但索引定义要显式确认不误伤 NULL；升级时存量重复行必须**先去重再建索引**，否则 `CREATE UNIQUE INDEX` 失败。沿用现有 `IF NOT EXISTS` 幂等风格。
 - **验收**：并发两次 dedup 保存同 `client_msg_id` 仅落一行；旧库升级不报错。
-- 状态：✅ · 负责人：Claude · 完成日期：2026-07-11 · Commit：（待提交）
+- 状态：✅ · 负责人：Claude · 完成日期：2026-07-11 · Commit：627b264
 - 备注：建索引前先按 `(sender_id, COALESCE(group_id,''), client_msg_id)` 去重保留 MIN(id)；建**部分唯一索引** `idx_messages_client_dedup`（`WHERE client_msg_id IS NOT NULL AND TRIM<>''`，避开 NULL 冲突）；`save_message`/`save_group_message` 改 `ON CONFLICT DO NOTHING` + `rows_affected()==0` 时回查既有行返回。静态验证通过。
 
 ### TASK-04 · 运行期 IP 变化监听（不重启也能换 IP） — P0（D3）
@@ -90,7 +90,7 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 - **文件**：`src-tauri/src/lib.rs`、`src-tauri/src/state.rs`、`src-tauri/src/chat/mod.rs`、`src-tauri/src/commands.rs`、`src-tauri/src/discovery/service.rs`、`src-tauri/src/discovery/broadcast.rs`、`frontend/src/App.tsx`。
 - **兼容**：广播仍用旧 `AnnouncePacket` 格式，旧版本照收。
 - **验收**：运行中手动改本机 IP（或切网卡），≤30s 内对端能以新 IP 连到本机。
-- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：（待提交）
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：627b264
 - 备注：新增 10s 本机 IP 监听、共享动态 LocalPeerId、DB 引用/alias 迁移、LAN 发现原地重建并立即发送 startup burst、稳定 node_id 自包过滤，以及前端本机 peer_id 热更新。cargo check / 前端 build 通过；真实切网卡 ≤30s 多实例验收待现场复核。
 
 ### TASK-05 · 渲染止血：diff 后再 setState + MessageBubble.memo — P1（C1）
@@ -99,7 +99,7 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 - **文件**：`frontend/src/App.tsx`、`frontend/src/components/Sidebar.tsx`、`frontend/src/components/MessageBubble.tsx`、`frontend/src/components/ChatWindow.tsx`。
 - **兼容**：纯前端。
 - **验收**：无网络变化时 React DevTools Profiler 显示消息列表 2s 内不再重渲染。
-- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：（待提交）
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：627b264
 - 备注：peers/groups/unread 内容未变时复用旧引用；MessageBubble 使用 React.memo；allItems 与 Sidebar 派生 Map 使用 useMemo。前端生产构建通过；React DevTools Profiler 待现场复核。
 
 ### TASK-06 · 失败 pending 消息排序改用 createdAt — P1（A6）
@@ -107,7 +107,7 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 - **改动**：所有 pending 创建处补写 `createdAt`（文本/文件路径当前漏写：1448-1454、1486-1494、1690-1692、1721-1723），排序用 `createdAt`。
 - **文件**：`frontend/src/components/ChatWindow.tsx`。
 - **验收**：一条失败消息后再收 20 条新消息，失败消息停在它原本的时间位置而非底部。
-- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：（待提交）
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：627b264
 - 备注：PendingMessage.createdAt 改为必填，文本、截图、选择文件、原生拖放、贴图/重试等全部创建路径均写入时间；排序稳定使用 createdAt。前端生产构建通过。
 
 ### TASK-07 · App.tsx 事件监听改 disposed 模式 — P1（A7）
@@ -115,7 +115,7 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 - **改动**：统一采用 ChatWindow 已有的 `disposed + trackUnlisten` 模式（ChatWindow.tsx:861-904 为范式）。
 - **文件**：`frontend/src/App.tsx`（328-338、888-950、952-966）。
 - **验收**：dev StrictMode 下 conversation-updated 只注册一份，markRead 不重复触发。
-- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：（待提交）
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：627b264
 - 备注：conversation-updated、tray-open-conversation、peer-id-changed（含新增 local-peer-id-changed）均使用 disposed 模式，解决 StrictMode 注册/清理竞态。前端生产构建通过。
 
 ### TASK-08 · 补发按 peer 加互斥锁 — P1（通信 3）
@@ -123,7 +123,7 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 - **改动**：按 peer_id 维护"正在投递"标记（`Mutex<HashSet>` 或 per-peer flag），投递中则跳过本轮。
 - **文件**：`src-tauri/src/commands.rs`、`src-tauri/src/lib.rs`。
 - **验收**：对同一 peer 快速触发两轮补发，队列记录只被投递一次。
-- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：（待提交）
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：627b264
 - 备注：进程级 Mutex<HashSet<peer_id>> 实现 single-flight 投递，重复触发直接跳过；新增并发门控单元测试。cargo check 与测试编译通过；Windows 测试进程受 STATUS_ENTRYPOINT_NOT_FOUND 环境问题未能启动。
 
 ### M1 手动验收清单（发布前）
@@ -144,8 +144,8 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 
 **测试记录**：
 
-- 日期：—
 - 测试人：—
+- 日期：—
 - A/B/C 版本与 commit：—
 - A/B/C IP 与网络环境：—
 - 结果：⬜ 未开始 / 🟡 部分通过 / ✅ 全部通过
@@ -156,43 +156,74 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 
 ## 4. 里程碑 M2 — 送达可靠性（能力门控，新版本间强语义 / 旧版本走原路）
 
-### TASK-09 · ACK 硬语义（client_msg_id 门控） — P0（通信 1）
+### TASK-09 · ACK 硬语义（client_msg_id + software_version 门控） — P0（通信 1）
 - **问题**：`send_wire_message` ACK 超时当成功（1692-1699）；`deliver_over_tcp` 写完即 true；补发写完即删队列。对端刚崩溃时消息静默丢失且永久删除。
-- **改动**：仅当消息**带 `client_msg_id`**（=对端新版本）时要求 ACK：ACK 超时 → 不删队列、保留重试；ACK 超时窗口从 180ms 提到 2–5s。不带 `client_msg_id` 的（旧版本）保持"发出即成功"。
+- **改动**：仅当消息带 `client_msg_id` 且已知对端 `software_version >= 0.2.0` 时要求 ACK：ACK 超时 → 不删队列、保留重试；ACK 窗口从 180ms 提到 3s。版本缺失/低于阈值的旧客户端保持“写完即成功”。
 - **文件**：`src-tauri/src/chat/mod.rs`（24、1692-1699）、`src-tauri/src/commands.rs`（deliver_over_tcp 3957-3959、补发 4027）。
 - **兼容**：铁律 3。旧版本零影响。
 - **验收**：新版本↔新版本：对端进程被 kill 后发消息 → 显示未送达并保留在队列；对端恢复后自动送达且不重复（靠 TASK-03 去重）。旧版本↔新版本：行为不变。
-- 状态：⬜ · 负责人：— · 完成日期：— · Commit：—
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：c6a8c31
+- 备注：Cargo/Tauri 版本同步提升至 `0.2.0`，作为 ACK 能力阈值；直发、群 fanout 与 pending 补发共用严格 ACK 校验，错误/缺失 ACK 均不删除队列。版本门控、错误 ACK、超时、旧版降级和 pending 前缀删除测试已补，测试编译通过；Windows 测试进程仍被 `STATUS_ENTRYPOINT_NOT_FOUND` 阻断。
 
 ### TASK-10 · 文件端到端确认 + 字节校验（software_version 门控） — P0（通信 2）
 - **问题**：文件写完 flush 即报成功，从不读接收端已回的 ACK；接收端落库前不校验字节数，截断文件被当完整保存。
 - **改动**：接收端在 `file_end` 校验累计字节 == `file_size`（可选哈希）后才回 ACK；发送端在对端 `software_version ≥ 支持版本`时阻塞等待该 ACK，失败发 `file-error` 而非报成功。旧接收端不回 ACK → 回退当前"写完即成功"。
 - **文件**：`src-tauri/src/chat/mod.rs`（发送 2119-2133、接收 1291-1304 / 1447-1449）。
-- **兼容**：门控 `software_version`；旧版本走原路。
+- **兼容**：门控 `software_version >= 0.2.0`；版本缺失或低版本走原路。
 - **验收**：新↔新：传输中断对端不落库、发送端显示失败；正常完成两端字节一致。旧↔新：不回退为失败。
-- 状态：⬜ · 负责人：— · 完成日期：— · Commit：—
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：c6a8c31
+- 备注：接收端校验逐帧身份/文件元数据、累计字节与声明大小，所有解码、写盘、flush、尺寸或落库失败均删除半包且不回 ACK；ACK 丢失重传命中 `client_msg_id` 去重后会删除新建临时文件，避免孤儿。直发、群文件和 pending 群文件仅对 `0.2.0+` 等待 ACK，旧版维持写完成功；文件 ACK 正路径和字节上限测试已补。
 
 ### TASK-11 · 前端投递状态 UI（已送达/等待上线/失败重试） — P0（B1）
 - **问题**：直发失败静默入队并照常返回成功，气泡上无任何投递状态，用户以为对方已收到。
-- **改动**：后端把 `delivered` 布尔随 ChatMessage 返回并入库；前端气泡 meta 显示 已送达 / 等待对方上线 / 发送失败(可重试)；投递成功经 conversation-updated 更新。依赖 TASK-09/10 提供真实送达信号。
+- **改动**：后端把可空 `delivered` 随 ChatMessage 返回并入库；前端气泡 meta 显示 已送达 / 等待对方上线 / 已发送，命令失败的 pending 显示发送失败并可重试；补发成功经 conversation-updated 更新。依赖 TASK-09/10 提供真实送达信号。
 - **文件**：`src-tauri/src/db/mod.rs`（messages 加 delivered 列）、`src-tauri/src/chat/mod.rs`、`frontend/src/components/MessageBubble.tsx`、`frontend/src/components/ChatWindow.tsx`。
-- **兼容**：delivered 列默认值兼容旧库；对旧版本 peer 因无 ACK，状态显示"已发送"（不谎称"已送达"）。
+- **兼容**：`delivered` 使用可空三态兼容旧库：`true`=ACK 已确认、`false`=等待补发、`NULL`=旧版/历史未知并显示“已发送”，不谎称“已送达”。
 - **验收**：给离线 peer 发消息显示"等待对方上线"，对方上线后变"已送达"。
-- 状态：⬜ · 负责人：— · 完成日期：— · Commit：—
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：c6a8c31
+- 备注：私聊在线 ACK、离线排队与旧版写完分别落为三态；补发成功先按身份 alias + `client_msg_id` 回写消息，再删除队列并 emit 刷新气泡。前端比较逻辑纳入 `delivered`，失败 pending 原位复用同一 `client_msg_id` 重试；文件进度不再按 100% 定时强删失败气泡。
 
 ### TASK-12 · 失焦时不自动已读 — P1（A2）
 - **问题**：窗口最小化/失焦时活跃会话新消息被无条件 markRead，未读永不增长 → 无声音无角标，用户错过消息。
 - **改动**：仅 `document.hasFocus()`（或 `appWindow.isVisible() && isFocused()`）时才 markRead；失焦走未读计数路径，focus 事件里用已有 `refreshActiveConversation` 补 markRead。
 - **文件**：`frontend/src/App.tsx`（907-914、935-941）。
 - **验收**：最小化后对方发消息 → 托盘角标 +1、有提示音；恢复窗口后清零。
-- 状态：⬜ · 负责人：— · 完成日期：— · Commit：—
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：c6a8c31
+- 备注：活跃会话仍即时合并事件消息，仅 `document.hasFocus()` 时自动 markRead；失焦/最小化走未读刷新，重新聚焦复用现有 focus 路径补标已读。前端 build 与定向 ESLint 通过（无新增告警）。
 
 ### TASK-13 · 群消息 fanout 异步化 + 部分失败不丢本地 — P1（通信 4）
 - **问题**：`send_group_message_typed` 同步串行对每个成员投递，掉线成员各吃 2s 超时；任一入队失败整体返回 Err 且不写本地库，消息"消失"。
-- **改动**：fanout 移入后台 `JoinSet` 并发；命令先落本地库再返回；失败成员入队即可，不影响本地可见。
+- **改动**：fanout 移入后台并用 `join_all` 并发；命令先落本地库并 emit 后返回；失败成员入队即可，不影响本地可见。
 - **文件**：`src-tauri/src/commands.rs`（2734-2775）。
 - **验收**：N 人群含离线成员，发送即时返回且本地立即可见；离线成员上线后补收。
-- 状态：⬜ · 负责人：— · 完成日期：— · Commit：—
+- 状态：✅ · 负责人：Codex · 完成日期：2026-07-13 · Commit：c6a8c31
+- 备注：群文本先保存并立即返回，再后台并发直投/入队；单成员失败只记日志。新增双监听器 Barrier 测试，串行实现会超时，并发实现可同时收包并回 ACK；测试编译通过。
+
+### M2 手动验收清单（发布前）
+
+- **人工验收状态**：⬜ 未开始（全部通过后改为 ✅）
+- **建议环境**：新版本 A/B、旧版本 C；群聊测试另准备新版本 D/E。各实例使用独立数据目录，并记录版本、IP、日志、数据库路径和 `client_msg_id`。
+
+| 编号 | 关联任务 | 手动操作 | 通过标准 | 状态 / 证据 |
+|---|---|---|---|---|
+| M2-MAN-01 | TASK-09 / TASK-11 | 新版本 A/B 在线，A 向 B 连续发送文本、表情等带 `client_msg_id` 的消息。 | B 每条仅显示一次；A 收到 ACK 后显示“已送达”；对应 pending 队列为空。 | ⬜ |
+| M2-MAN-02 | TASK-03 / TASK-09 / TASK-11 | 用网络代理或调试手段仅丢弃 B→A 的 ACK、保留 A→B 的消息；随后恢复 ACK 并触发补发。 | ACK 超时后 A 不删除 pending 且不显示“已送达”；恢复后自动补发并清队列；B 按 `client_msg_id` 去重，始终只有一条消息。 | ⬜ |
+| M2-MAN-03 | TASK-09 / TASK-11 | 结束新版本 B 进程，A 向 B 发送消息；确认状态后重启 B。 | A 显示“等待对方上线”或可重试状态，消息保留在队列；B 恢复后自动收到且仅收到一次，A 最终更新为“已送达”。 | ⬜ |
+| M2-MAN-04 | TASK-10 / TASK-11 | 新版本 A→B 正常发送一个较大文件；完成后分别执行 `Get-FileHash` 并比较大小与 SHA-256。 | B 仅在完整落盘并通过字节校验后保存消息和回 ACK；两端大小、SHA-256 一致；A 最终显示成功/已送达。 | ⬜ |
+| M2-MAN-05 | TASK-10 / TASK-11 | A→B 发送大文件，在约 30%～70% 时断网、结束 B 或中断 TCP；随后恢复网络并重试。 | B 不产生已完成消息，临时半包被清理；A 显示发送失败且可重试、不误报成功；重试后文件完整且仅有一条有效记录。 | ⬜ |
+| M2-MAN-06 | TASK-09 / TASK-10 / TASK-11 | 新版本 A 与旧版本 C 互发在线/离线文本和文件，等待时间超过新版本 ACK 超时窗口。 | C 不回 ACK 时 A 仍走旧路径，不无限保留队列；基础行为不劣化；状态只显示“已发送”，不谎称“已送达”。 | ⬜ |
+| M2-MAN-07 | TASK-12 | A 打开与 B 的会话后最小化或切到其他窗口；B 分别发送私聊和群消息；随后重新聚焦 A。 | 失焦期间不自动已读，侧栏与托盘未读数增加并有提示音；恢复焦点后当前会话刷新并清零，提示音不重复。 | ⬜ |
+| M2-MAN-08 | TASK-13 | 创建含 A/B/D/E 的群，令 D/E 离线，A 连续发送多条消息；观察本地与在线 B，再启动 D/E。 | 发送立即返回且本地立即可见，不随离线成员数量线性阻塞；B 即时收到；D/E 上线后补收且不重复；单成员失败不影响其他成员和 A 的本地记录。 | ⬜ |
+
+**测试记录**：
+
+- 测试人：—
+- 日期：—
+- A/B/C/D/E 版本与 commit：—
+- 网络、ACK 丢弃方式与数据目录：—
+- 结果：⬜ 未开始 / 🟡 部分通过 / ✅ 全部通过
+- 日志、气泡/托盘截图、pending 查询、文件大小与 SHA-256：—
+- 失败项与问题链接：—
 
 ---
 
@@ -226,7 +257,7 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 - **改动**：与 TASK-01 事件对接，覆盖 activeContact/messages/pending/草稿/未读 全部按会话 key 迁移；侧栏去重旧条目。
 - **文件**：`frontend/src/App.tsx`、`frontend/src/components/ChatWindow.tsx`、`frontend/src/components/Sidebar.tsx`。
 - **验收**：对方换 IP 时前端无重复联系人、正开会话无缝续接、草稿不丢。
-- 状态：✅ · 负责人：Claude · 完成日期：2026-07-11 · Commit：（待提交）
+- 状态：✅ · 负责人：Claude · 完成日期：2026-07-11 · Commit：627b264
 - 备注：`App.tsx` 新增 `peer-id-changed` 监听（disposed 模式）：从 `peers` 移除旧 id（必要时以旧信息补建新 id 条目）、把 `selectedPeer` 从旧 id 重指到新 id 触发历史重载、`recentRefreshKey+1`。新增 `PeerIdChangedEvent` 类型。tsc/lint 通过（无新增告警）。草稿隔离依赖 TASK-22，此处先保证会话 key 迁移。
 
 ---
@@ -369,3 +400,5 @@ Echo 是 P2P 局域网应用，**整网不可能同时升级**，新旧客户端
 | 2026-07-13 | 完成 M1：TASK-04（运行期 IP 热迁移与立即重广播）、TASK-05（轮询 diff + memo/useMemo）、TASK-06（pending createdAt 稳定排序）、TASK-07（事件监听 disposed）、TASK-08（按 peer single-flight 补发）。cargo check、cargo fmt、前端生产构建通过；Rust 测试已编译，运行受 Windows STATUS_ENTRYPOINT_NOT_FOUND 阻断 | Codex |
 | 2026-07-13 | 补充 M1 发布前手动验收清单：换 IP、Profiler、pending 排序、StrictMode、补发 single-flight、重启回归与新旧版本兼容 | Codex |
 | 2026-07-13 | 修复“最近有会话但联系人为空”：`get_unread_counts` 的 `node_id` 分组歧义导致整组 `Promise.all` 失败；后端改用 `resolved_node_id`，前端将未读加载降级为独立容错，避免辅助查询阻断联系人列表 | Codex |
+| 2026-07-13 | 回填 M1 / TASK-17 提交号 `627b264`；完成 M2 TASK-09～13：`0.2.0` 能力门控与硬 ACK、文件字节校验/半包清理、投递三态与补发回写、失焦保留未读、群消息后台并发 fanout | Codex |
+| 2026-07-13 | 补充 M2 发布前手动验收清单：ACK 丢失与进程崩溃、文件完整性/中断、新旧版本降级、投递状态、失焦未读和含离线成员群发 | Codex |
