@@ -19,12 +19,16 @@ pub const FILE_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 const FILE_LINE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const FILE_RECEIVE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 pub const FILE_SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+pub const MAX_TCP_LINE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_INCOMING_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const FILE_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 const TCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const MESSAGE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 pub(crate) const MESSAGE_ACK_MIN_VERSION: &str = "0.2.0";
 const EVENT_CONVERSATION_UPDATED: &str = "conversation-updated";
+const EVENT_FILE_RECEIVE_PROGRESS: &str = "file-receive-progress";
 pub const FILE_TRANSFER_CANCELLED_MESSAGE: &str = "发送已取消";
+const FILE_CANCELLED_CLIENT_ID_PREFIX: &str = "cancel:";
 const AVATAR_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +50,86 @@ fn normalized_client_msg_id(client_msg_id: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn cancelled_client_msg_id(client_msg_id: Option<&str>) -> Option<String> {
+    normalized_client_msg_id(client_msg_id)
+        .map(|client_msg_id| format!("{FILE_CANCELLED_CLIENT_ID_PREFIX}{client_msg_id}"))
+}
+
+fn cancellation_source_client_msg_id(client_msg_id: Option<&str>) -> Option<String> {
+    normalized_client_msg_id(client_msg_id).and_then(|client_msg_id| {
+        client_msg_id
+            .strip_prefix(FILE_CANCELLED_CLIENT_ID_PREFIX)
+            .map(str::to_string)
+    })
+}
+
+async fn read_bounded_line_with_limit<R>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use std::io::{Error, ErrorKind};
+
+    output.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(output.len());
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take_len = newline.map_or(available.len(), |index| index + 1);
+        if take_len > max_bytes.saturating_sub(output.len()) {
+            reader.consume(take_len);
+            output.clear();
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("TCP line exceeds {max_bytes} byte limit"),
+            ));
+        }
+
+        output.extend_from_slice(&available[..take_len]);
+        reader.consume(take_len);
+        if newline.is_some() {
+            return Ok(output.len());
+        }
+    }
+}
+
+pub(crate) async fn read_bounded_wire_line<R>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    read_bounded_line_with_limit(reader, output, MAX_TCP_LINE_BYTES).await
+}
+
+async fn wire_receiver_matches_local_identity(
+    db: &Database,
+    receiver_id: &str,
+    receiver_node_id: &str,
+    my_id: &str,
+    my_node_id: &str,
+) -> bool {
+    let receiver_node_id = receiver_node_id.trim();
+    if !receiver_node_id.is_empty() {
+        return receiver_node_id == my_node_id;
+    }
+    let receiver_id = receiver_id.trim();
+    if receiver_id.is_empty() || receiver_id == my_id {
+        return true;
+    }
+    db.identity_aliases(my_id)
+        .await
+        .map(|aliases| aliases.iter().any(|alias| alias == receiver_id))
+        .unwrap_or(false)
 }
 
 pub(crate) fn peer_supports_message_ack(software_version: &str) -> bool {
@@ -287,15 +371,114 @@ pub struct FileWireMessageLine<'a> {
 struct IncomingFileState {
     file: BufWriter<tokio::fs::File>,
     path: String,
+    transfer_id: String,
     file_name: String,
     sender_id: String,
+    sender_node_id: String,
     sender_name: String,
     receiver_id: String,
+    receiver_node_id: String,
     group_id: Option<String>,
     kind: String,
     client_msg_id: Option<String>,
     expected_size: u64,
     received_size: u64,
+    started_at: std::time::Instant,
+    last_progress_emit: std::time::Instant,
+}
+
+fn validate_incoming_file_size(expected_size: u64) -> Result<()> {
+    if expected_size > MAX_INCOMING_FILE_BYTES {
+        anyhow::bail!(
+            "Incoming file exceeds {} byte limit: declared {} bytes",
+            MAX_INCOMING_FILE_BYTES,
+            expected_size
+        );
+    }
+    Ok(())
+}
+
+fn incoming_file_transfer_id(msg: &WireMessage) -> String {
+    if let Some(client_msg_id) = normalized_client_msg_id(msg.client_msg_id.as_deref()) {
+        let conversation_id = msg.group_id.as_deref().unwrap_or(&msg.receiver_id);
+        let sender_identity = if msg.sender_node_id.trim().is_empty() {
+            &msg.sender_id
+        } else {
+            &msg.sender_node_id
+        };
+        format!(
+            "incoming:{}:{}:{}",
+            sender_identity, conversation_id, client_msg_id
+        )
+    } else {
+        format!("incoming:legacy:{}", uuid::Uuid::new_v4())
+    }
+}
+
+fn incoming_file_speed(started_at: std::time::Instant, received: u64) -> u64 {
+    let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+    (received as f64 / elapsed) as u64
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_file_receive_progress_values(
+    app_handle: &AppHandle,
+    transfer_id: &str,
+    client_msg_id: Option<&str>,
+    file_name: &str,
+    sender_id: &str,
+    sender_node_id: &str,
+    group_id: Option<&str>,
+    received: u64,
+    total: u64,
+    speed: u64,
+    done: bool,
+    status: &str,
+) {
+    let _ = app_handle.emit_all(
+        EVENT_FILE_RECEIVE_PROGRESS,
+        serde_json::json!({
+            "transferId": transfer_id,
+            "clientMsgId": client_msg_id,
+            "fileName": file_name,
+            "senderId": sender_id,
+            "senderNodeId": sender_node_id,
+            "groupId": group_id,
+            "received": received,
+            "total": total,
+            "speed": speed,
+            "done": done,
+            "status": status,
+        }),
+    );
+}
+
+fn emit_file_receive_progress(
+    app_handle: &AppHandle,
+    file_state: &mut IncomingFileState,
+    done: bool,
+    status: &str,
+    force: bool,
+) {
+    let now = std::time::Instant::now();
+    if !force && now.duration_since(file_state.last_progress_emit) < FILE_PROGRESS_INTERVAL {
+        return;
+    }
+    emit_file_receive_progress_values(
+        app_handle,
+        &file_state.transfer_id,
+        file_state.client_msg_id.as_deref(),
+        &file_state.file_name,
+        &file_state.sender_id,
+        &file_state.sender_node_id,
+        file_state.group_id.as_deref(),
+        file_state.received_size,
+        file_state.expected_size,
+        incoming_file_speed(file_state.started_at, file_state.received_size),
+        done,
+        status,
+    );
+    file_state.last_progress_emit = now;
 }
 
 async fn create_received_file(filename: &str) -> Result<(tokio::fs::File, String)> {
@@ -316,29 +499,41 @@ async fn create_received_file(filename: &str) -> Result<(tokio::fs::File, String
     Ok((file, file_path.to_string_lossy().to_string()))
 }
 
-async fn start_incoming_file(msg: &WireMessage) -> Result<IncomingFileState> {
+async fn start_incoming_file(
+    msg: &WireMessage,
+    app_handle: &AppHandle,
+) -> Result<IncomingFileState> {
     let expected_size = msg
         .file_size
         .context("Incoming file frame is missing file_size")?;
+    validate_incoming_file_size(expected_size)?;
     let file_name = msg
         .file_name
         .as_deref()
         .map(safe_received_file_name)
         .unwrap_or_else(|| "unknown".to_string());
     let (file, path) = create_received_file(&file_name).await?;
-    Ok(IncomingFileState {
+    let now = std::time::Instant::now();
+    let mut file_state = IncomingFileState {
         file: BufWriter::with_capacity(FILE_RECEIVE_BUFFER_SIZE, file),
         path,
+        transfer_id: incoming_file_transfer_id(msg),
         file_name,
         sender_id: msg.sender_id.clone(),
+        sender_node_id: msg.sender_node_id.clone(),
         sender_name: msg.sender_name.clone(),
         receiver_id: msg.receiver_id.clone(),
+        receiver_node_id: msg.receiver_node_id.clone(),
         group_id: msg.group_id.clone(),
         kind: msg.file_kind.as_deref().unwrap_or("file").to_string(),
         client_msg_id: normalized_client_msg_id(msg.client_msg_id.as_deref()),
         expected_size,
         received_size: 0,
-    })
+        started_at: now,
+        last_progress_emit: now,
+    };
+    emit_file_receive_progress(app_handle, &mut file_state, false, "receiving", true);
+    Ok(file_state)
 }
 
 fn validate_incoming_file_frame(file_state: &IncomingFileState, msg: &WireMessage) -> Result<()> {
@@ -351,7 +546,9 @@ fn validate_incoming_file_frame(file_state: &IncomingFileState, msg: &WireMessag
     let frame_client_msg_id = normalized_client_msg_id(msg.client_msg_id.as_deref());
 
     if msg.sender_id != file_state.sender_id
+        || msg.sender_node_id != file_state.sender_node_id
         || msg.receiver_id != file_state.receiver_id
+        || msg.receiver_node_id != file_state.receiver_node_id
         || msg.group_id != file_state.group_id
         || frame_file_name != file_state.file_name
         || frame_kind != file_state.kind
@@ -359,6 +556,40 @@ fn validate_incoming_file_frame(file_state: &IncomingFileState, msg: &WireMessag
         || msg.file_size != Some(file_state.expected_size)
     {
         anyhow::bail!("Incoming file metadata changed during transfer");
+    }
+    Ok(())
+}
+
+fn validate_incoming_file_cancellation(
+    file_state: &IncomingFileState,
+    msg: &WireMessage,
+) -> Result<()> {
+    let frame_file_name = msg
+        .file_name
+        .as_deref()
+        .map(safe_received_file_name)
+        .unwrap_or_else(|| "unknown".to_string());
+    let frame_kind = msg.file_kind.as_deref().unwrap_or("file");
+    let frame_client_msg_id = normalized_client_msg_id(msg.client_msg_id.as_deref());
+    let expected_cancel_client_msg_id =
+        cancelled_client_msg_id(file_state.client_msg_id.as_deref());
+    // Accept the original id as a transition-only fallback for peers that shipped an
+    // early version of the cancellation frame. New senders always use the derived id
+    // so legacy receivers do not consume the original file retry id.
+    let client_msg_id_matches = frame_client_msg_id == expected_cancel_client_msg_id
+        || (file_state.client_msg_id.is_some() && frame_client_msg_id == file_state.client_msg_id);
+
+    if msg.sender_id != file_state.sender_id
+        || msg.sender_node_id != file_state.sender_node_id
+        || msg.receiver_id != file_state.receiver_id
+        || msg.receiver_node_id != file_state.receiver_node_id
+        || msg.group_id != file_state.group_id
+        || frame_file_name != file_state.file_name
+        || frame_kind != file_state.kind
+        || !client_msg_id_matches
+        || msg.file_size != Some(file_state.expected_size)
+    {
+        anyhow::bail!("Incoming file cancellation metadata does not match active transfer");
     }
     Ok(())
 }
@@ -378,13 +609,36 @@ fn checked_received_size(current: u64, chunk_len: usize, expected: u64) -> Resul
     Ok(next)
 }
 
+fn validate_encoded_file_chunk_size(encoded_len: usize) -> Result<()> {
+    let max_encoded_chunk_size = base64_encoded_capacity(FILE_CHUNK_SIZE);
+    if encoded_len > max_encoded_chunk_size {
+        anyhow::bail!(
+            "Incoming encoded file frame exceeds {} byte limit",
+            max_encoded_chunk_size
+        );
+    }
+    Ok(())
+}
+
+fn validate_decoded_file_chunk_size(decoded_len: usize) -> Result<()> {
+    if decoded_len > FILE_CHUNK_SIZE {
+        anyhow::bail!(
+            "Incoming decoded file frame exceeds {} byte limit",
+            FILE_CHUNK_SIZE
+        );
+    }
+    Ok(())
+}
+
 async fn append_incoming_file_frame(
     file_state: &mut IncomingFileState,
     msg: &WireMessage,
     decode_buf: &mut Vec<u8>,
 ) -> Result<()> {
     validate_incoming_file_frame(file_state, msg)?;
+    validate_encoded_file_chunk_size(msg.content.len())?;
     base64_decode_into(&msg.content, decode_buf).context("Failed to decode incoming file frame")?;
+    validate_decoded_file_chunk_size(decode_buf.len())?;
     let next_size = checked_received_size(
         file_state.received_size,
         decode_buf.len(),
@@ -403,6 +657,106 @@ async fn remove_incomplete_incoming_file(file_state: IncomingFileState) {
     let path = file_state.path.clone();
     drop(file_state);
     remove_received_file(&path).await;
+}
+
+async fn terminate_incomplete_incoming_file(
+    app_handle: &AppHandle,
+    mut file_state: IncomingFileState,
+    status: &str,
+) {
+    emit_file_receive_progress(app_handle, &mut file_state, true, status, true);
+    remove_incomplete_incoming_file(file_state).await;
+}
+
+fn cancellation_record_client_msg_id(
+    wire_client_msg_id: Option<&str>,
+    active_client_msg_id: Option<&str>,
+) -> String {
+    if let Some(source_client_msg_id) = active_client_msg_id
+        .and_then(|value| normalized_client_msg_id(Some(value)))
+        .or_else(|| cancellation_source_client_msg_id(wire_client_msg_id))
+        .or_else(|| normalized_client_msg_id(wire_client_msg_id))
+    {
+        format!("{FILE_CANCELLED_CLIENT_ID_PREFIX}{source_client_msg_id}")
+    } else {
+        format!(
+            "{FILE_CANCELLED_CLIENT_ID_PREFIX}legacy:{}",
+            uuid::Uuid::new_v4()
+        )
+    }
+}
+
+async fn persist_incoming_file_cancellation(
+    db: &Database,
+    app_handle: &AppHandle,
+    incoming_tx: &mpsc::UnboundedSender<IncomingMessage>,
+    my_id: &str,
+    msg: &WireMessage,
+    file_name: &str,
+    cancellation_client_msg_id: &str,
+) -> Result<()> {
+    let expected_size = msg
+        .file_size
+        .context("Incoming file cancellation is missing file_size")?;
+    validate_incoming_file_size(expected_size)?;
+    let stored_file_size =
+        i64::try_from(expected_size).context("Incoming cancelled file is too large to store")?;
+    let display_content = format!("已取消发送 {file_name}");
+    let existing = db
+        .find_message_by_client_msg_id(
+            &msg.sender_id,
+            msg.group_id.as_deref(),
+            Some(cancellation_client_msg_id),
+        )
+        .await?
+        .is_some();
+
+    let saved = if let Some(group_id) = msg.group_id.as_deref() {
+        db.save_group_message_dedup(
+            group_id,
+            &msg.sender_id,
+            &msg.sender_name,
+            &display_content,
+            "file_cancelled",
+            None,
+            Some(file_name),
+            Some(stored_file_size),
+            false,
+            Some(cancellation_client_msg_id),
+        )
+        .await?
+    } else {
+        db.save_message_dedup(
+            &msg.sender_id,
+            &msg.sender_name,
+            my_id,
+            &display_content,
+            "file_cancelled",
+            None,
+            Some(file_name),
+            Some(stored_file_size),
+            Some(cancellation_client_msg_id),
+        )
+        .await?
+    };
+
+    if !existing {
+        if let Some(group_id) = msg.group_id.as_deref() {
+            emit_group_message_updated(app_handle, group_id, saved);
+        } else {
+            emit_contact_message_updated(app_handle, &msg.sender_id, saved);
+        }
+        let _ = incoming_tx.send(IncomingMessage {
+            sender_id: msg.sender_id.clone(),
+            sender_name: msg.sender_name.clone(),
+            content: display_content,
+            msg_type: "file_cancelled".to_string(),
+            file_name: Some(file_name.to_string()),
+            file_size: Some(expected_size),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        });
+    }
+    Ok(())
 }
 
 async fn remove_received_file(path: &str) {
@@ -451,10 +805,20 @@ fn emit_file_progress(
     sent: u64,
     total: u64,
     speed: u64,
+    done: bool,
 ) {
-    let _ = app_handle.emit_all("file-progress", serde_json::json!({
-        "fileName": file_name, "clientMsgId": client_msg_id, "sent": sent, "total": total, "speed": speed,
-    }));
+    let _ = app_handle.emit_all(
+        "file-progress",
+        serde_json::json!({
+            "direction": "send",
+            "fileName": file_name,
+            "clientMsgId": client_msg_id,
+            "sent": sent,
+            "total": total,
+            "speed": speed,
+            "done": done,
+        }),
+    );
 }
 
 fn is_empty_str(value: &&str) -> bool {
@@ -469,6 +833,155 @@ fn serialize_wire_message_line(msg: &WireMessage) -> Result<Vec<u8>> {
     let mut payload = serde_json::to_vec(msg).context("Failed to serialize message")?;
     payload.push(b'\n');
     Ok(payload)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_file_cancelled_frame<W>(
+    writer: &mut W,
+    my_id: &str,
+    my_node_id: &str,
+    my_name: &str,
+    my_department: &str,
+    my_software_version: &str,
+    my_mac_address: &str,
+    my_port: u16,
+    peer: &Peer,
+    file_name: &str,
+    file_size: u64,
+    file_kind: &str,
+    group_id: Option<&str>,
+    client_msg_id: Option<&str>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let safe_file_name = safe_received_file_name(file_name);
+    let cancelled = WireMessage {
+        sender_id: my_id.to_string(),
+        sender_node_id: my_node_id.to_string(),
+        sender_name: my_name.to_string(),
+        sender_department: my_department.to_string(),
+        sender_software_version: my_software_version.to_string(),
+        sender_mac_address: my_mac_address.to_string(),
+        sender_port: my_port,
+        receiver_id: peer.id.clone(),
+        receiver_node_id: peer.node_id.clone(),
+        content: format!("已取消发送 {safe_file_name}"),
+        msg_type: "file_cancelled".to_string(),
+        file_name: Some(file_name.to_string()),
+        file_size: Some(file_size),
+        file_data: None,
+        file_kind: Some(file_kind.to_string()),
+        known_peers: Vec::new(),
+        group_id: group_id.map(str::to_string),
+        client_msg_id: cancelled_client_msg_id(client_msg_id),
+    };
+    let payload = serialize_wire_message_line(&cancelled)?;
+    writer
+        .write_all(&payload)
+        .await
+        .context("Failed to write file cancellation")?;
+    writer
+        .flush()
+        .await
+        .context("Failed to flush file cancellation")
+}
+
+async fn persist_outgoing_private_file_cancellation(
+    db: &Database,
+    app_handle: &AppHandle,
+    my_id: &str,
+    my_name: &str,
+    peer_id: &str,
+    file_name: &str,
+    file_size: u64,
+    client_msg_id: Option<&str>,
+) -> Result<()> {
+    let Some(cancellation_client_msg_id) = cancelled_client_msg_id(client_msg_id) else {
+        return Ok(());
+    };
+    let safe_file_name = safe_received_file_name(file_name);
+    let display_content = format!("已取消发送 {safe_file_name}");
+    let stored_file_size =
+        i64::try_from(file_size).context("Cancelled outgoing file is too large to store")?;
+    let existing = db
+        .find_message_by_client_msg_id(my_id, None, Some(&cancellation_client_msg_id))
+        .await?
+        .is_some();
+    let saved = db
+        .save_message_dedup(
+            my_id,
+            my_name,
+            peer_id,
+            &display_content,
+            "file_cancelled",
+            None,
+            Some(&safe_file_name),
+            Some(stored_file_size),
+            Some(&cancellation_client_msg_id),
+        )
+        .await?;
+    if !existing {
+        emit_contact_message_updated(app_handle, peer_id, saved);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn notify_and_persist_outgoing_private_file_cancellation<W>(
+    writer: &mut W,
+    db: &Database,
+    app_handle: &AppHandle,
+    my_id: &str,
+    my_node_id: &str,
+    my_name: &str,
+    my_department: &str,
+    my_software_version: &str,
+    my_mac_address: &str,
+    my_port: u16,
+    peer: &Peer,
+    file_name: &str,
+    file_size: u64,
+    file_kind: &str,
+    client_msg_id: Option<&str>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Err(error) = write_file_cancelled_frame(
+        writer,
+        my_id,
+        my_node_id,
+        my_name,
+        my_department,
+        my_software_version,
+        my_mac_address,
+        my_port,
+        peer,
+        file_name,
+        file_size,
+        file_kind,
+        None,
+        client_msg_id,
+    )
+    .await
+    {
+        warn!(
+            "Failed to notify {} about cancelled file {}: {}",
+            peer.id, file_name, error
+        );
+    }
+    persist_outgoing_private_file_cancellation(
+        db,
+        app_handle,
+        my_id,
+        my_name,
+        &peer.id,
+        file_name,
+        file_size,
+        client_msg_id,
+    )
+    .await
 }
 
 async fn write_message_ack<W: AsyncWrite + Unpin>(
@@ -536,16 +1049,17 @@ where
     };
 
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    match tokio::time::timeout(timeout, reader.read_line(&mut line)).await {
-        Ok(Ok(bytes_read)) if bytes_read > 0 => {
-            let line_for_parse = line.trim_end_matches('\n').trim_end_matches('\r');
-            serde_json::from_str::<WireMessage>(line_for_parse)
-                .map(|msg| {
-                    msg.msg_type == "message_ack"
-                        && msg.client_msg_id.as_deref() == Some(expected_client_msg_id.as_str())
-                })
-                .unwrap_or(false)
+    let mut line = Vec::with_capacity(1024);
+    match tokio::time::timeout(timeout, read_bounded_wire_line(&mut reader, &mut line)).await {
+        Ok(Ok(bytes_read)) if bytes_read > 0 => serde_json::from_slice::<WireMessage>(&line)
+            .map(|msg| {
+                msg.msg_type == "message_ack"
+                    && msg.client_msg_id.as_deref() == Some(expected_client_msg_id.as_str())
+            })
+            .unwrap_or(false),
+        Ok(Err(error)) => {
+            warn!("Failed to read bounded message ack: {}", error);
+            false
         }
         _ => false,
     }
@@ -834,18 +1348,25 @@ impl ChatServer {
         let mut reader = BufReader::with_capacity(FILE_LINE_BUFFER_SIZE, reader);
 
         let mut incoming_file: Option<IncomingFileState> = None;
-        let mut line = String::with_capacity(base64_encoded_capacity(FILE_CHUNK_SIZE) + 1024);
+        let mut line = Vec::with_capacity(base64_encoded_capacity(FILE_CHUNK_SIZE) + 1024);
         let mut incoming_decode_buf = Vec::with_capacity(FILE_CHUNK_SIZE);
 
         loop {
-            line.clear();
-            let bytes_read = reader.read_line(&mut line).await?;
+            let bytes_read = match read_bounded_wire_line(&mut reader, &mut line).await {
+                Ok(bytes_read) => bytes_read,
+                Err(error) => {
+                    if let Some(file_state) = incoming_file.take() {
+                        terminate_incomplete_incoming_file(&app_handle, file_state, "failed").await;
+                    }
+                    return Err(anyhow::Error::from(error)
+                        .context("Failed to read bounded incoming TCP line"));
+                }
+            };
             if bytes_read == 0 {
                 break;
             }
-            let line_for_parse = line.trim_end_matches('\n').trim_end_matches('\r');
 
-            match serde_json::from_str::<WireMessage>(line_for_parse) {
+            match serde_json::from_slice::<WireMessage>(&line) {
                 Ok(msg) => {
                     let msg_type = msg.msg_type.as_str();
                     let observed_sender_id = observed_sender_endpoint(peer_addr, msg.sender_port);
@@ -870,6 +1391,21 @@ impl ChatServer {
                         warn!(
                             "Rejected wire message from {} because endpoint ownership conflicts with the claimed identity",
                             msg.sender_id
+                        );
+                        continue;
+                    }
+                    if !wire_receiver_matches_local_identity(
+                        db.as_ref(),
+                        &msg.receiver_id,
+                        &msg.receiver_node_id,
+                        &my_id,
+                        &my_node_id,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Rejected wire message from {} addressed to receiver endpoint/node {}/{}",
+                            msg.sender_id, msg.receiver_id, msg.receiver_node_id
                         );
                         continue;
                     }
@@ -1428,9 +1964,75 @@ impl ChatServer {
                     }
 
                     match msg_type {
+                        "file_cancelled" => {
+                            let file_name = msg
+                                .file_name
+                                .as_deref()
+                                .map(safe_received_file_name)
+                                .unwrap_or_else(|| "unknown".to_string());
+                            let cancellation_client_msg_id;
+                            if let Some(mut file_state) = incoming_file.take() {
+                                if let Err(error) =
+                                    validate_incoming_file_cancellation(&file_state, &msg)
+                                {
+                                    terminate_incomplete_incoming_file(
+                                        &app_handle,
+                                        file_state,
+                                        "failed",
+                                    )
+                                    .await;
+                                    return Err(error);
+                                }
+                                cancellation_client_msg_id = cancellation_record_client_msg_id(
+                                    msg.client_msg_id.as_deref(),
+                                    file_state.client_msg_id.as_deref(),
+                                );
+                                emit_file_receive_progress(
+                                    &app_handle,
+                                    &mut file_state,
+                                    true,
+                                    "cancelled",
+                                    true,
+                                );
+                                remove_incomplete_incoming_file(file_state).await;
+                            } else {
+                                let expected_size = msg
+                                    .file_size
+                                    .context("Incoming file cancellation is missing file_size")?;
+                                validate_incoming_file_size(expected_size)?;
+                                cancellation_client_msg_id = cancellation_record_client_msg_id(
+                                    msg.client_msg_id.as_deref(),
+                                    None,
+                                );
+                                emit_file_receive_progress_values(
+                                    &app_handle,
+                                    &incoming_file_transfer_id(&msg),
+                                    msg.client_msg_id.as_deref(),
+                                    &file_name,
+                                    &msg.sender_id,
+                                    &msg.sender_node_id,
+                                    msg.group_id.as_deref(),
+                                    0,
+                                    expected_size,
+                                    0,
+                                    true,
+                                    "cancelled",
+                                );
+                            }
+                            persist_incoming_file_cancellation(
+                                db.as_ref(),
+                                &app_handle,
+                                &incoming_tx,
+                                &my_id,
+                                &msg,
+                                &file_name,
+                                &cancellation_client_msg_id,
+                            )
+                            .await?;
+                        }
                         "file_chunk" => {
                             if incoming_file.is_none() {
-                                incoming_file = Some(start_incoming_file(&msg).await?);
+                                incoming_file = Some(start_incoming_file(&msg, &app_handle).await?);
                             }
                             let append_result = append_incoming_file_frame(
                                 incoming_file
@@ -1443,14 +2045,28 @@ impl ChatServer {
                             if let Err(error) = append_result {
                                 warn!("Failed to receive incoming file chunk: {}", error);
                                 if let Some(file_state) = incoming_file.take() {
-                                    remove_incomplete_incoming_file(file_state).await;
+                                    terminate_incomplete_incoming_file(
+                                        &app_handle,
+                                        file_state,
+                                        "failed",
+                                    )
+                                    .await;
                                 }
                                 return Err(error);
+                            }
+                            if let Some(file_state) = incoming_file.as_mut() {
+                                emit_file_receive_progress(
+                                    &app_handle,
+                                    file_state,
+                                    false,
+                                    "receiving",
+                                    false,
+                                );
                             }
                         }
                         "file_end" => {
                             if incoming_file.is_none() {
-                                incoming_file = Some(start_incoming_file(&msg).await?);
+                                incoming_file = Some(start_incoming_file(&msg, &app_handle).await?);
                             }
                             let append_result = append_incoming_file_frame(
                                 incoming_file
@@ -1463,7 +2079,12 @@ impl ChatServer {
                             if let Err(error) = append_result {
                                 warn!("Failed to receive incoming file end: {}", error);
                                 if let Some(file_state) = incoming_file.take() {
-                                    remove_incomplete_incoming_file(file_state).await;
+                                    terminate_incomplete_incoming_file(
+                                        &app_handle,
+                                        file_state,
+                                        "failed",
+                                    )
+                                    .await;
                                 }
                                 return Err(error);
                             }
@@ -1477,7 +2098,12 @@ impl ChatServer {
                                     file_state.received_size,
                                     file_state.expected_size
                                 );
-                                remove_incomplete_incoming_file(file_state).await;
+                                terminate_incomplete_incoming_file(
+                                    &app_handle,
+                                    file_state,
+                                    "failed",
+                                )
+                                .await;
                                 return Err(error);
                             }
                             if let Err(error) = file_state.file.flush().await {
@@ -1485,13 +2111,24 @@ impl ChatServer {
                                     "Failed to flush incoming file: {}",
                                     file_state.file_name
                                 ));
-                                remove_incomplete_incoming_file(file_state).await;
+                                terminate_incomplete_incoming_file(
+                                    &app_handle,
+                                    file_state,
+                                    "failed",
+                                )
+                                .await;
                                 return Err(error);
                             }
 
+                            let transfer_id = file_state.transfer_id.clone();
+                            let receive_speed = incoming_file_speed(
+                                file_state.started_at,
+                                file_state.received_size,
+                            );
                             let file_name_display = file_state.file_name.clone();
                             let saved_path = file_state.path.clone();
                             let sender_id = file_state.sender_id.clone();
+                            let sender_node_id = file_state.sender_node_id.clone();
                             let sender_name = file_state.sender_name.clone();
                             let group_id = file_state.group_id.clone();
                             let client_msg_id = file_state.client_msg_id.clone();
@@ -1548,6 +2185,20 @@ impl ChatServer {
 
                             match save_result {
                                 Ok(saved) => {
+                                    emit_file_receive_progress_values(
+                                        &app_handle,
+                                        &transfer_id,
+                                        client_msg_id.as_deref(),
+                                        &file_name_display,
+                                        &sender_id,
+                                        &sender_node_id,
+                                        group_id.as_deref(),
+                                        expected_size,
+                                        expected_size,
+                                        receive_speed,
+                                        true,
+                                        "completed",
+                                    );
                                     let is_new_file =
                                         saved.file_path.as_deref() == Some(saved_path.as_str());
                                     if is_new_file {
@@ -1723,7 +2374,7 @@ impl ChatServer {
         }
 
         if let Some(file_state) = incoming_file.take() {
-            remove_incomplete_incoming_file(file_state).await;
+            terminate_incomplete_incoming_file(&app_handle, file_state, "interrupted").await;
         }
 
         Ok(())
@@ -1933,7 +2584,7 @@ impl ChatServer {
             if last_progress_emit.elapsed() >= FILE_PROGRESS_INTERVAL {
                 let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
                 let speed = (sent as f64 / elapsed) as u64;
-                emit_file_progress(&app_handle, &file_name, None, sent, file_size, speed);
+                emit_file_progress(&app_handle, &file_name, None, sent, file_size, speed, false);
                 last_progress_emit = std::time::Instant::now();
             }
         }
@@ -1941,7 +2592,6 @@ impl ChatServer {
 
         let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
         let speed = (file_size as f64 / elapsed) as u64;
-        emit_file_progress(&app_handle, &file_name, None, file_size, file_size, speed);
 
         info!(
             "File send complete: {} ({} bytes, {} chunks)",
@@ -1965,6 +2615,15 @@ impl ChatServer {
                 None, // client_msg_id not used in this legacy path
             )
             .await?;
+        emit_file_progress(
+            &app_handle,
+            &file_name,
+            None,
+            file_size,
+            file_size,
+            speed,
+            true,
+        );
 
         Ok(saved)
     }
@@ -2275,10 +2934,27 @@ async fn send_file_in_background_inner(
         .await
         .with_context(|| format!("Failed to open file: {}", file_path))?;
 
-    wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await?;
+    if let Err(error) = wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await {
+        if group_id.is_none() {
+            persist_outgoing_private_file_cancellation(
+                db.as_ref(),
+                &app_handle,
+                &my_id,
+                &my_name,
+                &peer.id,
+                file_name,
+                file_size,
+                client_msg_id.as_deref(),
+            )
+            .await?;
+        }
+        return Err(error);
+    }
 
     let mut stream = connect_peer_with_timeout(peer).await?;
     tune_file_tcp_stream(&stream, peer);
+    let sender_software_version = crate::profile_metadata::software_version();
+    let sender_mac_address = crate::profile_metadata::mac_address();
 
     // Build known_peers once
     let peers_list: Vec<PeerEntry> = if let Ok(map) = peers.read() {
@@ -2309,20 +2985,41 @@ async fn send_file_in_background_inner(
         0,
         file_size,
         0,
+        false,
     );
 
     let mut buf = vec![0u8; FILE_CHUNK_SIZE];
     let mut content_buf = String::with_capacity(base64_encoded_capacity(FILE_CHUNK_SIZE));
     let mut payload = Vec::with_capacity(content_buf.capacity() + 1024);
-    let sender_software_version = crate::profile_metadata::software_version();
-    let sender_mac_address = crate::profile_metadata::mac_address();
     let mut i: u64 = 0;
     let mut sent_bytes: u64 = 0;
     let start_time = std::time::Instant::now();
     let mut last_progress_emit = start_time;
 
     if file_size == 0 {
-        wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await?;
+        if let Err(error) = wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await {
+            if group_id.is_none() {
+                notify_and_persist_outgoing_private_file_cancellation(
+                    &mut stream,
+                    db.as_ref(),
+                    &app_handle,
+                    &my_id,
+                    &my_node_id,
+                    &my_name,
+                    &my_department,
+                    &sender_software_version,
+                    &sender_mac_address,
+                    listen_port,
+                    peer,
+                    file_name,
+                    file_size,
+                    file_kind,
+                    client_msg_id.as_deref(),
+                )
+                .await?;
+            }
+            return Err(error);
+        }
         base64_encode_into(&[], &mut content_buf);
         serialize_file_wire_message_line(
             FileWireMessageLine {
@@ -2352,7 +3049,29 @@ async fn send_file_in_background_inner(
             .map_err(|error| file_send_connection_error(error, peer))?;
     } else {
         while sent_bytes < file_size {
-            wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await?;
+            if let Err(error) = wait_for_outgoing_file_transfer(client_msg_id.as_deref()).await {
+                if group_id.is_none() {
+                    notify_and_persist_outgoing_private_file_cancellation(
+                        &mut stream,
+                        db.as_ref(),
+                        &app_handle,
+                        &my_id,
+                        &my_node_id,
+                        &my_name,
+                        &my_department,
+                        &sender_software_version,
+                        &sender_mac_address,
+                        listen_port,
+                        peer,
+                        file_name,
+                        file_size,
+                        file_kind,
+                        client_msg_id.as_deref(),
+                    )
+                    .await?;
+                }
+                return Err(error);
+            }
 
             let remaining = (file_size - sent_bytes).min(buf.len() as u64) as usize;
             let n = file
@@ -2409,6 +3128,7 @@ async fn send_file_in_background_inner(
                     sent_bytes,
                     file_size,
                     speed,
+                    false,
                 );
                 last_progress_emit = std::time::Instant::now();
             }
@@ -2436,14 +3156,6 @@ async fn send_file_in_background_inner(
 
     let elapsed = start_time.elapsed().as_secs_f64().max(0.1);
     let speed = (file_size as f64 / elapsed) as u64;
-    emit_file_progress(
-        &app_handle,
-        file_name,
-        client_msg_id.as_deref(),
-        file_size,
-        file_size,
-        speed,
-    );
 
     info!(
         "File send complete: {} ({} bytes, {} chunks)",
@@ -2487,6 +3199,15 @@ async fn send_file_in_background_inner(
                 delivery_state,
             )
             .await?;
+        emit_file_progress(
+            &app_handle,
+            file_name,
+            client_msg_id.as_deref(),
+            file_size,
+            file_size,
+            speed,
+            true,
+        );
         emit_contact_message_updated(&app_handle, &peer.id, saved.clone());
 
         // Update peer last_seen
@@ -2527,8 +3248,10 @@ async fn send_file_in_background_inner(
         Ok(crate::db::ChatMessage {
             id: 0,
             sender_id: my_id,
+            sender_node_id: my_node_id,
             sender_name: my_name,
             receiver_id: peer.id.clone(),
+            receiver_node_id: peer.node_id.clone(),
             content: format!("📎 {}", file_name),
             msg_type: "file".to_string(),
             file_path: Some(file_path.to_string()),
@@ -2545,11 +3268,40 @@ async fn send_file_in_background_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_received_size, is_self_peer, migration_payload_node_matches,
-        observed_sender_endpoint, peer_supports_message_ack, requires_message_ack,
-        safe_received_file_name, wait_for_message_ack_with_timeout, LocalPeerId, Peer,
+        base64_encoded_capacity, cancellation_record_client_msg_id,
+        cancellation_source_client_msg_id, cancelled_client_msg_id, checked_received_size,
+        incoming_file_transfer_id, is_self_peer, migration_payload_node_matches,
+        observed_sender_endpoint, peer_supports_message_ack, read_bounded_line_with_limit,
+        read_bounded_wire_line, requires_message_ack, safe_received_file_name,
+        validate_decoded_file_chunk_size, validate_encoded_file_chunk_size,
+        validate_incoming_file_size, wait_for_message_ack_with_timeout,
+        wire_receiver_matches_local_identity, write_file_cancelled_frame, LocalPeerId, Peer,
+        WireMessage, FILE_CHUNK_SIZE, MAX_INCOMING_FILE_BYTES,
     };
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    fn file_wire_message(client_msg_id: Option<&str>) -> WireMessage {
+        WireMessage {
+            sender_id: "192.168.1.8:9527".to_string(),
+            sender_node_id: "node-a".to_string(),
+            sender_name: "Alice".to_string(),
+            sender_department: "Engineering".to_string(),
+            sender_software_version: "0.3.0".to_string(),
+            sender_mac_address: "AA:BB:CC:DD:EE:FF".to_string(),
+            sender_port: 9527,
+            receiver_id: "192.168.1.9:9527".to_string(),
+            receiver_node_id: "node-b".to_string(),
+            content: String::new(),
+            msg_type: "file_chunk".to_string(),
+            file_name: Some("report.zip".to_string()),
+            file_size: Some(42),
+            file_data: None,
+            file_kind: Some("file".to_string()),
+            known_peers: Vec::new(),
+            group_id: None,
+            client_msg_id: client_msg_id.map(str::to_string),
+        }
+    }
 
     #[test]
     fn local_peer_id_updates_all_clones() {
@@ -2588,6 +3340,68 @@ mod tests {
         );
 
         assert!(is_self_peer(&peer, "192.168.1.8:9527", 9527));
+    }
+
+    #[tokio::test]
+    async fn receiver_node_takes_priority_and_legacy_aliases_still_work() {
+        let db_path = std::env::temp_dir().join(format!(
+            "echo-receiver-node-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let db = crate::db::Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        db.upsert_peer_alias("node-local", "192.168.1.8:9527")
+            .await
+            .expect("current local endpoint should bind");
+        db.upsert_peer_alias("node-local", "192.168.1.7:9527")
+            .await
+            .expect("historical local endpoint should bind");
+
+        assert!(
+            wire_receiver_matches_local_identity(
+                &db,
+                "192.168.1.7:9527",
+                "node-local",
+                "192.168.1.8:9527",
+                "node-local",
+            )
+            .await
+        );
+        assert!(
+            !wire_receiver_matches_local_identity(
+                &db,
+                "192.168.1.8:9527",
+                "node-other",
+                "192.168.1.8:9527",
+                "node-local",
+            )
+            .await
+        );
+        assert!(
+            wire_receiver_matches_local_identity(
+                &db,
+                "192.168.1.7:9527",
+                "",
+                "192.168.1.8:9527",
+                "node-local",
+            )
+            .await
+        );
+        assert!(
+            !wire_receiver_matches_local_identity(
+                &db,
+                "192.168.1.99:9527",
+                "",
+                "192.168.1.8:9527",
+                "node-local",
+            )
+            .await
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
     }
 
     #[test]
@@ -2634,6 +3448,131 @@ mod tests {
         assert_eq!(checked_received_size(4, 6, 10).unwrap(), 10);
         assert!(checked_received_size(4, 7, 10).is_err());
         assert!(checked_received_size(u64::MAX, 1, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn incoming_file_quota_and_frame_limits_are_inclusive() {
+        assert!(validate_incoming_file_size(MAX_INCOMING_FILE_BYTES).is_ok());
+        assert!(validate_incoming_file_size(MAX_INCOMING_FILE_BYTES + 1).is_err());
+
+        let max_encoded = base64_encoded_capacity(FILE_CHUNK_SIZE);
+        assert!(validate_encoded_file_chunk_size(max_encoded).is_ok());
+        assert!(validate_encoded_file_chunk_size(max_encoded + 1).is_err());
+        assert!(validate_decoded_file_chunk_size(FILE_CHUNK_SIZE).is_ok());
+        assert!(validate_decoded_file_chunk_size(FILE_CHUNK_SIZE + 1).is_err());
+    }
+
+    #[test]
+    fn incoming_transfer_ids_are_stable_and_legacy_transfers_do_not_collide() {
+        let modern = file_wire_message(Some("client-file-1"));
+        assert_eq!(
+            incoming_file_transfer_id(&modern),
+            incoming_file_transfer_id(&modern)
+        );
+
+        let legacy = file_wire_message(None);
+        assert_ne!(
+            incoming_file_transfer_id(&legacy),
+            incoming_file_transfer_id(&legacy)
+        );
+    }
+
+    #[test]
+    fn cancellation_ids_are_derived_without_consuming_retry_id() {
+        assert_eq!(
+            cancelled_client_msg_id(Some("file-1")).as_deref(),
+            Some("cancel:file-1")
+        );
+        assert_eq!(
+            cancellation_source_client_msg_id(Some("cancel:file-1")).as_deref(),
+            Some("file-1")
+        );
+        assert_eq!(
+            cancellation_record_client_msg_id(Some("cancel:file-1"), Some("file-1")),
+            "cancel:file-1"
+        );
+        assert_eq!(
+            cancellation_record_client_msg_id(Some("file-1"), None),
+            "cancel:file-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_accepts_limit_and_discards_overlong_line_buffer() {
+        let (read_half, mut write_half) = tokio::io::duplex(64);
+        write_half
+            .write_all(b"1234567\n123456789\nok\n")
+            .await
+            .unwrap();
+        let mut reader = BufReader::with_capacity(4, read_half);
+        let mut line = Vec::new();
+
+        assert_eq!(
+            read_bounded_line_with_limit(&mut reader, &mut line, 8)
+                .await
+                .unwrap(),
+            8
+        );
+        assert_eq!(line, b"1234567\n");
+
+        let error = read_bounded_line_with_limit(&mut reader, &mut line, 8)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(line.is_empty());
+
+        assert_eq!(
+            read_bounded_line_with_limit(&mut reader, &mut line, 8)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(line, b"ok\n");
+    }
+
+    #[tokio::test]
+    async fn file_cancelled_control_frame_is_legacy_visible_and_bounded() {
+        let (mut read_half, mut write_half) = tokio::io::duplex(4096);
+        let mut peer = Peer::new(
+            "192.168.1.9:9527".to_string(),
+            "Bob".to_string(),
+            "Engineering".to_string(),
+            "192.168.1.9".parse().unwrap(),
+            9527,
+        );
+        peer.node_id = "node-b".to_string();
+
+        write_file_cancelled_frame(
+            &mut write_half,
+            "192.168.1.8:9527",
+            "node-a",
+            "Alice",
+            "Engineering",
+            "0.3.0",
+            "AA:BB:CC:DD:EE:FF",
+            9527,
+            &peer,
+            r"C:\temp\report.zip",
+            42,
+            "file",
+            None,
+            Some("file-1"),
+        )
+        .await
+        .unwrap();
+
+        let mut reader = BufReader::new(&mut read_half);
+        let mut line = Vec::new();
+        read_bounded_wire_line(&mut reader, &mut line)
+            .await
+            .unwrap();
+        let cancelled: WireMessage = serde_json::from_slice(&line).unwrap();
+        assert_eq!(cancelled.msg_type, "file_cancelled");
+        assert_eq!(cancelled.content, "已取消发送 report.zip");
+        assert_eq!(cancelled.client_msg_id.as_deref(), Some("cancel:file-1"));
+        assert_eq!(cancelled.file_size, Some(42));
+        assert_eq!(cancelled.sender_node_id, "node-a");
+        assert_eq!(cancelled.receiver_node_id, "node-b");
     }
 
     #[tokio::test]

@@ -127,6 +127,7 @@ export interface GroupInfo {
   group_id: string;
   name: string;
   creator_id: string;
+  creator_node_id?: string;
   created_at: string;
   members: StoredPeer[];
   last_message?: string | null;
@@ -193,8 +194,8 @@ export async function markGroupRead(groupId: string): Promise<void> {
   await invoke("mark_group_read", { groupId });
 }
 
-export async function saveTempFile(data: number[], filename: string): Promise<string> {
-  return await invoke("save_temp_file", { data, filename });
+export async function saveTempFile(dataBase64: string, filename: string): Promise<string> {
+  return await invoke("save_temp_file", { dataBase64, filename });
 }
 
 export interface ScreenshotData {
@@ -215,8 +216,8 @@ interface FileData {
   mime: string;
 }
 
-export async function readFileBase64(filePath: string): Promise<FileData> {
-  return await invoke("read_file_base64", { filePath });
+export async function readFileBase64(filePath: string, maxBytes?: number): Promise<FileData> {
+  return await invoke("read_file_base64", { filePath, maxBytes });
 }
 
 export async function openFile(filePath: string): Promise<void> {
@@ -241,6 +242,7 @@ export interface SearchHit {
 
 export interface SearchResult {
   peer_id: string;
+  peer_node_id?: string | null;
   peer_name: string;
   messages: SearchHit[];
 }
@@ -251,10 +253,11 @@ export async function searchMessages(query: string): Promise<SearchResult[]> {
   return await invoke("search_messages", { query });
 }
 
-export async function getConversationHistory(peerId: string, beforeId?: number, limit?: number, filter?: HistoryFilter, dayStart?: string, dayEnd?: string): Promise<ChatMessage[]> {
+export async function getConversationHistory(peerId: string, beforeId?: number, limit?: number, filter?: HistoryFilter, dayStart?: string, dayEnd?: string, afterId?: number): Promise<ChatMessage[]> {
   return await invoke("get_conversation_history", {
     peerId,
     beforeId,
+    afterId,
     limit,
     filter: filter === "all" ? undefined : filter,
     dayStart,
@@ -262,10 +265,11 @@ export async function getConversationHistory(peerId: string, beforeId?: number, 
   });
 }
 
-export async function getGroupHistory(groupId: string, beforeId?: number, limit?: number, filter?: HistoryFilter, dayStart?: string, dayEnd?: string): Promise<ChatMessage[]> {
+export async function getGroupHistory(groupId: string, beforeId?: number, limit?: number, filter?: HistoryFilter, dayStart?: string, dayEnd?: string, afterId?: number): Promise<ChatMessage[]> {
   return await invoke("get_group_history", {
     groupId,
     beforeId,
+    afterId,
     limit,
     filter: filter === "all" ? undefined : filter,
     dayStart,

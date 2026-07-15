@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import type { ChatMessage, Peer } from "../types";
+import { isSameIdentity } from "../types";
 import type { GroupInfo } from "../api";
 import { MessageBubble, DateDivider, getCollapsedMessageText, isLongMessageText } from "./MessageBubble";
 import { HistorySearchView } from "./HistorySearchView";
@@ -23,10 +24,11 @@ export interface PendingMessage {
   file_name?: string;
   file_path?: string;
   file_size?: number;
-  status: "sending" | "paused" | "failed" | "sent";
+  status: "sending" | "paused" | "cancelling" | "failed" | "sent";
   error?: string;
   progress?: number; // 0-100
   speed?: number; // bytes/sec
+  transferDone?: boolean;
   createdAt: number;
 }
 
@@ -39,9 +41,15 @@ interface ChatWindowProps {
   peer: Peer | null;
   messages: ChatMessage[];
   myId: string;
+  myNodeId: string;
   myName?: string;
   conversationResetKey: number;
   loadingMessages?: boolean;
+  hasOlderMessages?: boolean;
+  loadingOlderMessages?: boolean;
+  onLoadOlderMessages?: () => Promise<number>;
+  newerGapAfterId?: number | null;
+  onReturnToLatest?: () => Promise<void>;
   isGroup?: boolean;
   groupId?: string | null;
   groupInfo?: GroupInfo | null;
@@ -156,9 +164,47 @@ function getTextSearchHits(messages: ChatMessage[], query: string): TextSearchHi
 }
 
 async function readFileAndSave(file: File): Promise<string> {
-  const buffer = await file.arrayBuffer();
-  const data = Array.from(new Uint8Array(buffer));
-  return await saveTempFile(data, file.name || "file");
+  const dataBase64 = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("读取文件失败"));
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const separator = result.indexOf(",");
+      if (separator < 0) {
+        reject(new Error("文件编码失败"));
+        return;
+      }
+      resolve(result.slice(separator + 1));
+    };
+    reader.readAsDataURL(file);
+  });
+  return await saveTempFile(dataBase64, file.name || "file");
+}
+
+function contactEndpointConversationKey(peer: Peer | null | undefined): string {
+  if (!peer) return "";
+  const endpointId = peer.ip && peer.port ? `${peer.ip}:${peer.port}` : peer.id;
+  return endpointId ? `contact:${endpointId}` : "";
+}
+
+function contactConversationKey(peer: Peer | null | undefined): string {
+  if (!peer) return "";
+  const nodeId = peer.node_id?.trim();
+  return nodeId ? `contact:${nodeId}` : contactEndpointConversationKey(peer);
+}
+
+interface ReceivingFileTransfer {
+  transferId: string;
+  clientMsgId?: string | null;
+  fileName: string;
+  senderId: string;
+  senderNodeId?: string | null;
+  groupId?: string | null;
+  received: number;
+  total: number;
+  speed: number;
+  done: boolean;
+  status: "receiving" | "completed" | "cancelled" | "interrupted" | "failed";
 }
 
 function base64ToBlob(base64: string, mime: string): Blob {
@@ -171,11 +217,42 @@ function base64ToBlob(base64: string, mime: string): Blob {
 }
 
 const IMAGE_FILE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tiff"]);
+const MAX_FORWARD_INLINE_ATTACHMENT_BYTES = 2 * 1024 * 1024;
+const MAX_FORWARD_CARD_EMBEDDED_BYTES = 2 * 1024 * 1024;
+const MAX_FORWARD_CARD_JSON_BYTES = 6 * 1024 * 1024;
+const MAX_FORWARD_ITEM_CONTENT_CHARS = 64 * 1024;
+const MAX_FORWARD_THUMBNAIL_BASE64_CHARS = 512 * 1024;
+const FORWARD_THUMBNAIL_MAX_EDGE = 320;
 
 function isImageFileName(name?: string | null): boolean {
   if (!name) return false;
   const ext = name.split(".").pop()?.toLowerCase() ?? "";
   return IMAGE_FILE_EXTENSIONS.has(ext);
+}
+
+async function createForwardThumbnail(base64: string, mime: string): Promise<{ data: string; mime: string }> {
+  const image = new Image();
+  const loaded = new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error("图片缩略图生成失败"));
+  });
+  image.src = `data:${mime};base64,${base64}`;
+  await loaded;
+
+  const scale = Math.min(1, FORWARD_THUMBNAIL_MAX_EDGE / Math.max(image.naturalWidth, image.naturalHeight, 1));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("浏览器不支持图片缩略图");
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  const dataUrl = canvas.toDataURL("image/jpeg", 0.72);
+  const separator = dataUrl.indexOf(",");
+  const data = separator >= 0 ? dataUrl.slice(separator + 1) : "";
+  if (!data || data.length > MAX_FORWARD_THUMBNAIL_BASE64_CHARS) {
+    throw new Error("图片缩略图超过安全上限");
+  }
+  return { data, mime: "image/jpeg" };
 }
 
 function EmojiThumb({ path }: { path: string }) {
@@ -430,6 +507,9 @@ function getPendingStatusText(message: PendingMessage): string {
   if (message.status === "failed") {
     return message.error ? `发送失败：${message.error}` : "发送失败";
   }
+  if (message.status === "cancelling") {
+    return "正在取消发送...";
+  }
   if (message.status === "sent") {
     return "发送完成，正在保存...";
   }
@@ -460,10 +540,21 @@ function fallbackForwardText(message: ChatMessage): string {
 }
 
 async function buildForwardCard(messages: ChatMessage[]): Promise<ForwardCardData> {
-  const items = await Promise.all(messages.map(async (message) => {
+  const title = `${messages[0]?.sender_name ?? ""} 等人的聊天记录`;
+  const items: ForwardCardData["items"] = [];
+  let embeddedBytes = 0;
+  const encoder = new TextEncoder();
+  let encodedBytes = encoder.encode(JSON.stringify({ title, items: [] })).byteLength;
+
+  for (const message of messages) {
+    const safeContent = message.msg_type === "forward_card"
+      ? "[嵌套聊天记录已省略]"
+      : message.content.length > MAX_FORWARD_ITEM_CONTENT_CHARS
+        ? `${message.content.slice(0, MAX_FORWARD_ITEM_CONTENT_CHARS)}\n[内容过长，已截断]`
+        : message.content;
     const item: ForwardCardData["items"][number] = {
       sender: message.sender_name,
-      content: message.content,
+      content: safeContent,
       msg_type: message.msg_type,
       timestamp: message.timestamp,
       file_name: message.file_name,
@@ -472,24 +563,62 @@ async function buildForwardCard(messages: ChatMessage[]): Promise<ForwardCardDat
 
     if (isAttachmentMessage(message)) {
       item.content = fallbackForwardText(message);
-      if (message.file_path) {
-        try {
-          const file = await readFileBase64(message.file_path);
-          item.file_data = file.base64;
-          item.mime = file.mime;
-        } catch {
-          item.attachment_error = "文件不可用";
-        }
-      } else {
+      if (!message.file_path) {
+        item.attachment_state = "omitted";
         item.attachment_error = "文件不可用";
+      } else if ((message.file_size ?? 0) > MAX_FORWARD_INLINE_ATTACHMENT_BYTES) {
+        item.attachment_state = "omitted";
+        item.attachment_error = "附件过大，未随聊天记录转发";
+      } else if (embeddedBytes >= MAX_FORWARD_CARD_EMBEDDED_BYTES) {
+        item.attachment_state = "omitted";
+        item.attachment_error = "聊天记录附件总量已达上限";
+      } else {
+        try {
+          const remainingBytes = MAX_FORWARD_CARD_EMBEDDED_BYTES - embeddedBytes;
+          const maxBytes = Math.min(MAX_FORWARD_INLINE_ATTACHMENT_BYTES, remainingBytes);
+          const file = await readFileBase64(message.file_path, maxBytes);
+          item.mime = file.mime;
+          if (file.mime.startsWith("image/") || isImageFileName(message.file_name)) {
+            const thumbnail = await createForwardThumbnail(file.base64, file.mime || "image/*");
+            item.thumbnail_data = thumbnail.data;
+            item.thumbnail_mime = thumbnail.mime;
+            item.attachment_state = "thumbnail";
+            item.attachment_error = "仅附带缩略图，原文件未转发";
+            embeddedBytes += Math.ceil(thumbnail.data.length * 3 / 4);
+          } else {
+            const decodedBytes = Math.ceil(file.base64.length * 3 / 4);
+            if (decodedBytes > remainingBytes) throw new Error("聊天记录附件总量已达上限");
+            item.file_data = file.base64;
+            item.attachment_state = "embedded";
+            embeddedBytes += decodedBytes;
+          }
+        } catch (error) {
+          item.attachment_state = "omitted";
+          item.attachment_error = error instanceof Error && error.message.includes("上限")
+            ? error.message
+            : "文件不可用或超过转发上限";
+        }
       }
     }
 
-    return item;
-  }));
+    const itemBytes = encoder.encode(JSON.stringify(item)).byteLength + 1;
+    if (encodedBytes + itemBytes > MAX_FORWARD_CARD_JSON_BYTES) {
+      const omitted: ForwardCardData["items"][number] = {
+        sender: "Echo",
+        content: "其余聊天记录因大小限制未附带",
+        msg_type: "text",
+        timestamp: message.timestamp,
+      };
+      const omittedBytes = encoder.encode(JSON.stringify(omitted)).byteLength + 1;
+      if (encodedBytes + omittedBytes <= MAX_FORWARD_CARD_JSON_BYTES) items.push(omitted);
+      break;
+    }
+    items.push(item);
+    encodedBytes += itemBytes;
+  }
 
   return {
-    title: `${messages[0]?.sender_name ?? ""} 等人的聊天记录`,
+    title,
     items,
   };
 }
@@ -500,15 +629,19 @@ interface ForwardModalProps {
   peers: Peer[];
   groups: GroupInfo[];
   myId: string;
+  myNodeId: string;
   onClose: () => void;
 }
 
-function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardModalProps) {
+function ForwardModal({ messages, mode, peers, groups, myId, myNodeId, onClose }: ForwardModalProps) {
   const [query, setQuery] = useState("");
   const [sending, setSending] = useState<string | null>(null);
   const [sent, setSent] = useState<Set<string>>(new Set());
 
-  const filteredPeers = peers.filter((p) => p.id !== myId && p.username.toLowerCase().includes(query.toLowerCase()));
+  const filteredPeers = peers.filter((p) =>
+    !isSameIdentity(p.node_id, p.id, myNodeId, myId)
+      && p.username.toLowerCase().includes(query.toLowerCase())
+  );
   const filteredGroups = groups.filter((g) => g.name.toLowerCase().includes(query.toLowerCase()));
 
   const forward = async (targetId: string, isGroup: boolean) => {
@@ -519,6 +652,9 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
       if (mode === "merged") {
         const card = await buildForwardCard(sorted);
         const json = JSON.stringify(card);
+        if (new TextEncoder().encode(json).byteLength > MAX_FORWARD_CARD_JSON_BYTES) {
+          throw new Error("合并转发内容超过 6MB 安全上限，请减少所选消息");
+        }
         if (isGroup) await sendGroupMessageTyped(targetId, json, "forward_card");
         else await sendMessageTyped(targetId, json, "forward_card");
       } else {
@@ -596,17 +732,36 @@ function ForwardModal({ messages, mode, peers, groups, myId, onClose }: ForwardM
   );
 }
 
-export function ChatWindow({ peer, messages, myId, myName = "", conversationResetKey, loadingMessages = false, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendNudge, onSendRps, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, onDeleteMessages, onNudgeSignalConsumed, nudgeSignal = null, historySearchRequest = null }: ChatWindowProps) {
+export function ChatWindow({ peer, messages, myId, myNodeId, myName = "", conversationResetKey, loadingMessages = false, hasOlderMessages = false, loadingOlderMessages = false, onLoadOlderMessages, newerGapAfterId = null, onReturnToLatest, isGroup = false, groupId = null, groupInfo, peers = [], groups = [], onSendMessage, onSendNudge, onSendRps, onSendFile, onSendSticker, onGroupUpdated, onLoadHistoryContext, onDeleteMessages, onNudgeSignalConsumed, nudgeSignal = null, historySearchRequest = null }: ChatWindowProps) {
   const peerId = peer?.id ?? null;
   const pendingConversationKey = isGroup
     ? groupId ? `group:${groupId}` : peerId ? `group:${peerId}` : ""
-    : peer ? `contact:${peer.ip && peer.port ? `${peer.ip}:${peer.port}` : peer.id}` : "";
+    : contactConversationKey(peer);
   const pendingConversationKeyRef = useRef(pendingConversationKey);
   pendingConversationKeyRef.current = pendingConversationKey;
-  const [inputText, setInputText] = useState("");
+  const screenshotCaptureConversationKeyRef = useRef("");
+  const screenshotCaptureNonceRef = useRef(0);
+  const screenshotCloseCleanupTimerRef = useRef<number | null>(null);
+  const [draftByConversation, setDraftByConversation] = useState<Map<string, string>>(() => new Map());
+  const inputText = pendingConversationKey ? draftByConversation.get(pendingConversationKey) ?? "" : "";
+  const setInputText = useCallback((update: string | ((previous: string) => string)) => {
+    const conversationKey = pendingConversationKeyRef.current;
+    if (!conversationKey) return;
+    setDraftByConversation((previous) => {
+      const current = previous.get(conversationKey) ?? "";
+      const next = typeof update === "function" ? update(current) : update;
+      if (next === current) return previous;
+      const nextMap = new Map(previous);
+      if (next) nextMap.set(conversationKey, next);
+      else nextMap.delete(conversationKey);
+      return nextMap;
+    });
+  }, []);
   const [isDragging, setIsDragging] = useState(false);
   const [pendingByConversation, setPendingByConversation] = useState<Map<string, PendingMessage[]>>(() => new Map());
+  const [receivingByConversation, setReceivingByConversation] = useState<Map<string, ReceivingFileTransfer[]>>(() => new Map());
   const pendingMessages = pendingConversationKey ? pendingByConversation.get(pendingConversationKey) ?? EMPTY_PENDING_MESSAGES : EMPTY_PENDING_MESSAGES;
+  const receivingTransfers = pendingConversationKey ? receivingByConversation.get(pendingConversationKey) ?? [] : [];
   const updatePendingMessagesForKey = useCallback((conversationKey: string, update: PendingMessagesUpdate) => {
     if (!conversationKey) return;
     setPendingByConversation((prev) => {
@@ -648,6 +803,22 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       return changed ? nextMap : prev;
     });
   }, []);
+  const removePendingMessagesEverywhere = useCallback((
+    matches: (message: PendingMessage) => boolean,
+  ) => {
+    setPendingByConversation((previous) => {
+      let changed = false;
+      const next = new Map(previous);
+      for (const [conversationKey, messages] of previous) {
+        const filtered = messages.filter((message) => !matches(message));
+        if (filtered.length === messages.length) continue;
+        changed = true;
+        if (filtered.length > 0) next.set(conversationKey, filtered);
+        else next.delete(conversationKey);
+      }
+      return changed ? next : previous;
+    });
+  }, []);
   const [showEmoji, setShowEmoji] = useState(false);
   const [emojiTab, setEmojiTab] = useState<"default" | "custom">("default");
   const [customEmojis, setCustomEmojis] = useState<string[]>([]);
@@ -655,7 +826,90 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const [showScreenshotOptions, setShowScreenshotOptions] = useState(false);
   const [capturingScreenshot, setCapturingScreenshot] = useState(false);
   const [hideWindowForScreenshot, setHideWindowForScreenshot] = useState(getInitialHideWindowForScreenshot);
-  const [screenshotDraft, setScreenshotDraft] = useState<ScreenshotDraft | null>(null);
+  const [screenshotDraftByConversation, setScreenshotDraftByConversation] = useState<Map<string, ScreenshotDraft>>(() => new Map());
+  const screenshotDraft = pendingConversationKey
+    ? screenshotDraftByConversation.get(pendingConversationKey) ?? null
+    : null;
+  const screenshotDraftsRef = useRef(screenshotDraftByConversation);
+  screenshotDraftsRef.current = screenshotDraftByConversation;
+  const updateScreenshotDraftForKey = useCallback((
+    conversationKey: string,
+    update: ScreenshotDraft | null | ((previous: ScreenshotDraft | null) => ScreenshotDraft | null),
+  ) => {
+    if (!conversationKey) return;
+    setScreenshotDraftByConversation((previous) => {
+      const current = previous.get(conversationKey) ?? null;
+      const next = typeof update === "function" ? update(current) : update;
+      if (next === current) return previous;
+      if (current && current !== next) URL.revokeObjectURL(current.url);
+      const nextMap = new Map(previous);
+      if (next) nextMap.set(conversationKey, next);
+      else nextMap.delete(conversationKey);
+      return nextMap;
+    });
+  }, []);
+  const setScreenshotDraft = useCallback((
+    update: ScreenshotDraft | null | ((previous: ScreenshotDraft | null) => ScreenshotDraft | null),
+  ) => {
+    updateScreenshotDraftForKey(pendingConversationKeyRef.current, update);
+  }, [updateScreenshotDraftForKey]);
+  const endpointConversationKey = !isGroup ? contactEndpointConversationKey(peer) : "";
+  const nodeConversationKey = !isGroup && peer?.node_id?.trim()
+    ? `contact:${peer.node_id.trim()}`
+    : "";
+  useEffect(() => {
+    if (!endpointConversationKey || !nodeConversationKey || endpointConversationKey === nodeConversationKey) return;
+    if (screenshotCaptureConversationKeyRef.current === endpointConversationKey) {
+      screenshotCaptureConversationKeyRef.current = nodeConversationKey;
+    }
+
+    // A legacy contact can acquire its node_id without changing endpoint. Move
+    // every conversation-scoped UI bucket to the stable node key in that case.
+    setDraftByConversation((previous) => {
+      const endpointDraft = previous.get(endpointConversationKey);
+      if (endpointDraft === undefined) return previous;
+      const next = new Map(previous);
+      if (!next.has(nodeConversationKey)) next.set(nodeConversationKey, endpointDraft);
+      next.delete(endpointConversationKey);
+      return next;
+    });
+    setPendingByConversation((previous) => {
+      const endpointPending = previous.get(endpointConversationKey);
+      if (!endpointPending) return previous;
+      const existing = previous.get(nodeConversationKey) ?? [];
+      const known = new Set(existing.map((message) => message.clientMsgId));
+      const next = new Map(previous);
+      next.set(nodeConversationKey, [
+        ...existing,
+        ...endpointPending.filter((message) => !known.has(message.clientMsgId)),
+      ]);
+      next.delete(endpointConversationKey);
+      return next;
+    });
+    setScreenshotDraftByConversation((previous) => {
+      const endpointDraft = previous.get(endpointConversationKey);
+      if (!endpointDraft) return previous;
+      const existing = previous.get(nodeConversationKey);
+      const next = new Map(previous);
+      if (!existing) next.set(nodeConversationKey, endpointDraft);
+      else if (existing !== endpointDraft) URL.revokeObjectURL(endpointDraft.url);
+      next.delete(endpointConversationKey);
+      return next;
+    });
+    setReceivingByConversation((previous) => {
+      const endpointTransfers = previous.get(endpointConversationKey);
+      if (!endpointTransfers) return previous;
+      const existing = previous.get(nodeConversationKey) ?? [];
+      const known = new Set(existing.map((transfer) => transfer.transferId));
+      const next = new Map(previous);
+      next.set(nodeConversationKey, [
+        ...existing,
+        ...endpointTransfers.filter((transfer) => !known.has(transfer.transferId)),
+      ]);
+      next.delete(endpointConversationKey);
+      return next;
+    });
+  }, [endpointConversationKey, nodeConversationKey]);
   const [searchQuery, setSearchQuery] = useState("");
   const [showSearch, setShowSearch] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -691,11 +945,72 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     [messages, selectedIds]
   );
 
+  useEffect(() => () => {
+    for (const draft of screenshotDraftsRef.current.values()) {
+      URL.revokeObjectURL(draft.url);
+    }
+  }, []);
+
   useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    import("@tauri-apps/api/event").then(({ listen }) => (
+      listen<{ oldPeerId: string; newPeerId: string; nodeId?: string }>("peer-id-changed", (event) => {
+        const oldKey = `contact:${event.payload.oldPeerId}`;
+        const newKey = `contact:${event.payload.nodeId?.trim() || event.payload.newPeerId}`;
+        if (oldKey === newKey) return;
+        if (screenshotCaptureConversationKeyRef.current === oldKey) {
+          screenshotCaptureConversationKeyRef.current = newKey;
+        }
+
+        setDraftByConversation((previous) => {
+          const oldDraft = previous.get(oldKey);
+          if (oldDraft === undefined) return previous;
+          const next = new Map(previous);
+          if (!next.has(newKey)) next.set(newKey, oldDraft);
+          next.delete(oldKey);
+          return next;
+        });
+        setPendingByConversation((previous) => {
+          const oldPending = previous.get(oldKey);
+          if (!oldPending) return previous;
+          const existing = previous.get(newKey) ?? [];
+          const known = new Set(existing.map((message) => message.clientMsgId));
+          const next = new Map(previous);
+          next.set(newKey, [...existing, ...oldPending.filter((message) => !known.has(message.clientMsgId))]);
+          next.delete(oldKey);
+          return next;
+        });
+        setScreenshotDraftByConversation((previous) => {
+          const oldDraft = previous.get(oldKey);
+          if (!oldDraft) return previous;
+          const existing = previous.get(newKey);
+          const next = new Map(previous);
+          if (!existing) next.set(newKey, oldDraft);
+          else if (existing !== oldDraft) URL.revokeObjectURL(oldDraft.url);
+          next.delete(oldKey);
+          return next;
+        });
+        setReceivingByConversation((previous) => {
+          const oldTransfers = previous.get(oldKey);
+          if (!oldTransfers) return previous;
+          const existing = previous.get(newKey) ?? [];
+          const known = new Set(existing.map((transfer) => transfer.transferId));
+          const next = new Map(previous);
+          next.set(newKey, [...existing, ...oldTransfers.filter((transfer) => !known.has(transfer.transferId))]);
+          next.delete(oldKey);
+          return next;
+        });
+      })
+    )).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
     return () => {
-      if (screenshotDraft) URL.revokeObjectURL(screenshotDraft.url);
+      disposed = true;
+      unlisten?.();
     };
-  }, [screenshotDraft?.url]);
+  }, []);
 
   useEffect(() => {
     try {
@@ -791,7 +1106,9 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         m.client_msg_id && m.client_msg_id === p.clientMsgId
       );
 
-      return !exists; // 如果已存在，移除 pending
+      if (!exists) return true;
+      const isFileTransfer = p.msg_type === "file" || p.msg_type === "sticker";
+      return isFileTransfer && !p.transferDone;
     }));
   }, [messages, setPendingMessages]);
 
@@ -844,6 +1161,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   useEffect(() => {
     let disposed = false;
     const unlisteners: Array<() => void> = [];
+    const receiveCleanupTimers = new Set<number>();
     const trackUnlisten = (fn: () => void) => {
       if (disposed) {
         fn();
@@ -853,32 +1171,84 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     };
 
     import("@tauri-apps/api/event").then(({ listen }) => {
-      listen<{ fileName: string; clientMsgId?: string | null; sent: number; total: number; speed: number }>("file-progress", (event) => {
+      listen<{ fileName: string; clientMsgId?: string | null; sent: number; total: number; speed: number; done?: boolean }>("file-progress", (event) => {
         if (disposed) return;
-        const { fileName, clientMsgId, sent, total, speed } = event.payload;
-        const pct = total > 0 ? Math.round((sent / total) * 100) : 0;
+        const { fileName, clientMsgId, sent, total, speed, done = false } = event.payload;
+        const pct = total > 0 ? Math.round((sent / total) * 100) : done ? 100 : 0;
         const matchesFile = (message: PendingMessage) =>
           clientMsgId ? message.clientMsgId === clientMsgId : message.file_name === fileName && message.msg_type === "file";
         updatePendingMessagesEverywhere(
           matchesFile,
-          (message) => ({ ...message, progress: pct, speed, status: pct >= 100 ? "sent" as const : message.status })
+          (message) => ({
+            ...message,
+            progress: Math.max(message.progress ?? 0, Math.min(100, pct)),
+            speed,
+            transferDone: message.transferDone || done,
+            status: done ? "sent" as const : message.status,
+          })
         );
       }).then(trackUnlisten);
 
       listen<{ fileName: string; clientMsgId?: string | null; error: string }>("file-error", (event) => {
         if (disposed) return;
         const { fileName, clientMsgId, error } = event.payload;
+        const matchesFile = (message: PendingMessage) =>
+          clientMsgId ? message.clientMsgId === clientMsgId : message.file_name === fileName;
+        if (error.trim() === "发送已取消") {
+          removePendingMessagesEverywhere(matchesFile);
+          return;
+        }
         updatePendingMessagesEverywhere(
-          (message) => clientMsgId ? message.clientMsgId === clientMsgId : message.file_name === fileName,
+          matchesFile,
           (message) => ({ ...message, status: "failed", error })
         );
+      }).then(trackUnlisten);
+
+      listen<ReceivingFileTransfer>("file-receive-progress", (event) => {
+        if (disposed) return;
+        const transfer = event.payload;
+        const conversationKey = transfer.groupId
+          ? `group:${transfer.groupId}`
+          : `contact:${transfer.senderNodeId?.trim() || transfer.senderId}`;
+        setReceivingByConversation((previous) => {
+          const current = previous.get(conversationKey) ?? [];
+          const index = current.findIndex((item) => item.transferId === transfer.transferId);
+          const nextList = index >= 0
+            ? current.map((item, itemIndex) => itemIndex === index ? transfer : item)
+            : [...current, transfer];
+          const next = new Map(previous);
+          next.set(conversationKey, nextList);
+          return next;
+        });
+        if (transfer.done) {
+          const cleanupTimer = window.setTimeout(() => {
+            receiveCleanupTimers.delete(cleanupTimer);
+            setReceivingByConversation((previous) => {
+              let changed = false;
+              const next = new Map(previous);
+              // The conversation bucket may have migrated from endpoint to node
+              // while this delay was pending, so remove by transfer id globally.
+              for (const [key, current] of previous) {
+                const nextList = current.filter((item) => item.transferId !== transfer.transferId);
+                if (nextList.length === current.length) continue;
+                changed = true;
+                if (nextList.length > 0) next.set(key, nextList);
+                else next.delete(key);
+              }
+              return changed ? next : previous;
+            });
+          }, 1800);
+          receiveCleanupTimers.add(cleanupTimer);
+        }
       }).then(trackUnlisten);
     });
     return () => {
       disposed = true;
       for (const unlisten of unlisteners.splice(0)) unlisten();
+      for (const timer of receiveCleanupTimers) window.clearTimeout(timer);
+      receiveCleanupTimers.clear();
     };
-  }, [updatePendingMessagesEverywhere]);
+  }, [removePendingMessagesEverywhere, updatePendingMessagesEverywhere]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLDivElement>(null);
@@ -895,6 +1265,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const composerComposingRef = useRef(false);
 
   const pendingScrollRef = useRef(false);
+  const olderLoadInFlightRef = useRef(false);
 
   const hideDragOverlay = useCallback(() => {
     if (dragResetTimerRef.current !== null) {
@@ -1032,18 +1403,46 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     setContextHighlightId(null);
     setGroupMemberQuery("");
     setGroupInviteQuery("");
-    setScreenshotDraft(null);
     pendingJumpMessageIdRef.current = null;
     nearBottomRef.current = true;
     pendingScrollRef.current = true;
     requestAnimationFrame(() => inputRef.current?.focus());
   }, [conversationResetKey, historySearchRequest?.query]);
 
+  const loadOlderFromViewport = useCallback(async () => {
+    const el = messagesContainerRef.current;
+    if (!el || olderLoadInFlightRef.current || loadingOlderMessages || !hasOlderMessages || !onLoadOlderMessages) return;
+    olderLoadInFlightRef.current = true;
+    const previousScrollHeight = el.scrollHeight;
+    const previousScrollTop = el.scrollTop;
+    try {
+      const loaded = await onLoadOlderMessages();
+      if (loaded <= 0) return;
+      requestAnimationFrame(() => {
+        const current = messagesContainerRef.current;
+        if (!current) return;
+        current.scrollTop = previousScrollTop + (current.scrollHeight - previousScrollHeight);
+      });
+    } finally {
+      olderLoadInFlightRef.current = false;
+    }
+  }, [hasOlderMessages, loadingOlderMessages, onLoadOlderMessages]);
+
   const handleScroll = useCallback(() => {
     const el = messagesContainerRef.current;
     if (!el) return;
     nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
-  }, []);
+    if (el.scrollTop < 80) {
+      void loadOlderFromViewport();
+    }
+  }, [loadOlderFromViewport]);
+
+  const handleReturnToLatest = useCallback(async () => {
+    if (!onReturnToLatest) return;
+    pendingScrollRef.current = true;
+    nearBottomRef.current = true;
+    await onReturnToLatest();
+  }, [onReturnToLatest]);
 
   useEffect(() => {
     if (pendingScrollRef.current) {
@@ -1080,12 +1479,9 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
 
   useEffect(() => {
     if (!nudgeSignal) return;
-    const activeKind = isGroup ? "group" : "contact";
-    const activeId = isGroup ? groupId : peer?.id;
-    if (!activeId || nudgeSignal.kind !== activeKind || nudgeSignal.targetId !== activeId) return;
     playNudgeAnimation();
     onNudgeSignalConsumed?.(nudgeSignal.nonce);
-  }, [groupId, isGroup, nudgeSignal, onNudgeSignalConsumed, peer?.id, playNudgeAnimation]);
+  }, [nudgeSignal, onNudgeSignalConsumed, playNudgeAnimation]);
 
   const syncComposerDom = useCallback((text: string, caretOffset: number | null = null) => {
     const el = inputRef.current;
@@ -1130,7 +1526,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     if (!composerComposingRef.current && (forceRender || composerShouldRenderInlineEmoji(el, text))) {
       syncComposerDom(text, caretOffset);
     }
-  }, [syncComposerDom]);
+  }, [setInputText, syncComposerDom]);
 
   const rememberComposerCaret = useCallback(() => {
     const el = inputRef.current;
@@ -1226,11 +1622,15 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const handleCancelFileTransfer = useCallback(async (pending: PendingMessage) => {
     if (pending.msg_type !== "file" || (pending.status !== "sending" && pending.status !== "paused")) return;
     const conversationKey = pendingConversationKeyRef.current;
-    updatePendingMessagesForKey(conversationKey, (prev) => prev.filter((p) => p.id !== pending.id));
+    updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
+      p.id === pending.id ? { ...p, status: "cancelling", speed: 0 } : p
+    ));
     try {
       await cancelFileTransfer(pending.clientMsgId);
-    } catch {
-      // The background task may have completed between the click and command dispatch.
+    } catch (error) {
+      updatePendingMessagesForKey(conversationKey, (prev) => prev.map((p) =>
+        p.id === pending.id ? { ...p, status: "failed", error: String(error) } : p
+      ));
     }
   }, [updatePendingMessagesForKey]);
 
@@ -1392,10 +1792,11 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   }, [onSendFile, peer, updatePendingMessagesForKey]);
 
   const sendText = useCallback(async () => {
-    const currentText = inputRef.current ? decodeEchoEmojiTokens(readComposerText(inputRef.current)) : inputText;
+    const currentText = inputText;
     const trimmed = currentText.trim();
     const draft = screenshotDraft;
     if ((!trimmed && !draft) || !peer) return;
+    const conversationKey = pendingConversationKeyRef.current;
     setInputText("");
     setScreenshotDraft(null);
     nearBottomRef.current = true;
@@ -1407,7 +1808,6 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       await sendScreenshotFile(draft.file);
     }
     if (!trimmed) return;
-    const conversationKey = pendingConversationKeyRef.current;
 
     const tempId = ++pendingId;
     const clientMsgId = generateClientMsgId();
@@ -1430,7 +1830,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         p.id === tempId ? { ...p, status: "failed", error: String(e) } : p
       ));
     }
-  }, [inputText, peer, onSendMessage, screenshotDraft, sendScreenshotFile, syncComposerDom, updatePendingMessagesForKey]);
+  }, [inputText, peer, onSendMessage, screenshotDraft, sendScreenshotFile, setInputText, setScreenshotDraft, syncComposerDom, updatePendingMessagesForKey]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== "Enter" || composerComposingRef.current || e.nativeEvent.isComposing) return;
@@ -1505,14 +1905,19 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
 
   const captureScreenshot = useCallback(async () => {
     if (!peer || capturingScreenshot) return;
+    const conversationKey = pendingConversationKeyRef.current;
+    if (!conversationKey) return;
     setShowEmoji(false);
     setCapturingScreenshot(true);
+    let captureNonce = 0;
     try {
       const existing = WebviewWindow.getByLabel("screenshot-overlay");
       if (existing) {
         await existing.setFocus();
         return;
       }
+      captureNonce = ++screenshotCaptureNonceRef.current;
+      screenshotCaptureConversationKeyRef.current = conversationKey;
       if (hideWindowForScreenshot) {
         await appWindow.hide();
         await new Promise((resolve) => window.setTimeout(resolve, 180));
@@ -1529,11 +1934,17 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       if (hideWindowForScreenshot) {
         window.setTimeout(() => {
           if (!WebviewWindow.getByLabel("screenshot-overlay")) {
+            if (screenshotCaptureNonceRef.current === captureNonce) {
+              screenshotCaptureConversationKeyRef.current = "";
+            }
             void restoreMainWindowAfterScreenshot();
           }
         }, 15000);
       }
     } catch (error) {
+      if (captureNonce && screenshotCaptureNonceRef.current === captureNonce) {
+        screenshotCaptureConversationKeyRef.current = "";
+      }
       if (hideWindowForScreenshot) {
         await restoreMainWindowAfterScreenshot().catch(() => {});
       }
@@ -1554,31 +1965,62 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   }, [captureScreenshot]);
 
   useEffect(() => {
-    let unlistenCaptured: (() => void) | undefined;
-    let unlistenClosed: (() => void) | undefined;
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const trackUnlisten = (unlisten: () => void) => {
+      if (disposed) unlisten();
+      else unlisteners.push(unlisten);
+    };
     import("@tauri-apps/api/event").then(({ listen }) => {
       listen<ScreenshotCapturedPayload>("screenshot-captured", (event) => {
+        if (disposed) return;
+        if (screenshotCloseCleanupTimerRef.current !== null) {
+          window.clearTimeout(screenshotCloseCleanupTimerRef.current);
+          screenshotCloseCleanupTimerRef.current = null;
+        }
+        const conversationKey = screenshotCaptureConversationKeyRef.current;
+        screenshotCaptureConversationKeyRef.current = "";
+        if (!conversationKey) return;
         const payload = event.payload;
         const blob = base64ToBlob(payload.base64, payload.mime);
         const file = new File([blob], payload.filename || "screenshot.png", { type: payload.mime || "image/png" });
         const url = URL.createObjectURL(blob);
-        setScreenshotDraft((prev) => {
+        updateScreenshotDraftForKey(conversationKey, (prev) => {
           if (prev) URL.revokeObjectURL(prev.url);
           return { file, url, copiedToClipboard: payload.copiedToClipboard };
         });
-        requestAnimationFrame(() => inputRef.current?.focus());
-      }).then((fn) => { unlistenCaptured = fn; });
+        if (pendingConversationKeyRef.current === conversationKey) {
+          requestAnimationFrame(() => inputRef.current?.focus());
+        }
+      }).then(trackUnlisten);
       listen("screenshot-overlay-closed", () => {
+        if (disposed) return;
+        const closedCaptureNonce = screenshotCaptureNonceRef.current;
+        if (screenshotCloseCleanupTimerRef.current !== null) {
+          window.clearTimeout(screenshotCloseCleanupTimerRef.current);
+        }
+        // The overlay emits captured immediately before closing. Allow that
+        // event to arrive without erasing its conversation snapshot first.
+        screenshotCloseCleanupTimerRef.current = window.setTimeout(() => {
+          screenshotCloseCleanupTimerRef.current = null;
+          if (screenshotCaptureNonceRef.current === closedCaptureNonce) {
+            screenshotCaptureConversationKeyRef.current = "";
+          }
+        }, 1000);
         if (hideWindowForScreenshot) {
           void restoreMainWindowAfterScreenshot();
         }
-      }).then((fn) => { unlistenClosed = fn; });
+      }).then(trackUnlisten);
     });
     return () => {
-      unlistenCaptured?.();
-      unlistenClosed?.();
+      disposed = true;
+      for (const unlisten of unlisteners.splice(0)) unlisten();
+      if (screenshotCloseCleanupTimerRef.current !== null) {
+        window.clearTimeout(screenshotCloseCleanupTimerRef.current);
+        screenshotCloseCleanupTimerRef.current = null;
+      }
     };
-  }, [hideWindowForScreenshot, restoreMainWindowAfterScreenshot]);
+  }, [hideWindowForScreenshot, restoreMainWindowAfterScreenshot, updateScreenshotDraftForKey]);
 
   useEffect(() => {
     let registered = false;
@@ -1846,20 +2288,25 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
   const memberQuery = groupMemberQuery.trim().toLowerCase();
   const visibleGroupMembers = memberQuery
     ? groupMembers.filter((member) => {
-        const displayName = member.peer_id === myId ? (myName || member.username || "我") : (member.username || member.peer_id);
+        const isSelf = isSameIdentity(member.node_id, member.peer_id, myNodeId, myId);
+        const isCreator = isSameIdentity(member.node_id, member.peer_id, groupInfo?.creator_node_id, groupInfo?.creator_id);
+        const displayName = isSelf ? (myName || member.username || "我") : (member.username || member.peer_id);
         return [
           displayName,
           member.username,
           member.department,
           member.peer_id,
           member.is_online ? "在线" : "离线",
-          groupInfo?.creator_id === member.peer_id ? "群主" : "",
-          member.peer_id === myId ? "我" : "",
+          isCreator ? "群主" : "",
+          isSelf ? "我" : "",
         ].some((value) => value.toLowerCase().includes(memberQuery));
       })
     : groupMembers;
   const inviteCandidates = peers.filter((candidate) =>
-    candidate.id !== myId && !groupMembers.some((member) => member.peer_id === candidate.id)
+    !isSameIdentity(candidate.node_id, candidate.id, myNodeId, myId)
+      && !groupMembers.some((member) =>
+        isSameIdentity(member.node_id, member.peer_id, candidate.node_id, candidate.id)
+      )
   );
   const inviteQuery = groupInviteQuery.trim().toLowerCase();
   const visibleInviteCandidates = inviteQuery
@@ -1876,7 +2323,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
     : inviteCandidates;
   const historyConversationKey = isGroup
     ? `group:${groupId ?? peer.id}`
-    : `contact:${peer.ip && peer.port ? `${peer.ip}:${peer.port}` : peer.id}`;
+    : contactConversationKey(peer);
   const nudgeCooldownSeconds = Math.ceil(nudgeCooldownRemainingMs / 1000);
   const nudgeUnavailableOffline = !isGroup && !peer.online;
   const nudgeDisabled = nudgeUnavailableOffline || nudgeSending || nudgeCooldownSeconds > 0;
@@ -1981,7 +2428,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                 return next;
               });
             }}
-            className={`chat-header-action flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-gray-700 ${showGroupPanel ? "chat-header-action-active bg-gray-700 text-white" : ""}`}
+            className={`group-panel-trigger chat-header-action flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-gray-700 ${showGroupPanel ? "chat-header-action-active bg-gray-700 text-white" : ""}`}
             title="群信息"
           >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1995,6 +2442,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
           key={`${historyConversationKey}:${historySearchRequest?.nonce ?? "manual"}`}
           peer={peer}
           myId={myId}
+          myNodeId={myNodeId}
           isGroup={isGroup}
           groupId={groupId}
           initialSearchRequest={historySearchRequest}
@@ -2037,6 +2485,19 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
       })()}
 
       <div ref={messagesContainerRef} onScroll={handleScroll} className="chat-message-list flex-1 overflow-y-auto py-4">
+        {!loadingMessages && messages.length > 0 ? (
+          <div className="flex justify-center px-4 pb-3">
+            {loadingOlderMessages ? (
+              <span className="text-xs text-gray-500">正在加载更早消息...</span>
+            ) : hasOlderMessages ? (
+              <button type="button" onClick={() => void loadOlderFromViewport()} className="text-xs text-indigo-300 hover:text-indigo-200">
+                加载更早消息
+              </button>
+            ) : (
+              <span className="text-xs text-gray-600">没有更早消息了</span>
+            )}
+          </div>
+        ) : null}
         {loadingMessages ? (
           <div className="flex flex-col items-center justify-center h-full text-gray-500">
             <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin mb-3" />
@@ -2136,7 +2597,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                 <div key={item.id} ref={(el) => { if (el) messageRefs.current.set(item.id, el); else messageRefs.current.delete(item.id); }}>
                   <MessageBubble
                     message={item}
-                    isOwn={item.sender_id === myId}
+                    isOwn={isSameIdentity(item.sender_node_id, item.sender_id, myNodeId, myId)}
                     isGroup={isGroup}
                     showSender={isGroup}
                     highlighted={(searchMatchIds.has(item.id) && item.id === highlightedId) || contextHighlightId === item.id}
@@ -2151,9 +2612,55 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
                 </div>
               );
             }
+            if ("timestamp" in item && newerGapAfterId === item.id) {
+              elements.push(
+                <div key={`newer-gap-${item.id}`} className="mx-4 my-4 rounded-xl border border-dashed border-indigo-400/40 bg-indigo-500/10 px-4 py-3 text-center">
+                  <p className="text-xs text-gray-300">这里省略了部分较新的消息</p>
+                  <button
+                    type="button"
+                    onClick={() => void handleReturnToLatest()}
+                    className="mt-2 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-500"
+                  >
+                    回到最新
+                  </button>
+                </div>
+              );
+            }
             return elements;
           });
         })()}
+        {receivingTransfers.map((transfer) => {
+          const progress = transfer.total > 0
+            ? Math.min(100, Math.round((transfer.received / transfer.total) * 100))
+            : transfer.done ? 100 : 0;
+          const statusText = transfer.status === "cancelled"
+            ? `对方已取消发送 ${transfer.fileName}`
+            : transfer.status === "completed"
+              ? "接收完成，正在保存..."
+              : transfer.status === "interrupted" || transfer.status === "failed"
+                ? `接收中断 · ${transfer.fileName}`
+                : `正在接收 · ${progress}%${transfer.speed > 0 ? ` · ${formatSpeed(transfer.speed)}` : ""}`;
+          return (
+            <div key={`receiving-${transfer.transferId}`} className="message-row flex justify-start mb-3 px-4">
+              <div className="message-stack flex w-64 max-w-[78%] flex-col items-start">
+                <div className="message-bubble-shell message-bubble-content w-full rounded-2xl rounded-bl-md bg-gray-700 text-gray-100">
+                  <div className="flex items-center gap-2">
+                    <svg className="h-5 w-5 flex-shrink-0 text-indigo-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 14V8m0 6l-3-3m3 3l3-3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                    </svg>
+                    <p className="message-file-name truncate" title={transfer.fileName}>{transfer.fileName}</p>
+                  </div>
+                  {transfer.status === "receiving" || transfer.status === "completed" ? (
+                    <div className="mt-2 h-1.5 w-full rounded-full bg-gray-800">
+                      <div className="h-1.5 rounded-full bg-indigo-400 transition-all" style={{ width: `${progress}%` }} />
+                    </div>
+                  ) : null}
+                </div>
+                <span className="message-meta mt-1">{statusText}</span>
+              </div>
+            </div>
+          );
+        })}
         <div ref={messagesEndRef} />
       </div>
       {selectMode && (
@@ -2184,6 +2691,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
           peers={peers}
           groups={groups}
           myId={myId}
+          myNodeId={myNodeId}
           onClose={() => { setForwardModal(null); exitSelectMode(); }}
         />
       )}
@@ -2516,14 +3024,16 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
             </div>
             <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
               {visibleGroupMembers.map((m) => {
-                const displayName = m.peer_id === myId ? (myName || m.username || "我") : (m.username || m.peer_id);
+                const isSelf = isSameIdentity(m.node_id, m.peer_id, myNodeId, myId);
+                const isCreator = isSameIdentity(m.node_id, m.peer_id, groupInfo.creator_node_id, groupInfo.creator_id);
+                const displayName = isSelf ? (myName || m.username || "我") : (m.username || m.peer_id);
                 return (
-                  <div key={m.peer_id} className="group-panel-row flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-gray-800/70">
-                    <AvatarPreviewTrigger name={displayName} src={m.avatar_path} size="xs" online={m.peer_id === myId || m.is_online} />
+                  <div key={m.node_id || m.peer_id} className="group-panel-row flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-gray-800/70">
+                    <AvatarPreviewTrigger name={displayName} src={m.avatar_path} size="xs" online={isSelf || m.is_online} />
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs text-gray-200 truncate" title={displayName}>{displayName}{m.peer_id === myId ? " (我)" : ""}</p>
+                      <p className="text-xs text-gray-200 truncate" title={displayName}>{displayName}{isSelf ? " (我)" : ""}</p>
                       <p className="text-[10px] text-gray-500 truncate">
-                        {groupInfo.creator_id === m.peer_id ? "群主" : (m.department || "成员")}
+                        {isCreator ? "群主" : (m.department || "成员")}
                       </p>
                     </div>
                   </div>
@@ -2581,7 +3091,7 @@ export function ChatWindow({ peer, messages, myId, myName = "", conversationRese
         </div>
         {/* Leave / Dissolve */}
         <div className="px-4 py-3 border-t border-gray-700">
-          {groupInfo.creator_id !== myId ? (
+          {!isSameIdentity(groupInfo.creator_node_id, groupInfo.creator_id, myNodeId, myId) ? (
             <button
               onClick={handleLeaveGroup}
               disabled={!!groupActionBusy}

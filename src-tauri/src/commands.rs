@@ -11,8 +11,8 @@ use tauri::{AppHandle, Manager, State};
 use crate::chat::{
     base64_encode_into, base64_encoded_capacity, cancel_outgoing_file_transfer,
     clear_outgoing_file_transfer, emit_contact_message_updated, is_self_peer,
-    pause_outgoing_file_transfer, register_outgoing_file_transfer, requires_message_ack,
-    resume_outgoing_file_transfer, send_file_in_background_with_kind,
+    pause_outgoing_file_transfer, read_bounded_wire_line, register_outgoing_file_transfer,
+    requires_message_ack, resume_outgoing_file_transfer, send_file_in_background_with_kind,
     serialize_file_wire_message_line, wait_for_message_ack, wait_for_outgoing_file_transfer,
     FileWireMessageLine, WireMessage, FILE_CHUNK_SIZE, FILE_SOCKET_BUFFER_SIZE,
     FILE_TRANSFER_CANCELLED_MESSAGE,
@@ -68,6 +68,7 @@ pub struct AvatarInfo {
 }
 
 const AVATAR_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const TEMP_FILE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 #[tauri::command]
 pub async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String> {
@@ -620,7 +621,7 @@ pub async fn request_peer_avatar(
         .clone()
         .ok_or_else(|| "应用尚未初始化用户信息".to_string())?;
 
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         tokio::net::TcpStream::connect(peer.address()),
@@ -629,7 +630,7 @@ pub async fn request_peer_avatar(
     .map_err(|_| "请求头像超时".to_string())?
     .map_err(|e| e.to_string())?;
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
 
     let request = WireMessage {
         sender_id: runtime.my_id(),
@@ -659,12 +660,18 @@ pub async fn request_peer_avatar(
     writer.write_all(b"\n").await.map_err(|e| e.to_string())?;
     writer.flush().await.map_err(|e| e.to_string())?;
 
-    let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
-        .await
-        .map_err(|_| "请求头像超时".to_string())?
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "对方未返回头像".to_string())?;
-    let msg: WireMessage = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+    let mut line = Vec::with_capacity(1024);
+    let bytes_read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_bounded_wire_line(&mut reader, &mut line),
+    )
+    .await
+    .map_err(|_| "请求头像超时".to_string())?
+    .map_err(|e| e.to_string())?;
+    if bytes_read == 0 {
+        return Err("对方未返回头像".to_string());
+    }
+    let msg: WireMessage = serde_json::from_slice(&line).map_err(|e| e.to_string())?;
     if msg.msg_type != "avatar_response" {
         return Err("对方返回了无效头像响应".to_string());
     }
@@ -899,7 +906,8 @@ pub async fn send_message_typed(
         .await
         .map_err(|e| e.to_string())?
     {
-        Peer::new_with_profile(
+        let node_id = stored_peer.node_id.clone();
+        let mut peer = Peer::new_with_profile(
             stored_peer.peer_id,
             stored_peer.username,
             stored_peer.department,
@@ -910,7 +918,9 @@ pub async fn send_message_typed(
                 .parse()
                 .map_err(|_| "无效的联系人 IP 地址".to_string())?,
             stored_peer.port,
-        )
+        );
+        peer.node_id = node_id;
+        peer
     } else {
         return Err(format!("Peer {} not found", peer_id));
     };
@@ -1122,8 +1132,10 @@ async fn send_file_with_kind(
 
     // Clone for placeholder (before moving into background task)
     let placeholder_my_id = my_id.clone();
+    let placeholder_my_node_id = my_node_id.clone();
     let placeholder_my_name = my_name.clone();
     let placeholder_peer_id = peer.id.clone();
+    let placeholder_peer_node_id = peer.node_id.clone();
 
     // Clone for background task
     let bg_path = file_path.clone();
@@ -1189,8 +1201,10 @@ async fn send_file_with_kind(
     Ok(ChatMessage {
         id: 0,
         sender_id: placeholder_my_id,
+        sender_node_id: placeholder_my_node_id,
         sender_name: placeholder_my_name,
         receiver_id: placeholder_peer_id,
+        receiver_node_id: placeholder_peer_node_id,
         content,
         msg_type: msg_kind.to_string(),
         file_name: Some(file_name),
@@ -1231,7 +1245,7 @@ async fn probe_identity(
     my_department: &str,
     my_port: u16,
 ) -> Option<RemoteIdentity> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -1242,7 +1256,7 @@ async fn probe_identity(
     .ok()?;
     let peer_addr = stream.peer_addr().ok();
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
 
     let probe = WireMessage {
         sender_id: my_id.to_string(),
@@ -1270,11 +1284,18 @@ async fn probe_identity(
     writer.write_all(b"\n").await.ok()?;
     writer.flush().await.ok()?;
 
-    let line = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
-        .await
-        .ok()?
-        .ok()??;
-    let msg: WireMessage = serde_json::from_str(&line).ok()?;
+    let mut line = Vec::with_capacity(1024);
+    let bytes_read = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_bounded_wire_line(&mut reader, &mut line),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if bytes_read == 0 {
+        return None;
+    }
+    let msg: WireMessage = serde_json::from_slice(&line).ok()?;
     if msg.msg_type != "identity_response" || msg.sender_id.trim().is_empty() {
         return None;
     }
@@ -1568,7 +1589,7 @@ pub async fn discover_by_ip(
         .as_ref()
         .map(|peer| peer.mac_address.clone())
         .unwrap_or_default();
-    let peer = crate::discovery::Peer::new_with_profile(
+    let mut peer = crate::discovery::Peer::new_with_profile(
         pid.clone(),
         display_name.clone(),
         display_department.clone(),
@@ -1577,6 +1598,10 @@ pub async fn discover_by_ip(
         parsed_ip,
         port,
     );
+    peer.node_id = stored_peer
+        .as_ref()
+        .map(|stored| stored.node_id.clone())
+        .unwrap_or_default();
 
     {
         let runtime_opt = { state.runtime.read().await.clone() };
@@ -1740,16 +1765,35 @@ pub async fn mark_read(state: State<'_, AppState>, peer_id: String) -> Result<()
 }
 
 #[tauri::command]
-pub async fn save_temp_file(data: Vec<u8>, filename: String) -> Result<String, String> {
-    let files_dir = echo_files_dir();
-    std::fs::create_dir_all(&files_dir).map_err(|e| e.to_string())?;
+pub async fn save_temp_file(data_base64: String, filename: String) -> Result<String, String> {
+    if data_base64.len() > TEMP_FILE_MAX_BYTES.saturating_mul(4).saturating_div(3) + 8 {
+        return Err("临时文件超过 256MB 上限".to_string());
+    }
+    tokio::task::spawn_blocking(move || {
+        use base64::Engine;
 
-    let timestamp = chrono::Utc::now().timestamp_millis();
-    let file_path = files_dir.join(format!("{}_{}", timestamp, filename));
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(data_base64)
+            .map_err(|_| "临时文件 base64 数据无效".to_string())?;
+        if data.len() > TEMP_FILE_MAX_BYTES {
+            return Err("临时文件超过 256MB 上限".to_string());
+        }
 
-    std::fs::write(&file_path, &data).map_err(|e| e.to_string())?;
-
-    Ok(file_path.to_string_lossy().to_string())
+        let files_dir = echo_files_dir();
+        std::fs::create_dir_all(&files_dir).map_err(|e| e.to_string())?;
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let safe_filename = Path::new(&filename)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("file");
+        let file_path = files_dir.join(format!("{}_{}", timestamp, safe_filename));
+        std::fs::write(&file_path, &data).map_err(|e| e.to_string())?;
+        Ok(file_path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|error| format!("临时文件保存任务失败: {}", error))?
 }
 
 #[derive(Serialize)]
@@ -2144,7 +2188,15 @@ pub struct FileData {
 }
 
 #[tauri::command]
-pub fn read_file_base64(file_path: String) -> Result<FileData, String> {
+pub fn read_file_base64(file_path: String, max_bytes: Option<u64>) -> Result<FileData, String> {
+    if let Some(max_bytes) = max_bytes {
+        let size = std::fs::metadata(&file_path)
+            .map_err(|e| e.to_string())?
+            .len();
+        if size > max_bytes {
+            return Err(format!("文件超过 {} 字节上限", max_bytes));
+        }
+    }
     let bytes = std::fs::read(&file_path).map_err(|e| e.to_string())?;
 
     let mime = path_mime(&file_path).to_string();
@@ -2222,6 +2274,8 @@ pub fn open_folder(path: String) -> Result<(), String> {
 #[derive(Serialize)]
 pub struct SearchResult {
     pub peer_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub peer_node_id: String,
     pub peer_name: String,
     pub messages: Vec<SearchHit>,
 }
@@ -2239,6 +2293,41 @@ pub struct SearchHit {
     pub timestamp: String,
 }
 
+fn search_peer_identity(
+    my_identity_keys: &std::collections::HashSet<String>,
+    my_node_id: &str,
+    sender_id: &str,
+    sender_node_id: &str,
+    receiver_id: &str,
+    receiver_node_id: &str,
+) -> (bool, String, String) {
+    let my_node_id = my_node_id.trim();
+    let sender_node_id = sender_node_id.trim();
+    let sent_by_me = if !my_node_id.is_empty() && !sender_node_id.is_empty() {
+        sender_node_id == my_node_id
+    } else {
+        my_identity_keys.contains(sender_id)
+    };
+    if sent_by_me {
+        (
+            true,
+            receiver_id.to_string(),
+            receiver_node_id.trim().to_string(),
+        )
+    } else {
+        (false, sender_id.to_string(), sender_node_id.to_string())
+    }
+}
+
+fn search_peer_group_key(peer_id: &str, peer_node_id: &str) -> String {
+    let peer_node_id = peer_node_id.trim();
+    if peer_node_id.is_empty() {
+        format!("endpoint:{peer_id}")
+    } else {
+        format!("node:{peer_node_id}")
+    }
+}
+
 #[tauri::command]
 pub async fn search_messages(
     state: State<'_, AppState>,
@@ -2250,6 +2339,14 @@ pub async fn search_messages(
     };
 
     let my_id = runtime.my_id();
+    let my_node_id = runtime.my_node_id.clone();
+    let my_identity_keys = state
+        .db
+        .identity_aliases(&my_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
     let rows = state
         .db
         .search_messages(&my_id, &query)
@@ -2258,22 +2355,42 @@ pub async fn search_messages(
 
     let mut groups: std::collections::BTreeMap<String, SearchResult> =
         std::collections::BTreeMap::new();
+    let mut current_routes = std::collections::HashMap::<String, String>::new();
     for row in rows {
-        let peer_id = if row.sender_id == my_id {
-            row.receiver_id.clone()
+        let (sent_by_me, historical_peer_id, peer_node_id) = search_peer_identity(
+            &my_identity_keys,
+            &my_node_id,
+            &row.sender_id,
+            &row.sender_node_id,
+            &row.receiver_id,
+            &row.receiver_node_id,
+        );
+        let peer_id = if peer_node_id.is_empty() {
+            historical_peer_id
+        } else if let Some(current) = current_routes.get(&peer_node_id) {
+            current.clone()
         } else {
-            row.sender_id.clone()
+            let current = state
+                .db
+                .current_peer_id_for_node(&peer_node_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .unwrap_or(historical_peer_id);
+            current_routes.insert(peer_node_id.clone(), current.clone());
+            current
         };
-        let peer_name = if row.sender_id == my_id {
+        let peer_name = if sent_by_me {
             "我发往".to_string()
         } else {
             row.sender_name.clone()
         };
+        let group_key = search_peer_group_key(&peer_id, &peer_node_id);
 
         groups
-            .entry(peer_id.clone())
+            .entry(group_key)
             .or_insert_with(|| SearchResult {
                 peer_id: peer_id.clone(),
+                peer_node_id: peer_node_id.clone(),
                 peer_name,
                 messages: vec![],
             })
@@ -2363,6 +2480,7 @@ pub async fn get_conversation_history(
     state: State<'_, AppState>,
     peer_id: String,
     before_id: Option<i64>,
+    after_id: Option<i64>,
     limit: Option<i64>,
     filter: Option<String>,
     day_start: Option<String>,
@@ -2379,6 +2497,7 @@ pub async fn get_conversation_history(
             &peer_id,
             &runtime.my_id(),
             before_id,
+            after_id,
             limit,
             filter.as_deref(),
             day_start.as_deref(),
@@ -2393,6 +2512,7 @@ pub async fn get_group_history(
     state: State<'_, AppState>,
     group_id: String,
     before_id: Option<i64>,
+    after_id: Option<i64>,
     limit: Option<i64>,
     filter: Option<String>,
     day_start: Option<String>,
@@ -2403,6 +2523,7 @@ pub async fn get_group_history(
         .get_group_history(
             &group_id,
             before_id,
+            after_id,
             limit,
             filter.as_deref(),
             day_start.as_deref(),
@@ -2619,6 +2740,7 @@ pub async fn create_group(
             None => (String::new(), 9527, vec![]),
         }
     };
+    let creator_node_id = my_node_id.clone();
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
         p.as_ref()
@@ -2658,6 +2780,7 @@ pub async fn create_group(
         group_id: gid,
         name: payload.name,
         creator_id: my_id,
+        creator_node_id,
         created_at: String::new(),
         members,
         last_message: None,
@@ -2966,7 +3089,12 @@ pub async fn leave_group(state: State<'_, AppState>, group_id: String) -> Result
         .await
         .map_err(|e| e.to_string())?;
     if let Some(g) = groups.iter().find(|g| g.group_id == group_id) {
-        if g.creator_id == my_id {
+        let is_creator = if !g.creator_node_id.trim().is_empty() && !my_node_id.trim().is_empty() {
+            g.creator_node_id == my_node_id
+        } else {
+            g.creator_id == my_id
+        };
+        if is_creator {
             return Err("群主不可退群，请使用解散群".to_string());
         }
     }
@@ -3016,6 +3144,23 @@ pub async fn dissolve_group(state: State<'_, AppState>, group_id: String) -> Res
         let peers = r.discovery.read().await.get_peers();
         (r.my_id(), r.my_node_id.clone(), r.listen_port, peers)
     };
+    let groups = state
+        .db
+        .list_groups(&my_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let group = groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .ok_or_else(|| "群聊不存在或当前用户不是成员".to_string())?;
+    let is_creator = if !group.creator_node_id.trim().is_empty() && !my_node_id.trim().is_empty() {
+        group.creator_node_id == my_node_id
+    } else {
+        group.creator_id == my_id
+    };
+    if !is_creator {
+        return Err("只有群主可以解散群聊".to_string());
+    }
     let (my_name, my_department) = {
         let p = state.profile.lock().await;
         p.as_ref()
@@ -3092,6 +3237,228 @@ pub async fn send_group_sticker(
     .await
 }
 
+fn aggregate_group_file_progress(
+    file_size: u64,
+    target_count: usize,
+    completed_targets: usize,
+    current_target_sent: u64,
+) -> (u64, u64) {
+    let target_count = u64::try_from(target_count).unwrap_or(u64::MAX);
+    let completed_targets = u64::try_from(completed_targets)
+        .unwrap_or(u64::MAX)
+        .min(target_count);
+    let total = file_size.saturating_mul(target_count);
+    let sent = file_size
+        .saturating_mul(completed_targets)
+        .saturating_add(current_target_sent.min(file_size))
+        .min(total);
+    (sent, total)
+}
+
+fn emit_group_file_progress(
+    app_handle: &AppHandle,
+    file_name: &str,
+    client_msg_id: Option<&str>,
+    file_size: u64,
+    target_count: usize,
+    completed_targets: usize,
+    current_target_sent: u64,
+    speed: u64,
+    done: bool,
+) {
+    let (sent, total) = aggregate_group_file_progress(
+        file_size,
+        target_count,
+        completed_targets,
+        current_target_sent,
+    );
+    let _ = app_handle.emit_all(
+        "file-progress",
+        serde_json::json!({
+            "fileName": file_name,
+            "clientMsgId": client_msg_id,
+            "sent": sent,
+            "total": total,
+            "speed": speed,
+            "done": done,
+            "direction": "send",
+        }),
+    );
+}
+
+struct GroupFileProgressEmitter<'a> {
+    app_handle: &'a AppHandle,
+    file_name: &'a str,
+    client_msg_id: Option<&'a str>,
+    file_size: u64,
+    target_count: usize,
+    completed_targets: usize,
+    started_at: std::time::Instant,
+    last_emit_at: std::time::Instant,
+}
+
+impl GroupFileProgressEmitter<'_> {
+    fn emit(&mut self, current_target_sent: u64, force: bool) {
+        if !force
+            && self.last_emit_at.elapsed() < std::time::Duration::from_millis(200)
+            && current_target_sent < self.file_size
+        {
+            return;
+        }
+        let elapsed = self.started_at.elapsed().as_secs_f64().max(0.1);
+        let speed = (current_target_sent as f64 / elapsed) as u64;
+        emit_group_file_progress(
+            self.app_handle,
+            self.file_name,
+            self.client_msg_id,
+            self.file_size,
+            self.target_count,
+            self.completed_targets,
+            current_target_sent,
+            speed,
+            false,
+        );
+        self.last_emit_at = std::time::Instant::now();
+    }
+}
+
+async fn persist_group_file_cancellation(
+    db: &crate::db::Database,
+    app_handle: &AppHandle,
+    group_id: &str,
+    sender_id: &str,
+    sender_node_id: &str,
+    sender_name: &str,
+    file_name: &str,
+    client_msg_id: Option<&str>,
+    pending_cache: &Arc<tokio::sync::Mutex<Option<String>>>,
+) -> bool {
+    let cleanup_succeeded = cleanup_cancelled_group_file_transfers(
+        db,
+        group_id,
+        sender_id,
+        sender_node_id,
+        client_msg_id,
+        pending_cache,
+    )
+    .await;
+    let content = format!("已取消发送 {}", file_name);
+    let cancellation_id = client_msg_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("cancel:{}", value));
+    match db
+        .save_group_message_dedup(
+            group_id,
+            sender_id,
+            sender_name,
+            &content,
+            "text",
+            None,
+            Some(file_name),
+            None,
+            true,
+            cancellation_id.as_deref(),
+        )
+        .await
+    {
+        Ok(saved) => {
+            crate::chat::emit_group_message_updated(app_handle, group_id, saved);
+            cleanup_succeeded
+        }
+        Err(error) => {
+            log::error!("Failed to persist group file cancellation: {}", error);
+            false
+        }
+    }
+}
+
+async fn cleanup_cancelled_group_file_transfers(
+    db: &crate::db::Database,
+    group_id: &str,
+    sender_id: &str,
+    sender_node_id: &str,
+    client_msg_id: Option<&str>,
+    pending_cache: &Arc<tokio::sync::Mutex<Option<String>>>,
+) -> bool {
+    let Some(client_msg_id) = client_msg_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        log::error!("Cannot clean cancelled group file queue without client_msg_id");
+        return false;
+    };
+
+    let mut cache_paths = match db
+        .delete_cancelled_group_file_transfers(
+            group_id,
+            sender_id,
+            Some(sender_node_id),
+            client_msg_id,
+        )
+        .await
+    {
+        Ok(paths) => paths,
+        Err(error) => {
+            log::error!(
+                "Failed to clear cancelled group file queue for {}: {}",
+                client_msg_id,
+                error
+            );
+            return false;
+        }
+    };
+
+    // A cache copy can exist even when inserting the first pending row failed.
+    // Include the task-local path so cancellation does not leak that orphan.
+    if let Some(task_cache_path) = pending_cache.lock().await.clone() {
+        if !task_cache_path.trim().is_empty()
+            && !cache_paths.iter().any(|path| path == &task_cache_path)
+        {
+            cache_paths.push(task_cache_path);
+        }
+    }
+
+    let mut cleanup_succeeded = true;
+    for cache_path in cache_paths {
+        match db.count_pending_file_transfers_by_path(&cache_path).await {
+            Ok(0) => match tokio::fs::remove_file(&cache_path).await {
+                Ok(()) => {
+                    let mut task_cache = pending_cache.lock().await;
+                    if task_cache.as_deref() == Some(cache_path.as_str()) {
+                        *task_cache = None;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let mut task_cache = pending_cache.lock().await;
+                    if task_cache.as_deref() == Some(cache_path.as_str()) {
+                        *task_cache = None;
+                    }
+                }
+                Err(error) => {
+                    cleanup_succeeded = false;
+                    log::error!(
+                        "Failed to remove cancelled group file cache {}: {}",
+                        cache_path,
+                        error
+                    );
+                }
+            },
+            Ok(_) => {}
+            Err(error) => {
+                cleanup_succeeded = false;
+                log::error!(
+                    "Failed to check cancelled group file cache references {}: {}",
+                    cache_path,
+                    error
+                );
+            }
+        }
+    }
+
+    cleanup_succeeded
+}
+
 async fn send_group_file_with_kind(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -3103,7 +3470,7 @@ async fn send_group_file_with_kind(
 ) -> Result<ChatMessage, String> {
     use chrono::Utc;
     let client_msg_id = Some(client_msg_id_or_new(client_msg_id));
-    let (my_id, my_name, my_department, listen_port, db, members) = {
+    let (my_id, my_node_id, my_name, my_department, listen_port, db, members) = {
         let runtime_opt = { state.runtime.read().await.clone() };
         let r = runtime_opt.as_ref().ok_or("未初始化")?;
         let my_name = state
@@ -3127,6 +3494,7 @@ async fn send_group_file_with_kind(
             .map_err(|e| e.to_string())?;
         (
             r.my_id(),
+            r.my_node_id.clone(),
             my_name,
             my_department,
             r.listen_port,
@@ -3147,10 +3515,12 @@ async fn send_group_file_with_kind(
                 .unwrap_or("unknown")
                 .to_string()
         });
-    let file_size = tokio::fs::metadata(&file_path)
+    let file_size_u64 = tokio::fs::metadata(&file_path)
         .await
-        .map(|m| m.len() as i64)
+        .map(|m| m.len())
         .map_err(|e| e.to_string())?;
+    let file_size =
+        i64::try_from(file_size_u64).map_err(|_| "文件过大，无法记录传输大小".to_string())?;
     let pending_cache: Arc<tokio::sync::Mutex<Option<String>>> =
         Arc::new(tokio::sync::Mutex::new(None));
     let msg_kind = if file_kind == "sticker" {
@@ -3177,9 +3547,20 @@ async fn send_group_file_with_kind(
     let bg_handle = app_handle.clone();
     let bg_error_handle = app_handle.clone();
     let bg_db = db.clone();
-    let bg_members = members;
+    let bg_members: Vec<_> = members
+        .into_iter()
+        .filter(|member| {
+            if !member.node_id.trim().is_empty() && !my_node_id.trim().is_empty() {
+                member.node_id != my_node_id
+            } else {
+                member.peer_id != my_id
+            }
+        })
+        .collect();
+    let bg_target_count = bg_members.len();
     let bg_online_peers = online_peers;
     let bg_my_id = my_id.clone();
+    let bg_my_node_id = my_node_id.clone();
     let bg_my_name = my_name.clone();
     let bg_my_department = my_department.clone();
     let bg_group_id = group_id.clone();
@@ -3192,18 +3573,49 @@ async fn send_group_file_with_kind(
 
     tauri::async_runtime::spawn(async move {
         let mut had_delivery_failure = false;
+        let mut completed_targets = 0usize;
+        emit_group_file_progress(
+            &bg_handle,
+            &bg_file_name,
+            bg_client_msg_id.as_deref(),
+            file_size_u64,
+            bg_target_count,
+            0,
+            0,
+            0,
+            false,
+        );
         for member in bg_members {
-            if member.peer_id == bg_my_id {
-                continue;
-            }
             if let Err(e) = wait_for_outgoing_file_transfer(bg_client_msg_id.as_deref()).await {
+                let error_message = e.to_string();
+                let cancellation_persisted = if error_message == FILE_TRANSFER_CANCELLED_MESSAGE {
+                    persist_group_file_cancellation(
+                        bg_db.as_ref(),
+                        &bg_handle,
+                        &bg_group_id,
+                        &bg_my_id,
+                        &bg_my_node_id,
+                        &bg_my_name,
+                        &bg_file_name,
+                        bg_client_msg_id.as_deref(),
+                        &bg_pending_cache,
+                    )
+                    .await
+                } else {
+                    true
+                };
+                let reported_error = if cancellation_persisted {
+                    error_message
+                } else {
+                    "发送已取消，但待发送队列清理或取消记录保存失败".to_string()
+                };
                 clear_outgoing_file_transfer(bg_client_msg_id.as_deref()).await;
                 let _ = bg_error_handle.emit_all(
                     "file-error",
                     serde_json::json!({
                         "fileName": bg_file_name.as_str(),
                         "clientMsgId": bg_client_msg_id.as_deref(),
-                        "error": e.to_string(),
+                        "error": reported_error,
                     }),
                 );
                 return;
@@ -3214,6 +3626,8 @@ async fn send_group_file_with_kind(
             let target_department = member.department.clone();
             let target_software_version =
                 resolve_peer_software_version(&target_id, bg_db.as_ref(), &bg_online_peers).await;
+            let target_node_id =
+                resolve_peer_node_id(&target_id, bg_db.as_ref(), &bg_online_peers).await;
             let resolved_addr =
                 resolve_peer_addr(&target_id, bg_db.as_ref(), &bg_online_peers).await;
 
@@ -3226,12 +3640,14 @@ async fn send_group_file_with_kind(
                     port,
                 );
                 peer.software_version = target_software_version;
+                peer.node_id = target_node_id;
                 match send_group_file_to_peer_with_progress(
                     &bg_file_path,
                     &bg_file_name,
                     file_size,
                     &peer,
                     &bg_my_id,
+                    &bg_my_node_id,
                     &bg_my_name,
                     &bg_my_department,
                     listen_port,
@@ -3239,33 +3655,57 @@ async fn send_group_file_with_kind(
                     &bg_msg_kind,
                     bg_client_msg_id.as_deref(),
                     &bg_handle,
+                    completed_targets,
+                    bg_target_count,
                 )
                 .await
                 {
-                    Ok(_) => log::info!("Group file sent to {}", peer.id),
+                    Ok(_) => {
+                        completed_targets += 1;
+                        emit_group_file_progress(
+                            &bg_handle,
+                            &bg_file_name,
+                            bg_client_msg_id.as_deref(),
+                            file_size_u64,
+                            bg_target_count,
+                            completed_targets,
+                            0,
+                            0,
+                            false,
+                        );
+                        log::info!("Group file sent to {}", peer.id);
+                    }
                     Err(e) if e == FILE_TRANSFER_CANCELLED_MESSAGE => {
+                        let cancellation_persisted = persist_group_file_cancellation(
+                            bg_db.as_ref(),
+                            &bg_handle,
+                            &bg_group_id,
+                            &bg_my_id,
+                            &bg_my_node_id,
+                            &bg_my_name,
+                            &bg_file_name,
+                            bg_client_msg_id.as_deref(),
+                            &bg_pending_cache,
+                        )
+                        .await;
+                        let reported_error = if cancellation_persisted {
+                            e
+                        } else {
+                            "发送已取消，但待发送队列清理或取消记录保存失败".to_string()
+                        };
                         clear_outgoing_file_transfer(bg_client_msg_id.as_deref()).await;
                         let _ = bg_error_handle.emit_all(
                             "file-error",
                             serde_json::json!({
                                 "fileName": bg_file_name.as_str(),
                                 "clientMsgId": bg_client_msg_id.as_deref(),
-                                "error": e,
+                                "error": reported_error,
                             }),
                         );
                         return;
                     }
                     Err(e) => {
-                        had_delivery_failure = true;
-                        log::error!("Group file send failed to {}: {}", peer.id, e);
-                        let _ = bg_error_handle.emit_all(
-                            "file-error",
-                            serde_json::json!({
-                                "fileName": bg_file_name.as_str(),
-                                "clientMsgId": bg_client_msg_id.as_deref(),
-                                "error": e.as_str(),
-                            }),
-                        );
+                        log::error!("Group file send failed to {}, queueing: {}", peer.id, e);
                         if let Err(queue_err) = queue_group_file_for_peer(
                             bg_db.as_ref(),
                             &bg_file_path,
@@ -3273,7 +3713,9 @@ async fn send_group_file_with_kind(
                             file_size,
                             bg_pending_cache.clone(),
                             &peer.id,
+                            &peer.node_id,
                             &bg_my_id,
+                            &bg_my_node_id,
                             &bg_my_name,
                             &bg_my_department,
                             listen_port,
@@ -3283,6 +3725,7 @@ async fn send_group_file_with_kind(
                         )
                         .await
                         {
+                            had_delivery_failure = true;
                             log::error!(
                                 "Failed to queue group file for {}: {}",
                                 peer.id,
@@ -3296,6 +3739,23 @@ async fn send_group_file_with_kind(
                                     "error": queue_err,
                                 }),
                             );
+                        } else {
+                            completed_targets += 1;
+                            emit_group_file_progress(
+                                &bg_handle,
+                                &bg_file_name,
+                                bg_client_msg_id.as_deref(),
+                                file_size_u64,
+                                bg_target_count,
+                                completed_targets,
+                                0,
+                                0,
+                                false,
+                            );
+                            log::info!(
+                                "Queued group file for {} after direct send failure",
+                                peer.id
+                            );
                         }
                     }
                 }
@@ -3307,7 +3767,9 @@ async fn send_group_file_with_kind(
                     file_size,
                     bg_pending_cache.clone(),
                     &target_id,
+                    &target_node_id,
                     &bg_my_id,
+                    &bg_my_node_id,
                     &bg_my_name,
                     &bg_my_department,
                     listen_port,
@@ -3328,21 +3790,60 @@ async fn send_group_file_with_kind(
                         }),
                     );
                 } else {
+                    completed_targets += 1;
+                    emit_group_file_progress(
+                        &bg_handle,
+                        &bg_file_name,
+                        bg_client_msg_id.as_deref(),
+                        file_size_u64,
+                        bg_target_count,
+                        completed_targets,
+                        0,
+                        0,
+                        false,
+                    );
                     log::info!("Queued group file for offline member {}", target_id);
                 }
             }
         }
 
         if let Err(e) = wait_for_outgoing_file_transfer(bg_client_msg_id.as_deref()).await {
+            let error_message = e.to_string();
+            let cancellation_persisted = if error_message == FILE_TRANSFER_CANCELLED_MESSAGE {
+                persist_group_file_cancellation(
+                    bg_db.as_ref(),
+                    &bg_handle,
+                    &bg_group_id,
+                    &bg_my_id,
+                    &bg_my_node_id,
+                    &bg_my_name,
+                    &bg_file_name,
+                    bg_client_msg_id.as_deref(),
+                    &bg_pending_cache,
+                )
+                .await
+            } else {
+                true
+            };
+            let reported_error = if cancellation_persisted {
+                error_message
+            } else {
+                "发送已取消，但待发送队列清理或取消记录保存失败".to_string()
+            };
             clear_outgoing_file_transfer(bg_client_msg_id.as_deref()).await;
             let _ = bg_error_handle.emit_all(
                 "file-error",
                 serde_json::json!({
                     "fileName": bg_file_name.as_str(),
                     "clientMsgId": bg_client_msg_id.as_deref(),
-                    "error": e.to_string(),
+                    "error": reported_error,
                 }),
             );
+            return;
+        }
+
+        if had_delivery_failure {
+            clear_outgoing_file_transfer(bg_client_msg_id.as_deref()).await;
             return;
         }
 
@@ -3375,28 +3876,28 @@ async fn send_group_file_with_kind(
                 return;
             }
         };
+        emit_group_file_progress(
+            &bg_handle,
+            &bg_file_name,
+            bg_client_msg_id.as_deref(),
+            file_size_u64,
+            bg_target_count,
+            bg_target_count,
+            0,
+            0,
+            true,
+        );
         crate::chat::emit_group_message_updated(&bg_handle, &bg_group_id, saved);
-
-        if !had_delivery_failure {
-            let _ = bg_handle.emit_all(
-                "file-progress",
-                serde_json::json!({
-                    "fileName": bg_file_name.as_str(),
-                    "clientMsgId": bg_client_msg_id.as_deref(),
-                    "sent": file_size,
-                    "total": file_size,
-                    "speed": 0,
-                }),
-            );
-        }
         clear_outgoing_file_transfer(bg_client_msg_id.as_deref()).await;
     });
 
     Ok(ChatMessage {
         id: 0,
         sender_id: my_id,
+        sender_node_id: my_node_id,
         sender_name: my_name,
         receiver_id: String::new(),
+        receiver_node_id: String::new(),
         content,
         msg_type: msg_kind.to_string(),
         file_name: Some(file_name),
@@ -3415,6 +3916,7 @@ async fn send_group_file_to_peer_with_progress(
     file_size: i64,
     peer: &Peer,
     my_id: &str,
+    my_node_id: &str,
     my_name: &str,
     my_department: &str,
     listen_port: u16,
@@ -3422,12 +3924,16 @@ async fn send_group_file_to_peer_with_progress(
     file_kind: &str,
     client_msg_id: Option<&str>,
     app_handle: &tauri::AppHandle,
+    completed_targets: usize,
+    target_count: usize,
 ) -> Result<(), String> {
     let transfer = crate::db::PendingFileTransfer {
         id: 0,
         group_id: group_id.to_string(),
         peer_id: peer.id.clone(),
+        target_node_id: peer.node_id.clone(),
         sender_id: my_id.to_string(),
+        sender_node_id: my_node_id.to_string(),
         sender_name: my_name.to_string(),
         sender_department: my_department.to_string(),
         sender_port: listen_port,
@@ -3438,35 +3944,30 @@ async fn send_group_file_to_peer_with_progress(
         client_msg_id: client_msg_id.unwrap_or_default().to_string(),
     };
 
-    let _ = app_handle.emit_all(
-        "file-progress",
-        serde_json::json!({
-            "fileName": file_name,
-            "clientMsgId": client_msg_id,
-            "sent": 0,
-            "total": file_size,
-            "speed": 0,
-        }),
-    );
+    let file_size_u64 =
+        u64::try_from(file_size).map_err(|_| "文件大小无效，无法发送".to_string())?;
+    let now = std::time::Instant::now();
+    let mut progress = GroupFileProgressEmitter {
+        app_handle,
+        file_name,
+        client_msg_id,
+        file_size: file_size_u64,
+        target_count,
+        completed_targets,
+        started_at: now,
+        last_emit_at: now,
+    };
+    progress.emit(0, true);
 
     send_group_file_payloads_over_tcp_controlled(
         &peer.address(),
         &transfer,
         client_msg_id,
         &peer.software_version,
+        Some(&mut progress),
     )
     .await?;
-
-    let _ = app_handle.emit_all(
-        "file-progress",
-        serde_json::json!({
-            "fileName": file_name,
-            "clientMsgId": client_msg_id,
-            "sent": file_size,
-            "total": file_size,
-            "speed": 0,
-        }),
-    );
+    progress.emit(file_size_u64, true);
 
     Ok(())
 }
@@ -3478,7 +3979,9 @@ async fn queue_group_file_for_peer(
     file_size: i64,
     pending_cache: Arc<tokio::sync::Mutex<Option<String>>>,
     peer_id: &str,
+    target_node_id: &str,
     my_id: &str,
+    my_node_id: &str,
     my_name: &str,
     my_department: &str,
     listen_port: u16,
@@ -3491,7 +3994,9 @@ async fn queue_group_file_for_peer(
     db.queue_pending_file_transfer(
         group_id,
         peer_id,
+        Some(target_node_id),
         my_id,
+        Some(my_node_id),
         my_name,
         my_department,
         listen_port,
@@ -3598,14 +4103,14 @@ pub async fn deliver_pending(state: State<'_, AppState>, peer_id: String) -> Res
                 let addr = format!("{}:{}", ip, port);
                 let wm = crate::chat::WireMessage {
                     sender_id: p.sender_id.clone(),
-                    sender_node_id: String::new(),
+                    sender_node_id: p.sender_node_id.clone(),
                     sender_name: p.sender_name.clone(),
                     sender_department: String::new(),
                     sender_software_version: crate::profile_metadata::software_version(),
                     sender_mac_address: crate::profile_metadata::mac_address(),
                     sender_port: listen_port,
                     receiver_id: peer_id.clone(),
-                    receiver_node_id: String::new(),
+                    receiver_node_id: p.target_node_id.clone(),
                     content: p.content.clone(),
                     msg_type: p.msg_type.clone(),
                     file_name: None,
@@ -3786,9 +4291,11 @@ async fn deliver_pending_to_peer_inner(
     let mut delivered = Vec::new();
     for p in &pending {
         let wm = serde_json::json!({
-            "sender_id": p.sender_id, "sender_name": p.sender_name,
+            "sender_id": p.sender_id, "sender_node_id": p.sender_node_id,
+            "sender_name": p.sender_name,
             "sender_department": "", "sender_port": stored.port,
-            "receiver_id": peer_id_str, "content": p.content,
+            "receiver_id": peer_id_str, "receiver_node_id": p.target_node_id,
+            "content": p.content,
             "msg_type": p.msg_type, "group_id": p.group_id,
             "known_peers": [], "file_name": null, "file_size": null, "file_data": null,
         });
@@ -3867,7 +4374,7 @@ async fn send_group_file_payloads_over_tcp(
     transfer: &crate::db::PendingFileTransfer,
     peer_software_version: &str,
 ) -> bool {
-    send_group_file_payloads_over_tcp_controlled(addr, transfer, None, peer_software_version)
+    send_group_file_payloads_over_tcp_controlled(addr, transfer, None, peer_software_version, None)
         .await
         .is_ok()
 }
@@ -3877,6 +4384,7 @@ async fn send_group_file_payloads_over_tcp_controlled(
     transfer: &crate::db::PendingFileTransfer,
     client_msg_id: Option<&str>,
     peer_software_version: &str,
+    mut progress: Option<&mut GroupFileProgressEmitter<'_>>,
 ) -> Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let stored_client_msg_id = transfer.client_msg_id.trim();
@@ -3935,14 +4443,14 @@ async fn send_group_file_payloads_over_tcp_controlled(
         if let Err(error) = serialize_file_wire_message_line(
             FileWireMessageLine {
                 sender_id: &transfer.sender_id,
-                sender_node_id: "",
+                sender_node_id: &transfer.sender_node_id,
                 sender_name: &transfer.sender_name,
                 sender_department: &transfer.sender_department,
                 sender_software_version: &sender_software_version,
                 sender_mac_address: &sender_mac_address,
                 sender_port: transfer.sender_port,
                 receiver_id: &transfer.peer_id,
-                receiver_node_id: "",
+                receiver_node_id: &transfer.target_node_id,
                 content: &content_buf,
                 msg_type: "file_end",
                 file_name: &transfer.file_name,
@@ -3961,9 +4469,42 @@ async fn send_group_file_payloads_over_tcp_controlled(
         }
     } else {
         while sent_bytes < declared_file_size {
-            wait_for_outgoing_file_transfer(client_msg_id)
-                .await
-                .map_err(|e| e.to_string())?;
+            if let Err(error) = wait_for_outgoing_file_transfer(client_msg_id).await {
+                let error_message = error.to_string();
+                if error_message == FILE_TRANSFER_CANCELLED_MESSAGE {
+                    let cancellation_content = format!("已取消发送 {}", transfer.file_name);
+                    let cancellation_client_msg_id =
+                        wire_client_msg_id.map(|value| format!("cancel:{}", value));
+                    if serialize_file_wire_message_line(
+                        FileWireMessageLine {
+                            sender_id: &transfer.sender_id,
+                            sender_node_id: &transfer.sender_node_id,
+                            sender_name: &transfer.sender_name,
+                            sender_department: &transfer.sender_department,
+                            sender_software_version: &sender_software_version,
+                            sender_mac_address: &sender_mac_address,
+                            sender_port: transfer.sender_port,
+                            receiver_id: &transfer.peer_id,
+                            receiver_node_id: &transfer.target_node_id,
+                            content: &cancellation_content,
+                            msg_type: "file_cancelled",
+                            file_name: &transfer.file_name,
+                            file_size: declared_file_size,
+                            file_kind: &transfer.file_kind,
+                            known_peers: &[],
+                            group_id: Some(&transfer.group_id),
+                            client_msg_id: cancellation_client_msg_id.as_deref(),
+                        },
+                        &mut payload,
+                    )
+                    .is_ok()
+                    {
+                        let _ = stream.write_all(&payload).await;
+                        let _ = stream.flush().await;
+                    }
+                }
+                return Err(error_message);
+            }
 
             let remaining = (declared_file_size - sent_bytes).min(buf.len() as u64) as usize;
             let n = match file.read(&mut buf[..remaining]).await {
@@ -3980,14 +4521,14 @@ async fn send_group_file_payloads_over_tcp_controlled(
             if let Err(error) = serialize_file_wire_message_line(
                 FileWireMessageLine {
                     sender_id: &transfer.sender_id,
-                    sender_node_id: "",
+                    sender_node_id: &transfer.sender_node_id,
                     sender_name: &transfer.sender_name,
                     sender_department: &transfer.sender_department,
                     sender_software_version: &sender_software_version,
                     sender_mac_address: &sender_mac_address,
                     sender_port: transfer.sender_port,
                     receiver_id: &transfer.peer_id,
-                    receiver_node_id: "",
+                    receiver_node_id: &transfer.target_node_id,
                     content: &content_buf,
                     msg_type,
                     file_name: &transfer.file_name,
@@ -4003,6 +4544,9 @@ async fn send_group_file_payloads_over_tcp_controlled(
             }
             if stream.write_all(&payload).await.is_err() {
                 return Err(format!("Failed to write to {}", addr));
+            }
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.emit(sent_bytes, false);
             }
             if is_last {
                 break;
@@ -4433,7 +4977,8 @@ async fn build_member_directory(
 #[cfg(test)]
 mod pending_delivery_tests {
     use super::{
-        deliver_over_tcp, deliver_pending_payloads_over_tcp, finish_pending_delivery,
+        aggregate_group_file_progress, deliver_over_tcp, deliver_pending_payloads_over_tcp,
+        finish_pending_delivery, search_peer_group_key, search_peer_identity,
         send_group_file_payloads_over_tcp_controlled, send_or_queue_notification,
         try_begin_pending_delivery,
     };
@@ -4460,6 +5005,69 @@ mod pending_delivery_tests {
             "client_msg_id": client_msg_id
         })
         .to_string()
+    }
+
+    #[test]
+    fn group_file_progress_is_monotonic_across_members() {
+        assert_eq!(aggregate_group_file_progress(100, 3, 0, 0), (0, 300));
+        assert_eq!(aggregate_group_file_progress(100, 3, 0, 40), (40, 300));
+        assert_eq!(aggregate_group_file_progress(100, 3, 1, 0), (100, 300));
+        assert_eq!(aggregate_group_file_progress(100, 3, 1, 70), (170, 300));
+        assert_eq!(aggregate_group_file_progress(100, 3, 3, 0), (300, 300));
+        assert_eq!(aggregate_group_file_progress(100, 3, 8, 80), (300, 300));
+        assert_eq!(aggregate_group_file_progress(0, 3, 2, 0), (0, 0));
+        assert_eq!(aggregate_group_file_progress(100, 0, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn global_search_identity_is_node_first_and_groups_routes_by_node() {
+        let my_identity_keys = std::collections::HashSet::from([
+            "10.0.0.2:9527".to_string(),
+            "10.0.0.9:9527".to_string(),
+        ]);
+        let (sent_by_me, peer_id, peer_node_id) = search_peer_identity(
+            &my_identity_keys,
+            "node-self",
+            "10.0.0.2:9527",
+            "node-self",
+            "10.0.0.20:9527",
+            "node-peer",
+        );
+        assert!(sent_by_me);
+        assert_eq!(peer_id, "10.0.0.20:9527");
+        assert_eq!(peer_node_id, "node-peer");
+
+        let (sent_by_me, peer_id, peer_node_id) = search_peer_identity(
+            &my_identity_keys,
+            "node-self",
+            "10.0.0.9:9527",
+            "node-other",
+            "10.0.0.30:9527",
+            "node-self",
+        );
+        assert!(!sent_by_me);
+        assert_eq!(peer_id, "10.0.0.9:9527");
+        assert_eq!(peer_node_id, "node-other");
+
+        let (legacy_sent_by_me, _, legacy_peer_node_id) = search_peer_identity(
+            &my_identity_keys,
+            "node-self",
+            "10.0.0.2:9527",
+            "",
+            "10.0.0.40:9527",
+            "",
+        );
+        assert!(legacy_sent_by_me);
+        assert!(legacy_peer_node_id.is_empty());
+
+        assert_eq!(
+            search_peer_group_key("10.0.0.20:9527", "node-peer"),
+            search_peer_group_key("10.0.0.21:9527", "node-peer")
+        );
+        assert_ne!(
+            search_peer_group_key("10.0.0.20:9527", ""),
+            search_peer_group_key("10.0.0.21:9527", "")
+        );
     }
 
     fn ack_payload(client_msg_id: &str) -> Vec<u8> {
@@ -4586,7 +5194,9 @@ mod pending_delivery_tests {
             id: 1,
             group_id: "group-1".to_string(),
             peer_id: "receiver".to_string(),
+            target_node_id: "node-receiver".to_string(),
             sender_id: "sender".to_string(),
+            sender_node_id: "node-sender".to_string(),
             sender_name: "Sender".to_string(),
             sender_department: "研发部".to_string(),
             sender_port: 9527,
@@ -4607,6 +5217,8 @@ mod pending_delivery_tests {
             let payload: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
             assert_eq!(payload["msg_type"], "file_end");
             assert_eq!(payload["file_size"], 19);
+            assert_eq!(payload["sender_node_id"], "node-sender");
+            assert_eq!(payload["receiver_node_id"], "node-receiver");
             reader
                 .get_mut()
                 .write_all(&ack_payload("file-message-1"))
@@ -4619,6 +5231,7 @@ mod pending_delivery_tests {
             &transfer,
             Some("file-message-1"),
             "0.2.0",
+            None,
         )
         .await;
 

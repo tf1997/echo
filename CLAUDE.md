@@ -35,7 +35,7 @@ Echo is a **P2P LAN chat** app built with **Tauri v1**. Rust backend, React 19 +
 
 ### Identity model
 
-A peer's identity is `IP:port` — there is no UUID. The `peer_id` stored everywhere is the string `"192.168.1.5:9527"`.
+Each installation has a stable `node_id`; `peer_id` remains the current `IP:port` route for old-client compatibility. During the migration period both keys coexist: new records prefer confirmed node identity, while endpoint aliases keep legacy history readable. Never trust a wire `node_id` until it matches a persisted endpoint-to-node binding.
 
 ### Startup flow ([lib.rs](src-tauri/src/lib.rs))
 
@@ -66,7 +66,7 @@ A peer's identity is `IP:port` — there is no UUID. The `peer_id` stored everyw
 Messages are JSON lines over TCP (`\n`-delimited). The `WireMessage` struct ([chat/mod.rs:16-31](src-tauri/src/chat/mod.rs#L16-L31)) carries `msg_type`:
 
 - `"text"` — chat message
-- `"file_chunk"` / `"file_end"` — chunked base64 file transfer (48 KB raw per chunk)
+- `"file_chunk"` / `"file_end"` — chunked base64 file transfer (2 MB raw per chunk)
 - `"contact_summary"` / `"contact_sync_res"` — anti-entropy peer list exchange
 - `"group_created"`, `"group_renamed"`, `"group_dissolved"`, `"group_member_left"` — group lifecycle
 - `"profile_updated"` — identity change broadcast
@@ -76,11 +76,12 @@ Messages are JSON lines over TCP (`\n`-delimited). The `WireMessage` struct ([ch
 
 mDNS code in [discovery/service.rs](src-tauri/src/discovery/service.rs) is gated behind `if false`. Actual discovery uses 3 strategies combined:
 
-1. **UDP broadcast** every 3s to `255.255.255.255:<chat_port+2>`
+1. **UDP broadcast** startup burst (3 sends, 4–12s jitter), then every 8–15 minutes to `255.255.255.255:<chat_port+2>`
 2. **UDP multicast** to `239.255.42.42:<chat_port+2>`
-3. **Unicast subnet scan** every 5 minutes — probes all 254 hosts in each configured `/24` subnet with randomized host order and 3–15ms jitter
+3. **Unicast subnet scan** every 25–45 minutes — probes at most 96 randomized hosts per cycle across configured `/24` subnets, with 80–250ms jitter
 
 Discovery port = chat port + 2 (e.g., chat on 9527 → discovery on 9529).
+Broadcast, multicast announcements, and subnet scans pause during the 21:00–09:00 quiet period. Listening remains active, and a fresh startup burst is sent after quiet hours.
 
 ### Health check & online detection
 
@@ -94,7 +95,7 @@ Every 5–8 minutes (jittered), the app picks 2–3 online + 1 offline peer and 
 
 ### File transfer
 
-Files are sent as chunked base64 over the existing TCP connection. `CHUNK_SIZE = 48 * 1024` (48 KB raw → ~64 KB base64 per JSON line). The receiver reassembles chunks in memory, then writes the file to `~/Echo/files/`. Progress events (`file-progress`) are emitted to the frontend.
+Files are sent as chunked base64 over the existing TCP connection. `FILE_CHUNK_SIZE = 2 * 1024 * 1024` (2 MB raw per JSON line). The receiver decodes and streams chunks into a buffered file under `~/Echo/files/`, verifies the declared byte count, and removes incomplete files. Send and receive progress events are emitted to the frontend.
 
 ### Offline queuing
 
@@ -102,7 +103,7 @@ If a peer is unreachable, notifications (group messages, profile updates, group 
 
 ### Frontend
 
-Single-page React app with no router. Polling refreshes peer lists every 2s and messages every 1s. Key components:
+Single-page React app with no router. Peer/group/unread summaries refresh defensively in the background, while message updates arrive through the `conversation-updated` event; window focus performs a reconciliation refresh. There is no 1-second message polling loop. Key components:
 
 - [App.tsx](frontend/src/App.tsx) — top-level state, polling loops, profile setup
 - [Sidebar.tsx](frontend/src/components/Sidebar.tsx) — peer list, groups, search, subnet config

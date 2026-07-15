@@ -34,8 +34,10 @@ export interface StoredPeer {
 export interface ChatMessage {
   id: number;
   sender_id: string;
+  sender_node_id?: string;
   sender_name: string;
   receiver_id: string;
+  receiver_node_id?: string;
   content: string;
   msg_type: string;
   file_path: string | null;
@@ -45,6 +47,21 @@ export interface ChatMessage {
   is_read: boolean;
   client_msg_id?: string | null;
   delivered?: boolean | null;
+}
+
+export function isSameIdentity(
+  leftNodeId: string | null | undefined,
+  leftEndpointId: string | null | undefined,
+  rightNodeId: string | null | undefined,
+  rightEndpointId: string | null | undefined,
+): boolean {
+  const leftNode = leftNodeId?.trim() ?? "";
+  const rightNode = rightNodeId?.trim() ?? "";
+  if (leftNode && rightNode) return leftNode === rightNode;
+
+  const leftEndpoint = leftEndpointId?.trim() ?? "";
+  const rightEndpoint = rightEndpointId?.trim() ?? "";
+  return !!leftEndpoint && leftEndpoint === rightEndpoint;
 }
 
 export interface AppInfo {
@@ -115,6 +132,7 @@ export interface GroupInfo {
   group_id: string;
   name: string;
   creator_id: string;
+  creator_node_id?: string;
   created_at: string;
   members: StoredPeer[];
   last_message?: string | null;

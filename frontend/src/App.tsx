@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import type { Peer, ChatMessage, AppInfo, StoredPeer, UnreadCount, UpdateCheckResult } from "./types";
+import { isSameIdentity } from "./types";
 import { ask, message, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
-import { appWindow } from "@tauri-apps/api/window";
+import { appWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
 import { AvatarPreviewTrigger } from "./components/AvatarPreview";
@@ -56,7 +57,8 @@ function isEndpointLike(value: string) {
   return /^.+:\d+$/.test(value.trim());
 }
 
-const MESSAGE_FETCH_LIMIT = 500;
+const MESSAGE_FETCH_LIMIT = 100;
+const HISTORY_CONTEXT_LIMIT = 50;
 
 interface ConversationUpdatedEvent {
   kind: "contact" | "group";
@@ -96,8 +98,32 @@ interface NudgeSignal {
   nonce: number;
 }
 
-function isIncomingNudge(message: ChatMessage | null | undefined, myId: string | undefined): message is ChatMessage {
-  return !!message && message.msg_type === MESSAGE_TYPE_NUDGE && message.sender_id !== myId;
+const NUDGE_INTERRUPT_STORAGE_KEY = "echo.nudge.interrupt";
+
+function getInitialNudgeInterruptEnabled(): boolean {
+  try {
+    return window.localStorage.getItem(NUDGE_INTERRUPT_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+async function requestAttentionForNudge() {
+  try {
+    await appWindow.requestUserAttention(UserAttentionType.Informational);
+  } catch (error) {
+    console.error("Failed to request attention for nudge:", error);
+  }
+}
+
+function isIncomingNudge(
+  message: ChatMessage | null | undefined,
+  myId: string | undefined,
+  myNodeId: string | undefined,
+): message is ChatMessage {
+  return !!message
+    && message.msg_type === MESSAGE_TYPE_NUDGE
+    && !isSameIdentity(message.sender_node_id, message.sender_id, myNodeId, myId);
 }
 
 async function bringAppToFrontForNudge() {
@@ -118,12 +144,52 @@ interface SelectConversationOptions {
 
 function isSamePeerConversation(a: Peer | null | undefined, b: Peer | null | undefined) {
   if (!a || !b) return false;
-  return !!a.id && !!b.id && a.id === b.id;
+  return isSameIdentity(a.node_id, a.id, b.node_id, b.id);
 }
 
 function getPeerEndpointKey(peer: Pick<Peer, "ip" | "port"> | null | undefined) {
   if (!peer?.ip || !peer.port) return "";
   return `${peer.ip}:${peer.port}`;
+}
+
+function getPeerRouteKey(peer: Pick<Peer, "id" | "ip" | "port">) {
+  return getPeerEndpointKey(peer) || peer.id;
+}
+
+function getPeerIdentityKey(peer: Pick<Peer, "id" | "node_id" | "ip" | "port">) {
+  const nodeId = peer.node_id?.trim();
+  return nodeId ? `node:${nodeId}` : `endpoint:${getPeerRouteKey(peer)}`;
+}
+
+function findPeerIdentityIndex(peers: Peer[], candidate: Peer) {
+  const candidateNode = candidate.node_id?.trim();
+  if (candidateNode) {
+    const nodeIndex = peers.findIndex((peer) => peer.node_id?.trim() === candidateNode);
+    if (nodeIndex >= 0) return nodeIndex;
+  }
+  return peers.findIndex((peer) => {
+    const peerNode = peer.node_id?.trim();
+    if (candidateNode && peerNode) return candidateNode === peerNode;
+    return getPeerRouteKey(peer) === getPeerRouteKey(candidate);
+  });
+}
+
+function findMatchingPeer(peers: Peer[], candidate: Peer) {
+  const index = findPeerIdentityIndex(peers, candidate);
+  return index >= 0 ? peers[index] : undefined;
+}
+
+function findPeerBySenderIdentity(peers: Peer[], peerId: string, senderNodeId?: string | null) {
+  const nodeId = senderNodeId?.trim();
+  if (nodeId) {
+    const byNode = peers.find((peer) => peer.node_id?.trim() === nodeId);
+    if (byNode) return byNode;
+  }
+  return peers.find((peer) => {
+    const peerNode = peer.node_id?.trim();
+    if (nodeId && peerNode) return false;
+    return peer.id === peerId || getPeerEndpointKey(peer) === peerId;
+  });
 }
 
 function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
@@ -135,7 +201,9 @@ function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
     if (
       a.id !== b.id ||
       a.sender_id !== b.sender_id ||
+      a.sender_node_id !== b.sender_node_id ||
       a.receiver_id !== b.receiver_id ||
+      a.receiver_node_id !== b.receiver_node_id ||
       a.content !== b.content ||
       a.msg_type !== b.msg_type ||
       a.file_path !== b.file_path ||
@@ -161,6 +229,7 @@ function arePeerListsEqual(left: Peer[], right: Peer[]) {
     const b = right[i];
     if (
       a.id !== b.id ||
+      a.node_id !== b.node_id ||
       a.username !== b.username ||
       a.department !== b.department ||
       a.online !== b.online ||
@@ -189,6 +258,33 @@ function areUnreadCountsEqual(left: UnreadCount[], right: UnreadCount[]) {
   return true;
 }
 
+function areStoredPeerListsEqual(left: StoredPeer[], right: StoredPeer[]) {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i++) {
+    const a = left[i];
+    const b = right[i];
+    if (
+      a.peer_id !== b.peer_id ||
+      a.node_id !== b.node_id ||
+      a.username !== b.username ||
+      a.department !== b.department ||
+      a.software_version !== b.software_version ||
+      a.mac_address !== b.mac_address ||
+      a.avatar_path !== b.avatar_path ||
+      a.avatar_hash !== b.avatar_hash ||
+      a.avatar_updated_at !== b.avatar_updated_at ||
+      a.ip !== b.ip ||
+      a.port !== b.port ||
+      a.is_online !== b.is_online ||
+      a.last_seen_at !== b.last_seen_at
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function areGroupListsEqual(left: GroupInfo[], right: GroupInfo[]) {
   if (left === right) return true;
   if (left.length !== right.length) return false;
@@ -198,10 +294,13 @@ function areGroupListsEqual(left: GroupInfo[], right: GroupInfo[]) {
     if (
       a.group_id !== b.group_id ||
       a.name !== b.name ||
+      a.creator_id !== b.creator_id ||
+      a.creator_node_id !== b.creator_node_id ||
       a.unread_count !== b.unread_count ||
       a.last_message !== b.last_message ||
       a.last_message_at !== b.last_message_at ||
-      a.last_message_sender !== b.last_message_sender
+      a.last_message_sender !== b.last_message_sender ||
+      !areStoredPeerListsEqual(a.members, b.members)
     ) {
       return false;
     }
@@ -256,6 +355,9 @@ function App() {
   const [selectedPeer, setSelectedPeer] = useState<Peer | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [conversationLoading, setConversationLoading] = useState(false);
+  const [hasOlderMessages, setHasOlderMessages] = useState(false);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const [newerGapAfterId, setNewerGapAfterId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [unreadCounts, setUnreadCounts] = useState<UnreadCount[]>([]);
 
@@ -274,6 +376,7 @@ function App() {
   const [groups, setGroups] = useState<GroupInfo[]>([]);
   const [recentRefreshKey, setRecentRefreshKey] = useState(0);
   const [themeId, setThemeId] = useState<ThemeId>(() => getInitialTheme());
+  const [nudgeInterruptEnabled, setNudgeInterruptEnabled] = useState(getInitialNudgeInterruptEnabled);
   const [historySearchRequest, setHistorySearchRequest] = useState<HistorySearchRequest | null>(null);
   const [conversationResetKey, setConversationResetKey] = useState(0);
   const [nudgeSignal, setNudgeSignal] = useState<NudgeSignal | null>(null);
@@ -445,21 +548,26 @@ function App() {
 
     const peerById = new Map(peers.map((peer) => [peer.id, peer]));
     const peerByEndpoint = new Map(peers.map((peer) => [`${peer.ip}:${peer.port}`, peer]));
+    const peerByNodeId = new Map(
+      peers
+        .map((peer) => [peer.node_id?.trim() ?? "", peer] as const)
+        .filter(([nodeId]) => nodeId !== ""),
+    );
     const contactBuckets = new Map<string, Omit<TrayUnreadItem, "last_ts">>();
 
     for (const uc of unreadCounts) {
       if (uc.count <= 0) continue;
 
-      const peer = peerById.get(uc.peer_id) ?? peerByEndpoint.get(uc.peer_id);
+      const peer = peerById.get(uc.peer_id) ?? peerByEndpoint.get(uc.peer_id) ?? peerByNodeId.get(uc.peer_id);
       const name = (peer?.username || uc.username || uc.peer_id).trim();
       const displayName = name || uc.peer_id;
-      const key = isEndpointLike(displayName)
-        ? `contact:${peer?.id ?? uc.peer_id}`
-        : `contact:name:${displayName.toLowerCase()}`;
+      const routeId = peer?.id ?? uc.peer_id;
+      const nodeId = peer?.node_id?.trim();
+      const key = nodeId ? `contact:node:${nodeId}` : `contact:endpoint:${routeId}`;
       const existing = contactBuckets.get(key);
       const next = {
         kind: "contact" as const,
-        id: peer?.id ?? uc.peer_id,
+        id: routeId,
         name: displayName,
         count: uc.count,
       };
@@ -522,15 +630,14 @@ function App() {
   }, [appInfo?.initialized, unreadCounts, groups, peers]);
 
   const mergePeers = useCallback((onlinePeers: Peer[], stored: StoredPeer[]): Peer[] => {
-    const map = new Map<string, Peer>();
-    const endpointToId = new Map<string, string>();
+    const merged: Peer[] = [];
     const now = Date.now();
     const onlineGraceMs = 12000;
 
     for (const item of stored) {
-      const graceKey = onlineGraceUntilRef.current.get(item.peer_id) ?? 0;
-      const peer: Peer = {
+      let candidate: Peer = {
         id: item.peer_id,
+        node_id: item.node_id?.trim() || undefined,
         username: item.username,
         department: item.department,
         software_version: item.software_version ?? "",
@@ -540,59 +647,123 @@ function App() {
         avatar_updated_at: item.avatar_updated_at ?? 0,
         ip: item.ip,
         port: item.port,
-        online: item.is_online || graceKey > now,
+        online: item.is_online,
         last_seen: item.last_seen_at ? new Date(item.last_seen_at).getTime() / 1000 : undefined,
       };
+      const graceKey = getPeerIdentityKey(candidate);
+      const graceUntil = Math.max(
+        onlineGraceUntilRef.current.get(graceKey) ?? 0,
+        onlineGraceUntilRef.current.get(item.peer_id) ?? 0,
+      );
       if (item.is_online) {
-        onlineGraceUntilRef.current.set(peer.id, now + onlineGraceMs);
+        onlineGraceUntilRef.current.set(graceKey, now + onlineGraceMs);
       }
-      const endpointKey = `${peer.ip}:${peer.port}`;
-      if (!endpointToId.has(endpointKey)) {
-        endpointToId.set(endpointKey, peer.id);
-        map.set(peer.id, peer);
+      candidate = { ...candidate, online: item.is_online || graceUntil > now };
+
+      const index = findPeerIdentityIndex(merged, candidate);
+      if (index < 0) {
+        merged.push(candidate);
+        continue;
       }
+
+      const existing = merged[index];
+      const preferCandidate = candidate.online !== existing.online
+        ? candidate.online
+        : (candidate.last_seen ?? 0) >= (existing.last_seen ?? 0);
+      const primary = preferCandidate ? candidate : existing;
+      const fallback = preferCandidate ? existing : candidate;
+      const newestLastSeen = Math.max(existing.last_seen ?? 0, candidate.last_seen ?? 0);
+      merged[index] = {
+        ...fallback,
+        ...primary,
+        node_id: primary.node_id?.trim() || fallback.node_id?.trim() || undefined,
+        username: primary.username || fallback.username || primary.id,
+        department: primary.department || fallback.department || "",
+        software_version: primary.software_version || fallback.software_version || "",
+        mac_address: primary.mac_address || fallback.mac_address || "",
+        avatar_path: primary.avatar_path || fallback.avatar_path || "",
+        avatar_hash: primary.avatar_hash || fallback.avatar_hash || "",
+        avatar_updated_at: primary.avatar_updated_at || fallback.avatar_updated_at || 0,
+        online: existing.online || candidate.online,
+        last_seen: newestLastSeen || undefined,
+      };
     }
 
-    for (const peer of onlinePeers) {
-      const endpointKey = `${peer.ip}:${peer.port}`;
-      const existingId = endpointToId.get(endpointKey);
-      const cachedPeer = existingId ? map.get(existingId) : map.get(peer.id);
-      // Keep the stored conversation id stable only for the same endpoint.
-      // A different IP:port is a different contact even when profile text matches.
-      const displayId = existingId ?? peer.id;
-      const nextAvatarHash = peer.avatar_hash || cachedPeer?.avatar_hash || "";
-      const nextAvatarUpdatedAt = peer.avatar_updated_at || cachedPeer?.avatar_updated_at || 0;
+    for (const discovered of onlinePeers) {
+      const discoveredNodeId = discovered.node_id?.trim() || "";
+      const discoveredRouteKey = getPeerRouteKey(discovered);
+      // A node-less discovery can enrich a route only when that route has one
+      // unambiguous known owner. With conflicting owners, keep a separate
+      // legacy entry rather than assigning its live data to an arbitrary node.
+      const routeNodeIds = new Set(
+        merged
+          .filter((peer) => getPeerRouteKey(peer) === discoveredRouteKey)
+          .map((peer) => peer.node_id?.trim() || "")
+          .filter(Boolean),
+      );
+      const ambiguousLegacyRoute = !discoveredNodeId && routeNodeIds.size > 1;
+      const fallbackNodeId = !discoveredNodeId && routeNodeIds.size === 1
+        ? routeNodeIds.values().next().value ?? ""
+        : "";
+      const identityNodeId = discoveredNodeId || fallbackNodeId;
+      const compatiblePeers = merged.filter((peer) => {
+        const peerNodeId = peer.node_id?.trim() || "";
+        if (identityNodeId && peerNodeId) return identityNodeId === peerNodeId;
+        if (ambiguousLegacyRoute && peerNodeId) return false;
+        return getPeerRouteKey(peer) === discoveredRouteKey;
+      });
+      const cachedPeer = identityNodeId
+        ? compatiblePeers.find((peer) => peer.node_id?.trim() === identityNodeId) ?? compatiblePeers[0]
+        : compatiblePeers[0];
+      const nodeId = discoveredNodeId || cachedPeer?.node_id?.trim();
+      const candidate: Peer = { ...discovered, node_id: nodeId || undefined };
+      const graceKey = getPeerIdentityKey(candidate);
+      if (discovered.online) {
+        onlineGraceUntilRef.current.set(graceKey, now + onlineGraceMs);
+      }
+      const graceUntil = Math.max(
+        onlineGraceUntilRef.current.get(graceKey) ?? 0,
+        onlineGraceUntilRef.current.get(discovered.id) ?? 0,
+      );
+      const nextAvatarHash = discovered.avatar_hash || cachedPeer?.avatar_hash || "";
+      const nextAvatarUpdatedAt = discovered.avatar_updated_at || cachedPeer?.avatar_updated_at || 0;
       const cachedAvatarPath =
         cachedPeer?.avatar_hash && cachedPeer.avatar_hash === nextAvatarHash
           ? cachedPeer.avatar_path || ""
           : "";
-      endpointToId.set(endpointKey, displayId);
-      if (peer.online) {
-        onlineGraceUntilRef.current.set(displayId, now + onlineGraceMs);
-      }
-      map.set(displayId, {
-        id: displayId,
-        username: peer.username || cachedPeer?.username || displayId,
-        department: peer.department || cachedPeer?.department || "",
-        software_version: peer.software_version || cachedPeer?.software_version || "",
-        mac_address: peer.mac_address || cachedPeer?.mac_address || "",
-        avatar_path: peer.avatar_path || cachedAvatarPath,
+      const next: Peer = {
+        ...cachedPeer,
+        ...discovered,
+        id: discovered.id,
+        node_id: nodeId || undefined,
+        username: discovered.username || cachedPeer?.username || discovered.id,
+        department: discovered.department || cachedPeer?.department || "",
+        software_version: discovered.software_version || cachedPeer?.software_version || "",
+        mac_address: discovered.mac_address || cachedPeer?.mac_address || "",
+        avatar_path: discovered.avatar_path || cachedAvatarPath,
         avatar_hash: nextAvatarHash,
         avatar_updated_at: nextAvatarUpdatedAt,
-        ip: peer.ip,
-        port: peer.port,
-        last_seen: peer.last_seen ?? cachedPeer?.last_seen,
-        online: peer.online || (onlineGraceUntilRef.current.get(displayId) ?? 0) > now,
-      });
+        ip: discovered.ip,
+        port: discovered.port,
+        last_seen: discovered.last_seen ?? cachedPeer?.last_seen,
+        online: discovered.online || graceUntil > now,
+      };
+      // Collapse every compatible alias/legacy row, not only the first match.
+      // Known peers with a different node_id are deliberately left intact.
+      for (let index = merged.length - 1; index >= 0; index--) {
+        if (compatiblePeers.includes(merged[index])) merged.splice(index, 1);
+      }
+      merged.push(next);
     }
 
-    for (const [peerId, until] of onlineGraceUntilRef.current) {
-      if (until <= now || !map.has(peerId)) {
-        onlineGraceUntilRef.current.delete(peerId);
+    const activeGraceKeys = new Set(merged.map(getPeerIdentityKey));
+    for (const [key, until] of onlineGraceUntilRef.current) {
+      if (until <= now || !activeGraceKeys.has(key)) {
+        onlineGraceUntilRef.current.delete(key);
       }
     }
 
-    return Array.from(map.values()).sort((a, b) => {
+    return merged.sort((a, b) => {
       if (a.online !== b.online) return a.online ? -1 : 1;
       return a.username.localeCompare(b.username, "zh-CN");
     });
@@ -620,11 +791,7 @@ function App() {
     }
     setSelectedPeer((current) => {
       if (!current) return current;
-      const canonicalPeer = mergedPeers.find((peer) => peer.id === current.id);
-      if (canonicalPeer) return canonicalPeer;
-      const currentEndpoint = getPeerEndpointKey(current);
-      if (!currentEndpoint) return current;
-      return mergedPeers.find((peer) => getPeerEndpointKey(peer) === currentEndpoint) ?? current;
+      return findMatchingPeer(mergedPeers, current) ?? current;
     });
     return mergedPeers;
   }, [mergePeers]);
@@ -744,6 +911,8 @@ function App() {
         const active = activeConversationRef.current;
         if (cancelled || active?.kind !== "contact" || active.id !== currentIdentity.id) return;
         setMessages(conversation);
+        setHasOlderMessages(conversation.length >= MESSAGE_FETCH_LIMIT);
+        setNewerGapAfterId(null);
       })
       .catch(console.error);
 
@@ -804,15 +973,17 @@ function App() {
     const currentActive = activeConversationRef.current;
     if (currentActive?.kind === "contact" && isSamePeerConversation(selectedPeer, peer)) {
       const shouldReloadEmptyConversation = messages.length === 0 && !conversationLoading;
+      activeConversationRef.current = { kind: "contact", id: peer.id };
       setSelectedGroupId(null);
       setSelectedPeer((current) => {
         if (!current) return peer;
         return {
           ...current,
           ...peer,
-          id: current.id,
-          ip: current.ip || peer.ip,
-          port: current.port || peer.port,
+          id: peer.id,
+          node_id: peer.node_id?.trim() || current.node_id?.trim() || undefined,
+          ip: peer.ip || current.ip,
+          port: peer.port || current.port,
         };
       });
       if (!options?.preserveHistory) {
@@ -828,6 +999,8 @@ function App() {
           ]);
           if (selectionNonceRef.current !== nonce) return;
           setMessages(conv);
+          setHasOlderMessages(conv.length >= MESSAGE_FETCH_LIMIT);
+          setNewerGapAfterId(null);
         } catch (err) {
           console.error("Failed to reload empty conversation:", err);
         } finally {
@@ -841,6 +1014,7 @@ function App() {
     const nonce = ++selectionNonceRef.current;
     activeConversationRef.current = { kind: "contact", id: peer.id };
     setConversationLoading(true);
+    setLoadingOlderMessages(false);
     setConversationResetKey((key) => key + 1);
     if (!options?.preserveHistory) {
       setHistorySearchRequest(null);
@@ -848,6 +1022,8 @@ function App() {
     setSelectedGroupId(null);
     setSelectedPeer(peer);
     setMessages([]);
+    setHasOlderMessages(false);
+    setNewerGapAfterId(null);
     try {
       const [conv] = await Promise.all([
         getConversation(peer.id, MESSAGE_FETCH_LIMIT),
@@ -855,9 +1031,10 @@ function App() {
       ]);
       if (selectionNonceRef.current !== nonce) return;
       setMessages((currentMessages) => conv.reduce(mergeMessageIntoList, currentMessages));
+      setHasOlderMessages(conv.length >= MESSAGE_FETCH_LIMIT);
       checkPeerOnline(peer.id, peer.ip, peer.port).then((online) => {
         if (!online) {
-          onlineGraceUntilRef.current.delete(peer.id);
+          onlineGraceUntilRef.current.delete(getPeerIdentityKey(peer));
         }
         setPeers((prev) =>
           prev.map((p) => (p.id === peer.id ? { ...p, online } : p))
@@ -888,6 +1065,7 @@ function App() {
     const nonce = ++selectionNonceRef.current;
     activeConversationRef.current = { kind: "group", id: groupId };
     setConversationLoading(true);
+    setLoadingOlderMessages(false);
     setConversationResetKey((key) => key + 1);
     if (!options?.preserveHistory) {
       setHistorySearchRequest(null);
@@ -895,6 +1073,8 @@ function App() {
     setSelectedPeer(null);
     setSelectedGroupId(groupId);
     setMessages([]);
+    setHasOlderMessages(false);
+    setNewerGapAfterId(null);
     try {
       const [msgs] = await Promise.all([
         getGroupMessages(groupId, MESSAGE_FETCH_LIMIT),
@@ -902,6 +1082,7 @@ function App() {
       ]);
       if (selectionNonceRef.current !== nonce) return;
       setMessages((currentMessages) => msgs.reduce(mergeMessageIntoList, currentMessages));
+      setHasOlderMessages(msgs.length >= MESSAGE_FETCH_LIMIT);
     } catch (err) {
       console.error("Failed to load group messages:", err);
     } finally {
@@ -932,8 +1113,8 @@ function App() {
     setNudgeSignal((current) => (current?.nonce === nonce ? null : current));
   }, []);
 
-  const canInterruptForIncomingNudge = useCallback((kind: ConversationKind, targetId: string, senderId: string) => {
-    const key = `${kind}:${targetId}:${senderId}`;
+  const canInterruptForIncomingNudge = useCallback((kind: ConversationKind, targetId: string, senderIdentityKey: string) => {
+    const key = `${kind}:${targetId}:${senderIdentityKey}`;
     const now = Date.now();
     const cooldownUntil = incomingNudgeCooldownRef.current.get(key) ?? 0;
     if (cooldownUntil > now) return false;
@@ -941,8 +1122,8 @@ function App() {
     return true;
   }, []);
 
-  const selectIncomingNudgePeer = useCallback(async (peerId: string) => {
-    const currentPeer = peersRef.current.find((peer) => peer.id === peerId);
+  const selectIncomingNudgePeer = useCallback(async (peerId: string, senderNodeId?: string | null) => {
+    const currentPeer = findPeerBySenderIdentity(peersRef.current, peerId, senderNodeId);
     if (currentPeer) {
       void selectPeerRef.current(currentPeer);
       return;
@@ -950,7 +1131,7 @@ function App() {
 
     try {
       const refreshedPeers = await loadPeerState();
-      const refreshedPeer = refreshedPeers.find((peer) => peer.id === peerId);
+      const refreshedPeer = findPeerBySenderIdentity(refreshedPeers, peerId, senderNodeId);
       if (refreshedPeer) {
         void selectPeerRef.current(refreshedPeer);
       }
@@ -971,15 +1152,18 @@ function App() {
       if (payload.kind === "group") {
         const groupId = payload.group_id;
         if (!groupId) return;
-        const incomingNudge = isIncomingNudge(payload.message, appInfo?.peer_id) ? payload.message : null;
+        const incomingNudge = isIncomingNudge(payload.message, appInfo?.peer_id, appInfo?.node_id) ? payload.message : null;
         const canInterrupt = incomingNudge
-          ? canInterruptForIncomingNudge("group", groupId, incomingNudge.sender_id)
+          ? canInterruptForIncomingNudge("group", groupId, incomingNudge.sender_node_id?.trim() || incomingNudge.sender_id)
           : false;
         const activeGroup = isActiveConversation("group", groupId);
         if (canInterrupt) {
-          void bringAppToFrontForNudge();
+          void requestAttentionForNudge();
           triggerNudge("group", groupId);
-          if (!activeGroup) {
+          if (nudgeInterruptEnabled) {
+            void bringAppToFrontForNudge();
+          }
+          if (nudgeInterruptEnabled && !activeGroup) {
             void selectGroupRef.current(groupId);
           }
         }
@@ -999,16 +1183,19 @@ function App() {
 
       const peerId = payload.peer_id;
       if (!peerId) return;
-      const incomingNudge = isIncomingNudge(payload.message, appInfo?.peer_id) ? payload.message : null;
+      const incomingNudge = isIncomingNudge(payload.message, appInfo?.peer_id, appInfo?.node_id) ? payload.message : null;
       const canInterrupt = incomingNudge
-        ? canInterruptForIncomingNudge("contact", peerId, incomingNudge.sender_id)
+        ? canInterruptForIncomingNudge("contact", peerId, incomingNudge.sender_node_id?.trim() || incomingNudge.sender_id)
         : false;
       const activeContact = isActiveConversation("contact", peerId);
       if (canInterrupt) {
-        void bringAppToFrontForNudge();
+        void requestAttentionForNudge();
         triggerNudge("contact", peerId);
-        if (!activeContact) {
-          void selectIncomingNudgePeer(peerId);
+        if (nudgeInterruptEnabled) {
+          void bringAppToFrontForNudge();
+        }
+        if (nudgeInterruptEnabled && !activeContact) {
+          void selectIncomingNudgePeer(peerId, incomingNudge?.sender_node_id);
         }
       }
       if (activeContact && payload.message) {
@@ -1027,7 +1214,7 @@ function App() {
     });
 
     return () => { disposed = true; unlisten?.(); };
-  }, [appInfo?.initialized, appInfo?.peer_id, canInterruptForIncomingNudge, loadPeerState, isActiveConversation, selectIncomingNudgePeer, triggerNudge]);
+  }, [appInfo?.initialized, appInfo?.node_id, appInfo?.peer_id, canInterruptForIncomingNudge, loadPeerState, isActiveConversation, nudgeInterruptEnabled, selectIncomingNudgePeer, triggerNudge]);
 
   useEffect(() => {
     let disposed = false;
@@ -1075,31 +1262,65 @@ function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     listen<PeerIdChangedEvent>("peer-id-changed", (event) => {
-      const { oldPeerId, newPeerId } = event.payload;
+      const { oldPeerId, newPeerId, nodeId } = event.payload;
       if (!oldPeerId || !newPeerId || oldPeerId === newPeerId) return;
 
+      const eventNodeId = nodeId?.trim() ?? "";
       const sep = newPeerId.lastIndexOf(":");
       const newIp = sep > 0 ? newPeerId.slice(0, sep) : "";
       const newPort = sep > 0 ? Number(newPeerId.slice(sep + 1)) : 0;
+      const activeConversation = activeConversationRef.current;
+      if (activeConversation?.kind === "contact" && activeConversation.id === oldPeerId) {
+        // Update the synchronous routing ref before React commits selectedPeer;
+        // otherwise a new-route event arriving in this gap is discarded.
+        activeConversationRef.current = { kind: "contact", id: newPeerId };
+      }
+      const matchesMovedIdentity = (peer: Peer) => {
+        const peerNodeId = peer.node_id?.trim() ?? "";
+        if (eventNodeId && peerNodeId) return eventNodeId === peerNodeId;
+        return peer.id === oldPeerId;
+      };
 
       setPeers((current) => {
-        const withoutOld = current.filter((p) => p.id !== oldPeerId);
-        // If the new id isn't in the list yet (next poll will bring it), carry
-        // the old peer's display info forward under the new id/endpoint.
-        if (!withoutOld.some((p) => p.id === newPeerId)) {
-          const old = current.find((p) => p.id === oldPeerId);
-          if (old) {
-            withoutOld.push({ ...old, id: newPeerId, ip: newIp || old.ip, port: newPort || old.port });
-          }
+        const source = (eventNodeId
+          ? current.find((peer) => peer.node_id?.trim() === eventNodeId)
+          : undefined) ?? current.find(matchesMovedIdentity);
+        if (!source) return current;
+        const migrated: Peer = {
+          ...source,
+          id: newPeerId,
+          node_id: eventNodeId || source.node_id?.trim() || undefined,
+          ip: newIp || source.ip,
+          port: newPort || source.port,
+        };
+        const next = current.filter((peer) => !matchesMovedIdentity(peer));
+        const compatibleIndex = findPeerIdentityIndex(next, migrated);
+        if (compatibleIndex >= 0) {
+          const existing = next[compatibleIndex];
+          next[compatibleIndex] = {
+            ...existing,
+            ...migrated,
+            username: migrated.username || existing.username,
+            department: migrated.department || existing.department,
+            online: migrated.online || existing.online,
+          };
+        } else {
+          next.push(migrated);
         }
-        return withoutOld;
+        return next;
       });
 
       // Repoint the active conversation so its history effect refetches the
       // migrated rows under the new id.
       setSelectedPeer((current) =>
-        current && current.id === oldPeerId
-          ? { ...current, id: newPeerId, ip: newIp || current.ip, port: newPort || current.port }
+        current && matchesMovedIdentity(current)
+          ? {
+              ...current,
+              id: newPeerId,
+              node_id: eventNodeId || current.node_id?.trim() || undefined,
+              ip: newIp || current.ip,
+              port: newPort || current.port,
+            }
           : current
       );
 
@@ -1113,42 +1334,56 @@ function App() {
 
   const handleSendMessage = useCallback(async (content: string, clientMsgId?: string) => {
     if (!selectedPeer) throw new Error("未选择联系人");
-    const sent = await sendMessage(selectedPeer.id, content, clientMsgId);
-    setMessages((prev) => mergeMessageIntoList(prev, sent));
+    const targetPeerId = selectedPeer.id;
+    const sent = await sendMessage(targetPeerId, content, clientMsgId);
+    if (isActiveConversation("contact", targetPeerId)) {
+      setMessages((prev) => mergeMessageIntoList(prev, sent));
+    }
     setRecentRefreshKey((key) => key + 1);
     return sent;
-  }, [selectedPeer]);
+  }, [isActiveConversation, selectedPeer]);
 
   const handleSendGroupMsg = useCallback(async (groupId: string, content: string, clientMsgId?: string) => {
     const msg = await sendGroupMessage(groupId, content, clientMsgId);
-    setMessages((prev) => mergeMessageIntoList(prev, msg));
+    if (isActiveConversation("group", groupId)) {
+      setMessages((prev) => mergeMessageIntoList(prev, msg));
+    }
     listGroups().then(setGroups).catch(console.error);
     return msg;
-  }, []);
+  }, [isActiveConversation]);
 
   const handleSendNudge = useCallback(async (clientMsgId?: string) => {
     if (selectedGroupId) {
-      const msg = await sendGroupMessageTyped(selectedGroupId, NUDGE_MESSAGE_CONTENT, MESSAGE_TYPE_NUDGE, clientMsgId);
-      setMessages((prev) => mergeMessageIntoList(prev, msg));
+      const targetGroupId = selectedGroupId;
+      const msg = await sendGroupMessageTyped(targetGroupId, NUDGE_MESSAGE_CONTENT, MESSAGE_TYPE_NUDGE, clientMsgId);
+      if (isActiveConversation("group", targetGroupId)) {
+        setMessages((prev) => mergeMessageIntoList(prev, msg));
+      }
       listGroups().then(setGroups).catch(console.error);
       return msg;
     }
     if (!selectedPeer) throw new Error("未选择联系人");
     if (!selectedPeer.online) throw new Error("对方离线，不能发送抖一抖");
-    const sent = await sendMessageTyped(selectedPeer.id, NUDGE_MESSAGE_CONTENT, MESSAGE_TYPE_NUDGE, clientMsgId);
-    setMessages((prev) => mergeMessageIntoList(prev, sent));
+    const targetPeerId = selectedPeer.id;
+    const sent = await sendMessageTyped(targetPeerId, NUDGE_MESSAGE_CONTENT, MESSAGE_TYPE_NUDGE, clientMsgId);
+    if (isActiveConversation("contact", targetPeerId)) {
+      setMessages((prev) => mergeMessageIntoList(prev, sent));
+    }
     setRecentRefreshKey((key) => key + 1);
     return sent;
-  }, [selectedGroupId, selectedPeer]);
+  }, [isActiveConversation, selectedGroupId, selectedPeer]);
 
   const handleSendRps = useCallback(async (move: RpsMove, clientMsgId?: string) => {
     if (selectedGroupId) throw new Error("群聊暂不支持猜拳");
     if (!selectedPeer) throw new Error("未选择联系人");
-    const sent = await sendMessageTyped(selectedPeer.id, getRpsMessageContent(move), MESSAGE_TYPE_RPS, clientMsgId);
-    setMessages((prev) => mergeMessageIntoList(prev, sent));
+    const targetPeerId = selectedPeer.id;
+    const sent = await sendMessageTyped(targetPeerId, getRpsMessageContent(move), MESSAGE_TYPE_RPS, clientMsgId);
+    if (isActiveConversation("contact", targetPeerId)) {
+      setMessages((prev) => mergeMessageIntoList(prev, sent));
+    }
     setRecentRefreshKey((key) => key + 1);
     return sent;
-  }, [selectedGroupId, selectedPeer]);
+  }, [isActiveConversation, selectedGroupId, selectedPeer]);
 
   const handleSendFile = useCallback(async (filePath: string, clientMsgId?: string, fileName?: string | null) => {
     if (selectedGroupId) {
@@ -1160,8 +1395,9 @@ function App() {
 
   const handleSendSticker = useCallback(async (filePath: string, clientMsgId?: string) => {
     if (selectedGroupId) {
-      const sent = await sendGroupSticker(selectedGroupId, filePath, clientMsgId);
-      if (sent.id > 0) {
+      const targetGroupId = selectedGroupId;
+      const sent = await sendGroupSticker(targetGroupId, filePath, clientMsgId);
+      if (sent.id > 0 && isActiveConversation("group", targetGroupId)) {
         setMessages((prev) => mergeMessageIntoList(prev, sent));
       }
       listGroups().then(setGroups).catch(console.error);
@@ -1169,7 +1405,7 @@ function App() {
     }
     if (!selectedPeer) throw new Error("未选择联系人");
     return await sendSticker(selectedPeer.id, filePath, clientMsgId);
-  }, [selectedPeer, selectedGroupId]);
+  }, [isActiveConversation, selectedPeer, selectedGroupId]);
 
   const handlePickProfileAvatar = useCallback(async () => {
     const selected = await open({
@@ -1268,6 +1504,15 @@ function App() {
     applyTheme(nextThemeId);
   }, []);
 
+  const handleNudgeInterruptChange = useCallback((enabled: boolean) => {
+    setNudgeInterruptEnabled(enabled);
+    try {
+      window.localStorage.setItem(NUDGE_INTERRUPT_STORAGE_KEY, enabled ? "true" : "false");
+    } catch {
+      // Preference persistence is optional.
+    }
+  }, []);
+
   const startHistorySearch = useCallback((kind: "contact" | "group", targetId: string, query: string, messageId?: number) => {
     const term = query.trim();
     if (!term) return;
@@ -1281,8 +1526,23 @@ function App() {
     });
   }, []);
 
-  const handleJumpToContactSearchHit = useCallback((peerId: string, query: string, messageId?: number) => {
-    const peer = peers.find((item) => item.id === peerId);
+  const handleJumpToContactSearchHit = useCallback((peerId: string, peerNodeId: string | null | undefined, query: string, messageId?: number) => {
+    const nodeId = peerNodeId?.trim() ?? "";
+    let peer: Peer | undefined;
+    if (nodeId) {
+      peer = peers.find((item) => item.node_id?.trim() === nodeId);
+    } else {
+      const candidates = peers.filter((item) => item.id === peerId || getPeerEndpointKey(item) === peerId);
+      const first = candidates[0];
+      if (first && candidates.every((item) => isSameIdentity(
+        item.node_id,
+        getPeerRouteKey(item),
+        first.node_id,
+        getPeerRouteKey(first),
+      ))) {
+        peer = first;
+      }
+    }
     if (!peer) return;
     startHistorySearch("contact", peer.id, query, messageId);
     void handleSelectPeer(peer, { preserveHistory: true });
@@ -1294,18 +1554,101 @@ function App() {
     void handleSelectGroup(groupId, { preserveHistory: true });
   }, [groups, handleSelectGroup, startHistorySearch]);
 
+  const handleLoadOlderMessages = useCallback(async (): Promise<number> => {
+    const active = activeConversationRef.current;
+    if (!active || loadingOlderMessages || !hasOlderMessages) return 0;
+    const oldestId = messages.reduce<number | null>(
+      (oldest, message) => message.id > 0 && (oldest === null || message.id < oldest) ? message.id : oldest,
+      null,
+    );
+    if (oldestId === null) {
+      setHasOlderMessages(false);
+      return 0;
+    }
+
+    const selectionNonce = selectionNonceRef.current;
+    setLoadingOlderMessages(true);
+    try {
+      const older = active.kind === "group"
+        ? await getGroupHistory(active.id, oldestId, MESSAGE_FETCH_LIMIT, "all")
+        : await getConversationHistory(active.id, oldestId, MESSAGE_FETCH_LIMIT, "all");
+      if (
+        selectionNonceRef.current !== selectionNonce
+        || !isActiveConversation(active.kind, active.id)
+      ) {
+        return 0;
+      }
+      setMessages((current) => older.reduce(mergeMessageIntoList, current));
+      setHasOlderMessages(older.length >= MESSAGE_FETCH_LIMIT);
+      return older.length;
+    } finally {
+      if (
+        selectionNonceRef.current === selectionNonce
+        && isActiveConversation(active.kind, active.id)
+      ) {
+        setLoadingOlderMessages(false);
+      }
+    }
+  }, [hasOlderMessages, isActiveConversation, loadingOlderMessages, messages]);
+
   const handleLoadHistoryContext = useCallback(async (messageId: number) => {
+    const active = activeConversationRef.current;
+    if (!active) return;
+    const selectionNonce = selectionNonceRef.current;
     const beforeId = messageId + 1;
-    if (selectedGroupId) {
-      const context = await getGroupHistory(selectedGroupId, beforeId, MESSAGE_FETCH_LIMIT, "all");
-      setMessages(context);
+    const [before, after, latest] = active.kind === "group"
+      ? await Promise.all([
+        getGroupHistory(active.id, beforeId, HISTORY_CONTEXT_LIMIT, "all"),
+        getGroupHistory(active.id, undefined, HISTORY_CONTEXT_LIMIT, "all", undefined, undefined, messageId),
+        getGroupMessages(active.id, 1),
+      ])
+      : await Promise.all([
+        getConversationHistory(active.id, beforeId, HISTORY_CONTEXT_LIMIT, "all"),
+        getConversationHistory(active.id, undefined, HISTORY_CONTEXT_LIMIT, "all", undefined, undefined, messageId),
+        getConversation(active.id, 1),
+      ]);
+    if (
+      selectionNonceRef.current !== selectionNonce
+      || !isActiveConversation(active.kind, active.id)
+    ) {
       return;
     }
-    if (selectedPeer) {
-      const context = await getConversationHistory(selectedPeer.id, beforeId, MESSAGE_FETCH_LIMIT, "all");
-      setMessages(context);
+
+    const context = [...before, ...after].reduce(mergeMessageIntoList, []);
+    const newestContextId = context.reduce((max, message) => Math.max(max, message.id), 0);
+    const latestId = latest.reduce((max, message) => Math.max(max, message.id), 0);
+    setMessages(context);
+    setHasOlderMessages(before.length >= HISTORY_CONTEXT_LIMIT);
+    setNewerGapAfterId(latestId > newestContextId ? newestContextId : null);
+  }, [isActiveConversation]);
+
+  const handleReturnToLatest = useCallback(async () => {
+    const active = activeConversationRef.current;
+    if (!active) return;
+    const selectionNonce = selectionNonceRef.current;
+    setConversationLoading(true);
+    try {
+      const latest = active.kind === "group"
+        ? await getGroupMessages(active.id, MESSAGE_FETCH_LIMIT)
+        : await getConversation(active.id, MESSAGE_FETCH_LIMIT);
+      if (
+        selectionNonceRef.current !== selectionNonce
+        || !isActiveConversation(active.kind, active.id)
+      ) {
+        return;
+      }
+      setMessages(latest);
+      setHasOlderMessages(latest.length >= MESSAGE_FETCH_LIMIT);
+      setNewerGapAfterId(null);
+    } finally {
+      if (
+        selectionNonceRef.current === selectionNonce
+        && isActiveConversation(active.kind, active.id)
+      ) {
+        setConversationLoading(false);
+      }
     }
-  }, [selectedGroupId, selectedPeer]);
+  }, [isActiveConversation]);
 
   const handleDeleteMessages = useCallback(async (messageIds: number[]) => {
     const ids = Array.from(new Set(messageIds.filter((id) => Number.isFinite(id) && id > 0)));
@@ -1466,15 +1809,23 @@ function App() {
         groups={groups}
         themeId={themeId}
         onThemeChange={handleThemeChange}
+        nudgeInterruptEnabled={nudgeInterruptEnabled}
+        onNudgeInterruptChange={handleNudgeInterruptChange}
         recentRefreshKey={recentRefreshKey}
       />
       <ChatWindow
         peer={selectedGroupId ? { id: selectedGroupId, username: groups.find(g => g.group_id === selectedGroupId)?.name || "群聊", department: "", software_version: "", mac_address: "", ip: "", port: 0, online: true } : selectedPeer}
         messages={messages}
         myId={appInfo.peer_id}
+        myNodeId={appInfo.node_id}
         myName={appInfo.username}
         conversationResetKey={conversationResetKey}
         loadingMessages={conversationLoading}
+        hasOlderMessages={hasOlderMessages}
+        loadingOlderMessages={loadingOlderMessages}
+        onLoadOlderMessages={handleLoadOlderMessages}
+        newerGapAfterId={newerGapAfterId}
+        onReturnToLatest={handleReturnToLatest}
         isGroup={!!selectedGroupId}
         groupId={selectedGroupId}
         groupInfo={selectedGroupId ? groups.find(g => g.group_id === selectedGroupId) ?? null : null}

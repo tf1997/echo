@@ -1502,11 +1502,23 @@ body {
 }
 
 .message-url {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: transparent;
   color: var(--echo-accent-muted);
+  cursor: pointer;
+  font: inherit;
   font-weight: 600;
   text-decoration: underline;
   text-decoration-thickness: 1px;
   text-underline-offset: 3px;
+}
+
+.message-url:focus-visible {
+  border-radius: 3px;
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
 }
 
 .message-bubble-own .message-url {
@@ -3357,6 +3369,10 @@ body {
     display: none !important;
   }
 
+  .group-panel-trigger {
+    display: none !important;
+  }
+
   .message-stack,
   .message-stack-long-text {
     max-width: min(78%, 30rem);
@@ -3366,8 +3382,8 @@ body {
 
 @media (max-width: 640px) {
   .app-sidebar {
-    width: 100% !important;
-    min-width: 0;
+    width: min(18rem, 42vw) !important;
+    min-width: 15rem;
   }
 
   .message-stack,

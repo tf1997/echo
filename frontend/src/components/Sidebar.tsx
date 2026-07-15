@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import type { ChatMessage, Peer, UnreadCount, StoredPeer } from "../types";
+import { isSameIdentity } from "../types";
 import { searchMessages, searchGroupChatMessages, discoverByIp, listRecentContacts, removeRecentContact, createGroup, refreshPeerProfile } from "../api";
 import { THEMES } from "../theme";
 import type { ThemeId } from "../theme";
@@ -13,7 +14,7 @@ interface SidebarProps {
   selectedPeerId: string | null;
   selectedPeer: Peer | null;
   onSelectPeer: (peer: Peer) => void;
-  onJumpToSearchHit: (peerId: string, query: string, messageId?: number) => void;
+  onJumpToSearchHit: (peerId: string, peerNodeId: string | null | undefined, query: string, messageId?: number) => void;
   onJumpToGroupSearchHit: (groupId: string, query: string, messageId?: number) => void;
   myId: string;
   myName: string;
@@ -32,6 +33,8 @@ interface SidebarProps {
   groups: GroupInfo[];
   themeId: ThemeId;
   onThemeChange: (themeId: ThemeId) => void;
+  nudgeInterruptEnabled: boolean;
+  onNudgeInterruptChange: (enabled: boolean) => void;
   recentRefreshKey: number;
 }
 
@@ -51,7 +54,7 @@ function storedPeerEndpointKey(peer: Pick<StoredPeer, "ip" | "port">) {
   return peer.ip && peer.port ? `${peer.ip}:${peer.port}` : "";
 }
 
-export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myId, myName, myDepartment, mySoftwareVersion, myMacAddress, myAvatarPath, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit, onJumpToGroupSearchHit, selectedGroupId, onSelectGroup, groups, themeId, onThemeChange, recentRefreshKey }: SidebarProps) {
+export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myId, myName, myDepartment, mySoftwareVersion, myMacAddress, myAvatarPath, myIp, myPort, onEditProfile, unreadCounts, scanSubnets, onSaveScanSubnets, onJumpToSearchHit, onJumpToGroupSearchHit, selectedGroupId, onSelectGroup, groups, themeId, onThemeChange, nudgeInterruptEnabled, onNudgeInterruptChange, recentRefreshKey }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [groupSearchResults, setGroupSearchResults] = useState<{ group: GroupInfo; messages: ChatMessage[] }[]>([]);
@@ -111,10 +114,11 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
       .then((stored) => {
         if (cancelled || !stored) return;
         setProfilePeer((current) => {
-          if (!current || current.id !== peer.id) return current;
+          if (!current || !isSameIdentity(current.node_id, current.id, peer.node_id, peer.id)) return current;
           return {
             ...current,
             id: stored.peer_id,
+            node_id: stored.node_id?.trim() || undefined,
             username: stored.username,
             department: stored.department,
             software_version: stored.software_version ?? "",
@@ -262,6 +266,14 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
     [unreadCounts],
   );
   const peerById = useMemo(() => new Map(peers.map((peer) => [peer.id, peer])), [peers]);
+  const peerByNodeId = useMemo(
+    () => new Map(
+      peers
+        .map((peer) => [peer.node_id?.trim() ?? "", peer] as const)
+        .filter(([nodeId]) => nodeId !== ""),
+    ),
+    [peers],
+  );
   const peerByEndpoint = useMemo(
     () => new Map(
       peers
@@ -273,11 +285,18 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
   const selectedPeerEndpoint = selectedPeer ? peerEndpointKey(selectedPeer) : "";
   const isPeerSelected = useCallback((peer: Peer, recentPeerId?: string) => {
     if (!selectedPeerId) return false;
+    if (selectedPeer) {
+      return isSameIdentity(
+        peer.node_id,
+        peerEndpointKey(peer) || peer.id,
+        selectedPeer.node_id,
+        selectedPeerEndpoint || selectedPeer.id,
+      );
+    }
     if (selectedPeerId === peer.id) return true;
     if (recentPeerId && selectedPeerId === recentPeerId) return true;
-    const endpoint = peerEndpointKey(peer);
-    return !!endpoint && !!selectedPeerEndpoint && endpoint === selectedPeerEndpoint;
-  }, [selectedPeerEndpoint, selectedPeerId]);
+    return false;
+  }, [selectedPeer, selectedPeerEndpoint, selectedPeerId]);
   const recentGroups = groups
     .filter((group) => !!group.last_message_at || (group.unread_count || 0) > 0)
     .sort((a, b) => {
@@ -357,10 +376,10 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
     }
   }, []);
 
-  const handleJumpToHit = useCallback((peerId: string, messageId?: number) => {
+  const handleJumpToHit = useCallback((peerId: string, peerNodeId?: string | null, messageId?: number) => {
     const term = searchQuery.trim();
     clearGlobalSearch();
-    onJumpToSearchHit(peerId, term, messageId);
+    onJumpToSearchHit(peerId, peerNodeId, term, messageId);
   }, [clearGlobalSearch, onJumpToSearchHit, searchQuery]);
 
   const handleJumpToGroupHit = useCallback((groupId: string, messageId?: number) => {
@@ -525,7 +544,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                 {savingSubnets ? "保存中..." : "保存网段"}
               </button>
               <p className="text-[10px] text-gray-500 mt-1">
-                留空则不扫描 · 5 分钟间隔 · IP 随机
+                留空则不扫描 · 25–45 分钟间隔 · 每轮最多 96 个随机 IP
               </p>
             </div>
             <div className="border-t border-gray-700 my-3 pt-3">
@@ -546,6 +565,23 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                     <span style={{ background: theme.preview[2] }} />
                   </button>
                 ))}
+              </div>
+            </div>
+            <div className="border-t border-gray-700 my-3 pt-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-xs text-gray-300">抖一抖勿扰</p>
+                  <p className="mt-0.5 text-[10px] text-gray-500">开启后仅闪烁任务栏，不抢焦点或切换会话</p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={!nudgeInterruptEnabled}
+                  onClick={() => onNudgeInterruptChange(!nudgeInterruptEnabled)}
+                  className={`relative h-6 w-11 flex-shrink-0 rounded-full transition-colors ${!nudgeInterruptEnabled ? "bg-indigo-500" : "bg-gray-600"}`}
+                >
+                  <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${!nudgeInterruptEnabled ? "translate-x-5" : "translate-x-0.5"}`} />
+                </button>
               </div>
             </div>
             <button
@@ -638,9 +674,9 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
           ) : (
             <>
               {searchResults.map((result) => (
-                <div key={result.peer_id} className="mb-1">
+                <div key={result.peer_node_id?.trim() ? `node:${result.peer_node_id.trim()}` : `endpoint:${result.peer_id}`} className="mb-1">
                   <button
-                    onClick={() => handleJumpToHit(result.peer_id)}
+                    onClick={() => handleJumpToHit(result.peer_id, result.peer_node_id)}
                     className="sidebar-search-result w-full text-left px-4 py-2 hover:bg-gray-800"
                   >
                     <p className="text-xs font-medium text-indigo-400 truncate">{result.peer_name}</p>
@@ -648,7 +684,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                   {result.messages.slice(0, 5).map((hit) => (
                     <button
                       key={hit.id}
-                      onClick={() => handleJumpToHit(result.peer_id, hit.id)}
+                      onClick={() => handleJumpToHit(result.peer_id, result.peer_node_id, hit.id)}
                       className="sidebar-search-result w-full text-left px-4 py-1.5 pl-6 hover:bg-gray-800"
                     >
                       <p className="text-xs text-gray-300 truncate">
@@ -736,20 +772,17 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                     <div className="sidebar-recent-list pb-1">
                       <p className="sidebar-section-label px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-500">最近联系人</p>
                       {recentContacts.map(r => {
-                        const livePeer = peerById.get(r.peer_id);
-                        const endpointPeer = peerByEndpoint.get(storedPeerEndpointKey(r));
-                        const peer: Peer = livePeer ?? (endpointPeer ? {
-                          ...endpointPeer,
+                        const nodePeer = r.node_id?.trim() ? peerByNodeId.get(r.node_id.trim()) : undefined;
+                        const routePeer = peerById.get(r.peer_id) ?? peerByEndpoint.get(storedPeerEndpointKey(r));
+                        const compatibleRoutePeer = routePeer && isSameIdentity(
+                          r.node_id,
+                          storedPeerEndpointKey(r) || r.peer_id,
+                          routePeer.node_id,
+                          peerEndpointKey(routePeer) || routePeer.id,
+                        ) ? routePeer : undefined;
+                        const peer: Peer = nodePeer ?? compatibleRoutePeer ?? {
                           id: r.peer_id,
-                          username: endpointPeer.username || r.username,
-                          department: endpointPeer.department || r.department,
-                          software_version: endpointPeer.software_version || r.software_version || "",
-                          mac_address: endpointPeer.mac_address || r.mac_address || "",
-                          avatar_path: (endpointPeer.avatar_hash || "") === (r.avatar_hash || "") ? (endpointPeer.avatar_path || r.avatar_path || "") : (r.avatar_path || ""),
-                          avatar_hash: endpointPeer.avatar_hash || r.avatar_hash || "",
-                          avatar_updated_at: endpointPeer.avatar_updated_at || r.avatar_updated_at || 0,
-                        } : {
-                          id: r.peer_id,
+                          node_id: r.node_id?.trim() || undefined,
                           username: r.username,
                           department: r.department,
                           software_version: r.software_version ?? "",
@@ -761,9 +794,9 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                           port: r.port,
                           online: r.is_online,
                           last_seen: r.last_seen_at ? new Date(r.last_seen_at).getTime() / 1000 : undefined,
-                        });
+                        };
                         return (
-                          <div key={r.peer_id} className="group relative">
+                          <div key={r.node_id || r.peer_id} className="group relative">
                             <PeerItem peer={peer} isSelected={isPeerSelected(peer, r.peer_id)} unread={unreadMap.get(r.peer_id) ?? unreadMap.get(peer.id) ?? 0} onClick={() => onSelectPeer(peer)} onAvatarClick={() => setProfilePeer(peer)} />
                             <button onClick={(e) => { e.stopPropagation(); handleRemoveRecent(r.peer_id); }} className="sidebar-remove-action absolute right-2 top-3 hidden group-hover:flex w-5 h-5 rounded-full bg-gray-600 hover:bg-red-600 items-center justify-center text-[10px]" title="移除">×</button>
                           </div>
@@ -845,7 +878,7 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
                         </span>
                       </button>
                       {expanded && deptPeers.map(peer => (
-                        <PeerItem key={peer.id} peer={peer} isSelected={isPeerSelected(peer)} unread={unreadMap.get(peer.id) ?? 0} onClick={() => onSelectPeer(peer)} onAvatarClick={() => setProfilePeer(peer)} />
+                        <PeerItem key={peer.node_id || peer.id} peer={peer} isSelected={isPeerSelected(peer)} unread={unreadMap.get(peer.id) ?? 0} onClick={() => onSelectPeer(peer)} onAvatarClick={() => setProfilePeer(peer)} />
                       ))}
                     </div>
                   );

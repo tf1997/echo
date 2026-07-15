@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { ChatMessage, Peer } from "../types";
+import { isSameIdentity } from "../types";
 import {
   getConversationHistory,
   getGroupHistory,
@@ -25,6 +26,7 @@ const FILTERS: { id: HistoryFilter; label: string }[] = [
 interface HistorySearchViewProps {
   peer: Peer;
   myId: string;
+  myNodeId: string;
   isGroup: boolean;
   groupId?: string | null;
   initialSearchRequest?: {
@@ -162,7 +164,7 @@ function getCalendarCells(month: Date): (Date | null)[] {
   return cells;
 }
 
-export function HistorySearchView({ peer, myId, isGroup, groupId, initialSearchRequest = null, onJumpToMessage, onClose }: HistorySearchViewProps) {
+export function HistorySearchView({ peer, myId, myNodeId, isGroup, groupId, initialSearchRequest = null, onJumpToMessage, onClose }: HistorySearchViewProps) {
   const [filter, setFilter] = useState<HistoryFilter>("all");
   const [selectedDay, setSelectedDay] = useState("");
   const [datePickerOpen, setDatePickerOpen] = useState(false);
@@ -601,7 +603,9 @@ export function HistorySearchView({ peer, myId, isGroup, groupId, initialSearchR
             const showDivider = label && label !== lastDateLabel;
             if (showDivider) lastDateLabel = label;
             const text = getResultText(message);
-            const sender = message.sender_id === myId ? "我" : message.sender_name;
+            const sender = isSameIdentity(message.sender_node_id, message.sender_id, myNodeId, myId)
+              ? "我"
+              : message.sender_name;
             const typeLabel = getTypeLabel(message);
             const focused = focusedMessageId === message.id;
             return (

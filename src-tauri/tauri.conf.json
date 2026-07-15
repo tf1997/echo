@@ -41,6 +41,8 @@
         "title": "Echo - P2P Chat",
         "width": 1000,
         "height": 700,
+        "minWidth": 760,
+        "minHeight": 560,
         "resizable": true,
         "fullscreen": false
       }

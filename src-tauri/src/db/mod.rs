@@ -32,7 +32,11 @@ pub struct PendingGroupMsg {
     pub id: i64,
     pub group_id: String,
     pub peer_id: String,
+    #[serde(default)]
+    pub target_node_id: String,
     pub sender_id: String,
+    #[serde(default)]
+    pub sender_node_id: String,
     pub sender_name: String,
     pub content: String,
     pub msg_type: String,
@@ -44,7 +48,11 @@ pub struct PendingFileTransfer {
     pub id: i64,
     pub group_id: String,
     pub peer_id: String,
+    #[serde(default)]
+    pub target_node_id: String,
     pub sender_id: String,
+    #[serde(default)]
+    pub sender_node_id: String,
     pub sender_name: String,
     pub sender_department: String,
     pub sender_port: u16,
@@ -61,6 +69,8 @@ pub struct GroupInfo {
     pub group_id: String,
     pub name: String,
     pub creator_id: String,
+    #[serde(default)]
+    pub creator_node_id: String,
     pub created_at: String,
     pub members: Vec<StoredPeer>,
     #[serde(default)]
@@ -112,8 +122,12 @@ pub struct UnreadCount {
 pub struct ChatMessage {
     pub id: i64,
     pub sender_id: String,
+    #[serde(default)]
+    pub sender_node_id: String,
     pub sender_name: String,
     pub receiver_id: String,
+    #[serde(default)]
+    pub receiver_node_id: String,
     pub content: String,
     pub msg_type: String, // "text", "file", "image"
     pub file_path: Option<String>,
@@ -257,8 +271,10 @@ fn chat_message_from_row(row: &SqliteRow) -> ChatMessage {
     ChatMessage {
         id: row.get("id"),
         sender_id: row.get("sender_id"),
+        sender_node_id: row.try_get("sender_node_id").unwrap_or_default(),
         sender_name: row.get("sender_name"),
         receiver_id: row.get("receiver_id"),
+        receiver_node_id: row.try_get("receiver_node_id").unwrap_or_default(),
         content: row.get("content"),
         msg_type: row.get("msg_type"),
         file_path: row.get("file_path"),
@@ -658,31 +674,55 @@ impl Database {
         .await
         .context("Failed to create client_msg_id index")?;
 
-        // Deduplicate existing rows before adding the UNIQUE constraint, otherwise
-        // CREATE UNIQUE INDEX fails on databases upgraded from versions that allowed
-        // duplicate (sender_id, group_id, client_msg_id) rows. Keep the earliest row
-        // (MIN(id)) per dedup key. NULL/empty client_msg_id rows are left untouched.
+        // The legacy client-id constraint is rebuilt below on every upgrade. Ensure
+        // the message node columns exist before deciding whether a row belongs to
+        // the stable-node or endpoint-only compatibility key.
+        for definition in ["sender_node_id TEXT", "receiver_node_id TEXT"] {
+            let statement = format!("ALTER TABLE messages ADD COLUMN {definition}");
+            if let Err(error) = sqlx::query(&statement).execute(&self.pool).await {
+                if !error.to_string().contains("duplicate column name") {
+                    return Err(error).with_context(|| {
+                        format!("Failed to add message node identity column {definition}")
+                    });
+                }
+            }
+        }
+
+        // Deduplicate existing rows before adding the UNIQUE constraints. A known
+        // node keeps one row across all of its historical endpoints; only node-less
+        // legacy rows use sender_id as the compatibility key. This also makes the
+        // cleanup safe to rerun after two different nodes reuse the same endpoint.
         sqlx::query(
             "DELETE FROM messages
              WHERE client_msg_id IS NOT NULL AND TRIM(client_msg_id) <> ''
                AND id NOT IN (
                  SELECT MIN(id) FROM messages
                  WHERE client_msg_id IS NOT NULL AND TRIM(client_msg_id) <> ''
-                 GROUP BY sender_id, COALESCE(group_id, ''), client_msg_id
+                 GROUP BY CASE
+                            WHEN COALESCE(TRIM(sender_node_id), '') <> ''
+                              THEN 'node:' || TRIM(sender_node_id)
+                            ELSE 'endpoint:' || sender_id
+                          END,
+                          COALESCE(group_id, ''), client_msg_id
                )",
         )
         .execute(&self.pool)
         .await
         .context("Failed to dedup messages before unique index")?;
 
-        // Enforce dedup at the storage layer. Partial index skips legacy rows with
-        // no client_msg_id (multiple NULLs would otherwise be treated as distinct,
-        // and NULL group_id is normalized to '' so private-message keys collide
-        // correctly). This is the race backstop behind the SELECT-first dedup path.
+        // Older builds created this index for every row, which could falsely merge
+        // two known nodes that happened to reuse the same endpoint. Keep endpoint
+        // uniqueness only for node-less legacy rows; create_node_identity_indexes
+        // adds the complementary stable-node constraint after backfill.
+        sqlx::query("DROP INDEX IF EXISTS idx_messages_client_dedup")
+            .execute(&self.pool)
+            .await
+            .context("Failed to drop legacy client_msg_id dedup index")?;
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_dedup
              ON messages(sender_id, COALESCE(group_id, ''), client_msg_id)
-             WHERE client_msg_id IS NOT NULL AND TRIM(client_msg_id) <> ''",
+             WHERE COALESCE(TRIM(sender_node_id), '') = ''
+               AND client_msg_id IS NOT NULL AND TRIM(client_msg_id) <> ''",
         )
         .execute(&self.pool)
         .await
@@ -780,10 +820,240 @@ impl Database {
         .await
         .ok();
 
+        // TASK-27 keeps endpoint columns as compatibility keys while adding
+        // trusted node keys for rolling upgrades.
+        self.add_node_identity_columns().await?;
+
         self.normalize_legacy_endpoint_peer_ids().await?;
         self.clean_duplicate_peer_endpoints().await?;
+        self.backfill_node_identity_columns().await?;
+        self.converge_node_identity_duplicates().await?;
+        self.create_node_identity_indexes().await?;
 
         info!("Database initialized successfully.");
+        Ok(())
+    }
+
+    async fn add_node_identity_columns(&self) -> Result<()> {
+        for (table, definition) in [
+            ("messages", "sender_node_id TEXT"),
+            ("messages", "receiver_node_id TEXT"),
+            ("group_members", "node_id TEXT"),
+            ("recent_contacts", "node_id TEXT"),
+            ("groups", "creator_node_id TEXT"),
+            ("pending_group_messages", "target_node_id TEXT"),
+            ("pending_group_messages", "sender_node_id TEXT"),
+            ("pending_notifications", "target_node_id TEXT"),
+            ("pending_file_transfers", "target_node_id TEXT"),
+            ("pending_file_transfers", "sender_node_id TEXT"),
+        ] {
+            let statement = format!("ALTER TABLE {table} ADD COLUMN {definition}");
+            if let Err(error) = sqlx::query(&statement).execute(&self.pool).await {
+                if !error.to_string().contains("duplicate column name") {
+                    return Err(error).with_context(|| {
+                        format!("Failed to add node identity column {definition} to {table}")
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn backfill_node_identity_columns(&self) -> Result<()> {
+        for (table, endpoint_column, node_column) in [
+            ("messages", "sender_id", "sender_node_id"),
+            ("messages", "receiver_id", "receiver_node_id"),
+            ("group_members", "peer_id", "node_id"),
+            ("recent_contacts", "peer_id", "node_id"),
+            ("groups", "creator_id", "creator_node_id"),
+            ("pending_group_messages", "peer_id", "target_node_id"),
+            ("pending_group_messages", "sender_id", "sender_node_id"),
+            ("pending_notifications", "peer_id", "target_node_id"),
+            ("pending_file_transfers", "peer_id", "target_node_id"),
+            ("pending_file_transfers", "sender_id", "sender_node_id"),
+        ] {
+            self.backfill_node_identity_column(table, endpoint_column, node_column)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn backfill_node_identity_column(
+        &self,
+        table: &str,
+        endpoint_column: &str,
+        node_column: &str,
+    ) -> Result<()> {
+        // UNION removes duplicate confirmations. Endpoints claimed by more than
+        // one persisted node are deliberately left blank.
+        let statement = format!(
+            "WITH endpoint_nodes(endpoint, node_id) AS (
+                SELECT peer_id, node_id FROM peers WHERE TRIM(node_id) <> ''
+                UNION
+                SELECT alias_peer_id, node_id FROM peer_aliases WHERE TRIM(node_id) <> ''
+                UNION
+                SELECT peer_id, node_id FROM user_profile
+                WHERE TRIM(COALESCE(peer_id, '')) <> '' AND TRIM(node_id) <> ''
+             ),
+             unique_endpoint_nodes(endpoint, node_id) AS (
+                SELECT endpoint, MIN(node_id)
+                FROM endpoint_nodes
+                GROUP BY endpoint
+                HAVING COUNT(*) = 1
+             )
+             UPDATE {table}
+             SET {node_column} = (
+                SELECT node_id FROM unique_endpoint_nodes
+                WHERE endpoint = {table}.{endpoint_column}
+             )
+             WHERE COALESCE(TRIM({node_column}), '') = ''
+               AND EXISTS (
+                SELECT 1 FROM unique_endpoint_nodes
+                WHERE endpoint = {table}.{endpoint_column}
+             )"
+        );
+        sqlx::query(&statement)
+            .execute(&self.pool)
+            .await
+            .with_context(|| {
+                format!("Failed to backfill {table}.{node_column} from trusted mappings")
+            })?;
+        Ok(())
+    }
+
+    async fn converge_node_identity_duplicates(&self) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM messages
+             WHERE COALESCE(TRIM(sender_node_id), '') <> ''
+               AND client_msg_id IS NOT NULL AND TRIM(client_msg_id) <> ''
+               AND id NOT IN (
+                    SELECT MIN(id) FROM messages
+                    WHERE COALESCE(TRIM(sender_node_id), '') <> ''
+                      AND client_msg_id IS NOT NULL AND TRIM(client_msg_id) <> ''
+                    GROUP BY sender_node_id, COALESCE(group_id, ''), client_msg_id
+               )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to converge node-keyed message duplicates")?;
+
+        sqlx::query(
+            "UPDATE group_members
+             SET joined_at = (
+                SELECT MIN(other.joined_at)
+                FROM group_members other
+                WHERE other.group_id = group_members.group_id
+                  AND other.node_id = group_members.node_id
+             )
+             WHERE COALESCE(TRIM(node_id), '') <> ''
+               AND rowid = (
+                    SELECT MIN(other.rowid)
+                    FROM group_members other
+                    WHERE other.group_id = group_members.group_id
+                      AND other.node_id = group_members.node_id
+               )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to preserve node-keyed group join time")?;
+        sqlx::query(
+            "DELETE FROM group_members
+             WHERE COALESCE(TRIM(node_id), '') <> ''
+               AND rowid NOT IN (
+                    SELECT MIN(rowid) FROM group_members
+                    WHERE COALESCE(TRIM(node_id), '') <> ''
+                    GROUP BY group_id, node_id
+               )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to converge node-keyed group member duplicates")?;
+
+        sqlx::query(
+            "DELETE FROM recent_contacts
+             WHERE COALESCE(TRIM(node_id), '') <> ''
+               AND EXISTS (
+                    SELECT 1 FROM recent_contacts newer
+                    WHERE newer.node_id = recent_contacts.node_id
+                      AND (newer.added_at > recent_contacts.added_at
+                           OR (newer.added_at = recent_contacts.added_at
+                               AND newer.peer_id < recent_contacts.peer_id))
+               )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to converge node-keyed recent contact duplicates")?;
+        Ok(())
+    }
+
+    async fn create_node_identity_indexes(&self) -> Result<()> {
+        for (statement, label) in [
+            (
+                "CREATE INDEX IF NOT EXISTS idx_messages_node_conversation_recent
+                 ON messages(sender_node_id, receiver_node_id, id DESC)",
+                "message node conversation",
+            ),
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_node_client_dedup
+                 ON messages(sender_node_id, COALESCE(group_id, ''), client_msg_id)
+                 WHERE COALESCE(TRIM(sender_node_id), '') <> ''
+                   AND client_msg_id IS NOT NULL AND TRIM(client_msg_id) <> ''",
+                "message node dedup",
+            ),
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_group_members_group_node
+                 ON group_members(group_id, node_id)
+                 WHERE COALESCE(TRIM(node_id), '') <> ''",
+                "group member node",
+            ),
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_recent_contacts_node
+                 ON recent_contacts(node_id)
+                 WHERE COALESCE(TRIM(node_id), '') <> ''",
+                "recent contact node",
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS idx_groups_creator_node ON groups(creator_node_id)",
+                "group creator node",
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS idx_pending_group_target_node
+                 ON pending_group_messages(target_node_id, id)",
+                "pending group target node",
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS idx_pending_group_sender_node
+                 ON pending_group_messages(sender_node_id)",
+                "pending group sender node",
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS idx_pending_notification_target_node
+                 ON pending_notifications(target_node_id, id)",
+                "pending notification target node",
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS idx_pending_file_target_node
+                 ON pending_file_transfers(target_node_id, id)",
+                "pending file target node",
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS idx_pending_file_sender_node
+                 ON pending_file_transfers(sender_node_id)",
+                "pending file sender node",
+            ),
+        ] {
+            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
+                // Never brick an unusual legacy database on an optional unique
+                // index; deterministic convergence will be retried next startup.
+                if statement.contains("CREATE UNIQUE INDEX")
+                    && error.to_string().contains("UNIQUE constraint failed")
+                {
+                    log::warn!("Skipped {label} index on conflicting legacy data: {error}");
+                    continue;
+                }
+                return Err(error).with_context(|| format!("Failed to create {label} index"));
+            }
+        }
         Ok(())
     }
 
@@ -806,8 +1076,17 @@ impl Database {
 
             let new_peer_id = canonicalize_endpoint_peer_id(&old_peer_id, &ip, port);
             if old_peer_id != new_peer_id {
-                self.migrate_legacy_endpoint_peer(&old_peer_id, &new_peer_id)
-                    .await?;
+                if let Err(error) = self
+                    .migrate_legacy_endpoint_peer(&old_peer_id, &new_peer_id)
+                    .await
+                {
+                    log::warn!(
+                        "Keeping non-canonical peer {} because migration to {} is unsafe: {}",
+                        old_peer_id,
+                        new_peer_id,
+                        error
+                    );
+                }
             }
         }
 
@@ -833,22 +1112,31 @@ impl Database {
         .await
         .context("Failed to load duplicate peer endpoints")?;
 
+        let mut migrated_old_peer_ids = Vec::new();
         for row in rows {
             let old_peer_id: String = row.get("old_peer_id");
             let new_peer_id: String = row.get("new_peer_id");
-            self.migrate_peer_references(&old_peer_id, &new_peer_id)
-                .await?;
+            match self
+                .migrate_peer_references(&old_peer_id, &new_peer_id)
+                .await
+            {
+                Ok(()) => migrated_old_peer_ids.push(old_peer_id),
+                Err(error) => log::warn!(
+                    "Keeping duplicate endpoint peer {} because identity migration to {} is unsafe: {}",
+                    old_peer_id,
+                    new_peer_id,
+                    error
+                ),
+            }
         }
 
-        sqlx::query(
-            "DELETE FROM peers
-             WHERE rowid NOT IN (
-                SELECT MAX(rowid) FROM peers GROUP BY ip, port
-             )",
-        )
-        .execute(&self.pool)
-        .await
-        .context("Failed to clean duplicate peer endpoints")?;
+        for old_peer_id in migrated_old_peer_ids {
+            sqlx::query("DELETE FROM peers WHERE peer_id = ?")
+                .bind(old_peer_id)
+                .execute(&self.pool)
+                .await
+                .context("Failed to remove safely merged duplicate peer endpoint")?;
+        }
 
         Ok(())
     }
@@ -856,16 +1144,45 @@ impl Database {
     pub async fn add_recent_contact(&self, peer_id: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         log::info!("add_recent_contact: {}", peer_id);
-        sqlx::query("INSERT INTO recent_contacts (peer_id, added_at) VALUES (?, ?) ON CONFLICT(peer_id) DO UPDATE SET added_at = excluded.added_at")
-            .bind(peer_id).bind(&now)
-            .execute(&self.pool).await
-            .context("Failed to add recent contact")?;
+        let node_id = self.trusted_node_id_for_endpoint(peer_id).await?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to begin recent contact update")?;
+        if let Some(node_id) = node_id.as_deref() {
+            sqlx::query(
+                "DELETE FROM recent_contacts
+                 WHERE node_id = ? AND peer_id <> ?",
+            )
+            .bind(node_id)
+            .bind(peer_id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to converge recent contact endpoint")?;
+        }
+        sqlx::query(
+            "INSERT INTO recent_contacts (peer_id, node_id, added_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(peer_id) DO UPDATE SET
+                node_id = excluded.node_id,
+                added_at = excluded.added_at",
+        )
+        .bind(peer_id)
+        .bind(node_id.as_deref())
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to add recent contact")?;
+        tx.commit()
+            .await
+            .context("Failed to commit recent contact update")?;
         Ok(())
     }
 
     pub async fn list_recent_contacts(&self) -> Result<Vec<StoredPeer>> {
         let rows = sqlx::query(
-            "SELECT r.peer_id, p.node_id as node_id, p.username as username,
+            "SELECT p.peer_id AS peer_id, p.node_id as node_id, p.username as username,
                     p.department as department,
                     p.software_version as software_version,
                     p.mac_address as mac_address,
@@ -880,11 +1197,28 @@ impl Database {
                         SELECT MAX(m.id)
                         FROM messages m
                         WHERE m.group_id IS NULL
-                          AND (m.sender_id = r.peer_id OR m.receiver_id = r.peer_id)
+                          AND (
+                            (COALESCE(TRIM(r.node_id), '') <> ''
+                             AND (m.sender_node_id = r.node_id OR m.receiver_node_id = r.node_id))
+                            OR
+                            (COALESCE(TRIM(r.node_id), '') = ''
+                             AND ((COALESCE(TRIM(m.sender_node_id), '') = ''
+                                   AND m.sender_id = r.peer_id)
+                                  OR (COALESCE(TRIM(m.receiver_node_id), '') = ''
+                                      AND m.receiver_id = r.peer_id)))
+                          )
                           AND m.msg_type NOT IN ('file_chunk', 'file_end')
                     ) as last_message_id
              FROM recent_contacts r
-             JOIN peers p ON r.peer_id = p.peer_id
+             JOIN peers p ON p.peer_id = CASE
+                WHEN COALESCE(TRIM(r.node_id), '') <> '' THEN (
+                    SELECT p2.peer_id FROM peers p2
+                    WHERE p2.node_id = r.node_id
+                    ORDER BY p2.is_online DESC, p2.last_seen_at DESC, p2.peer_id ASC
+                    LIMIT 1
+                )
+                ELSE r.peer_id
+             END
              WHERE TRIM(p.username) <> '' OR TRIM(p.department) <> ''
              ORDER BY
                 CASE WHEN last_message_id IS NULL THEN 1 ELSE 0 END,
@@ -917,8 +1251,15 @@ impl Database {
     }
 
     pub async fn remove_recent_contact(&self, peer_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM recent_contacts WHERE peer_id = ?")
-            .bind(peer_id)
+        let (node_id, endpoint_keys) = self.node_first_identity_keys(peer_id).await?;
+        let predicate =
+            Self::node_first_identity_predicate("node_id", "peer_id", endpoint_keys.len());
+        let statement = format!("DELETE FROM recent_contacts WHERE {predicate}");
+        let mut query = sqlx::query(&statement).bind(&node_id).bind(&node_id);
+        for key in &endpoint_keys {
+            query = query.bind(key);
+        }
+        query
             .execute(&self.pool)
             .await
             .context("Failed to remove recent contact")?;
@@ -1134,23 +1475,41 @@ impl Database {
         timestamp: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query("INSERT INTO pending_group_messages (group_id, peer_id, sender_id, sender_name, content, msg_type, original_timestamp, created_at) VALUES (?,?,?,?,?,?,?,?)")
-            .bind(group_id).bind(peer_id).bind(sender_id).bind(sender_name)
+        let target_node_id = self.trusted_node_id_for_endpoint(peer_id).await?;
+        let sender_node_id = self.trusted_node_id_for_endpoint(sender_id).await?;
+        sqlx::query("INSERT INTO pending_group_messages (group_id, peer_id, target_node_id, sender_id, sender_node_id, sender_name, content, msg_type, original_timestamp, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
+            .bind(group_id).bind(peer_id).bind(target_node_id.as_deref())
+            .bind(sender_id).bind(sender_node_id.as_deref()).bind(sender_name)
             .bind(content).bind(msg_type).bind(timestamp).bind(&now)
             .execute(&self.pool).await.context("Failed to store pending group msg")?;
         Ok(())
     }
 
     pub async fn get_pending_for_peer(&self, peer_id: &str) -> Result<Vec<PendingGroupMsg>> {
-        let rows = sqlx::query("SELECT id, group_id, peer_id, sender_id, sender_name, content, msg_type, original_timestamp FROM pending_group_messages WHERE peer_id = ? ORDER BY id ASC")
-            .bind(peer_id).fetch_all(&self.pool).await.context("Failed to get pending msgs")?;
+        let (node_id, endpoint_keys) = self.node_first_identity_keys(peer_id).await?;
+        let predicate =
+            Self::node_first_identity_predicate("target_node_id", "peer_id", endpoint_keys.len());
+        let statement = format!(
+            "SELECT id, group_id, peer_id, target_node_id, sender_id, sender_node_id, sender_name, content, msg_type, original_timestamp
+             FROM pending_group_messages WHERE {predicate} ORDER BY id ASC"
+        );
+        let mut query = sqlx::query(&statement).bind(&node_id).bind(&node_id);
+        for key in &endpoint_keys {
+            query = query.bind(key);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to get pending msgs")?;
         Ok(rows
             .iter()
             .map(|r| PendingGroupMsg {
                 id: r.get("id"),
                 group_id: r.get("group_id"),
                 peer_id: r.get("peer_id"),
+                target_node_id: r.try_get("target_node_id").unwrap_or_default(),
                 sender_id: r.get("sender_id"),
+                sender_node_id: r.try_get("sender_node_id").unwrap_or_default(),
                 sender_name: r.get("sender_name"),
                 content: r.get("content"),
                 msg_type: r.get("msg_type"),
@@ -1184,18 +1543,30 @@ impl Database {
         payload: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        let (target_node_id, endpoint_keys) = self.node_first_identity_keys(peer_id).await?;
         // Dedupe profile_updated — only one queued copy per peer makes sense.
         if kind == "profile_updated" {
-            sqlx::query(
-                "DELETE FROM pending_notifications WHERE peer_id = ? AND kind = 'profile_updated'",
-            )
-            .bind(peer_id)
-            .execute(&self.pool)
-            .await
-            .ok();
+            let predicate = Self::node_first_identity_predicate(
+                "target_node_id",
+                "peer_id",
+                endpoint_keys.len(),
+            );
+            let statement = format!(
+                "DELETE FROM pending_notifications
+                 WHERE {predicate} AND kind = 'profile_updated'"
+            );
+            let mut delete = sqlx::query(&statement)
+                .bind(&target_node_id)
+                .bind(&target_node_id);
+            for key in &endpoint_keys {
+                delete = delete.bind(key);
+            }
+            delete.execute(&self.pool).await.ok();
         }
-        sqlx::query("INSERT INTO pending_notifications (peer_id, kind, payload, created_at) VALUES (?, ?, ?, ?)")
-            .bind(peer_id).bind(kind).bind(payload).bind(&now)
+        sqlx::query("INSERT INTO pending_notifications (peer_id, target_node_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(peer_id)
+            .bind(if target_node_id.is_empty() { None } else { Some(target_node_id.as_str()) })
+            .bind(kind).bind(payload).bind(&now)
             .execute(&self.pool).await.context("Failed to queue pending notification")?;
         Ok(())
     }
@@ -1204,13 +1575,21 @@ impl Database {
         &self,
         peer_id: &str,
     ) -> Result<Vec<(i64, String, String)>> {
-        let rows = sqlx::query(
-            "SELECT id, kind, payload FROM pending_notifications WHERE peer_id = ? ORDER BY id ASC",
-        )
-        .bind(peer_id)
-        .fetch_all(&self.pool)
-        .await
-        .context("Failed to load pending notifications")?;
+        let (node_id, endpoint_keys) = self.node_first_identity_keys(peer_id).await?;
+        let predicate =
+            Self::node_first_identity_predicate("target_node_id", "peer_id", endpoint_keys.len());
+        let statement = format!(
+            "SELECT id, kind, payload FROM pending_notifications
+             WHERE {predicate} ORDER BY id ASC"
+        );
+        let mut query = sqlx::query(&statement).bind(&node_id).bind(&node_id);
+        for key in &endpoint_keys {
+            query = query.bind(key);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to load pending notifications")?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -1240,7 +1619,9 @@ impl Database {
         &self,
         group_id: &str,
         peer_id: &str,
+        target_node_id: Option<&str>,
         sender_id: &str,
+        sender_node_id: Option<&str>,
         sender_name: &str,
         sender_department: &str,
         sender_port: u16,
@@ -1251,14 +1632,30 @@ impl Database {
         client_msg_id: Option<&str>,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        let target_node_id = match target_node_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(node_id) => Some(node_id.to_string()),
+            None => self.trusted_node_id_for_endpoint(peer_id).await?,
+        };
+        let sender_node_id = match sender_node_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(node_id) => Some(node_id.to_string()),
+            None => self.trusted_node_id_for_endpoint(sender_id).await?,
+        };
         sqlx::query(
             "INSERT INTO pending_file_transfers
-             (group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, file_kind, client_msg_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (group_id, peer_id, target_node_id, sender_id, sender_node_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, file_kind, client_msg_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(group_id)
         .bind(peer_id)
+        .bind(target_node_id.as_deref())
         .bind(sender_id)
+        .bind(sender_node_id.as_deref())
         .bind(sender_name)
         .bind(sender_department)
         .bind(sender_port as i64)
@@ -1277,12 +1674,21 @@ impl Database {
         &self,
         peer_id: &str,
     ) -> Result<Vec<PendingFileTransfer>> {
-        let rows = sqlx::query(
-            "SELECT id, group_id, peer_id, sender_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, file_kind, client_msg_id
-             FROM pending_file_transfers WHERE peer_id = ? ORDER BY id ASC",
-        )
-        .bind(peer_id).fetch_all(&self.pool).await
-        .context("Failed to load pending file transfers")?;
+        let (node_id, endpoint_keys) = self.node_first_identity_keys(peer_id).await?;
+        let predicate =
+            Self::node_first_identity_predicate("target_node_id", "peer_id", endpoint_keys.len());
+        let statement = format!(
+            "SELECT id, group_id, peer_id, target_node_id, sender_id, sender_node_id, sender_name, sender_department, sender_port, file_path, file_name, file_size, file_kind, client_msg_id
+             FROM pending_file_transfers WHERE {predicate} ORDER BY id ASC"
+        );
+        let mut query = sqlx::query(&statement).bind(&node_id).bind(&node_id);
+        for key in &endpoint_keys {
+            query = query.bind(key);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to load pending file transfers")?;
 
         Ok(rows
             .iter()
@@ -1290,7 +1696,9 @@ impl Database {
                 id: r.get("id"),
                 group_id: r.get("group_id"),
                 peer_id: r.get("peer_id"),
+                target_node_id: r.try_get("target_node_id").unwrap_or_default(),
                 sender_id: r.get("sender_id"),
+                sender_node_id: r.try_get("sender_node_id").unwrap_or_default(),
                 sender_name: r.get("sender_name"),
                 sender_department: r.get("sender_department"),
                 sender_port: r.get::<i64, _>("sender_port") as u16,
@@ -1312,6 +1720,81 @@ impl Database {
         Ok(())
     }
 
+    pub async fn delete_cancelled_group_file_transfers(
+        &self,
+        group_id: &str,
+        sender_id: &str,
+        sender_node_id: Option<&str>,
+        client_msg_id: &str,
+    ) -> Result<Vec<String>> {
+        let client_msg_id = client_msg_id.trim();
+        if client_msg_id.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (resolved_sender_node_id, sender_endpoint_keys) =
+            self.node_first_identity_keys(sender_id).await?;
+        let sender_node_id = sender_node_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or(resolved_sender_node_id);
+        let sender_predicate = Self::node_first_identity_predicate(
+            "sender_node_id",
+            "sender_id",
+            sender_endpoint_keys.len(),
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to start cancelled group file cleanup")?;
+
+        let select_statement = format!(
+            "SELECT DISTINCT file_path
+             FROM pending_file_transfers
+             WHERE group_id = ? AND client_msg_id = ? AND {sender_predicate}"
+        );
+        let mut select = sqlx::query(&select_statement)
+            .bind(group_id)
+            .bind(client_msg_id)
+            .bind(&sender_node_id)
+            .bind(&sender_node_id);
+        for key in &sender_endpoint_keys {
+            select = select.bind(key);
+        }
+        let rows = select
+            .fetch_all(&mut *tx)
+            .await
+            .context("Failed to load cancelled group file cache paths")?;
+        let file_paths = rows
+            .iter()
+            .map(|row| row.get::<String, _>("file_path"))
+            .collect::<Vec<_>>();
+
+        let delete_statement = format!(
+            "DELETE FROM pending_file_transfers
+             WHERE group_id = ? AND client_msg_id = ? AND {sender_predicate}"
+        );
+        let mut delete = sqlx::query(&delete_statement)
+            .bind(group_id)
+            .bind(client_msg_id)
+            .bind(&sender_node_id)
+            .bind(&sender_node_id);
+        for key in &sender_endpoint_keys {
+            delete = delete.bind(key);
+        }
+        delete
+            .execute(&mut *tx)
+            .await
+            .context("Failed to delete cancelled group file transfers")?;
+        tx.commit()
+            .await
+            .context("Failed to commit cancelled group file cleanup")?;
+
+        Ok(file_paths)
+    }
+
     pub async fn count_pending_file_transfers_by_path(&self, file_path: &str) -> Result<i64> {
         let row =
             sqlx::query("SELECT COUNT(*) AS count FROM pending_file_transfers WHERE file_path = ?")
@@ -1330,22 +1813,40 @@ impl Database {
         member_ids: &[String],
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query("INSERT OR IGNORE INTO groups (group_id, name, creator_id, created_at) VALUES (?, ?, ?, ?)")
-            .bind(group_id).bind(name).bind(creator_id).bind(&now)
+        let creator_node_id = self.trusted_node_id_for_endpoint(creator_id).await?;
+        sqlx::query("INSERT OR IGNORE INTO groups (group_id, name, creator_id, creator_node_id, created_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(group_id).bind(name).bind(creator_id).bind(creator_node_id.as_deref()).bind(&now)
             .execute(&self.pool).await.context("Failed to create group")?;
         self.add_group_members(group_id, member_ids).await?;
         Ok(())
     }
 
     pub async fn list_groups(&self, my_id: &str) -> Result<Vec<GroupInfo>> {
-        let rows = sqlx::query(
-            "SELECT g.group_id, g.name, g.creator_id, g.created_at FROM groups g
-             INNER JOIN group_members gm ON g.group_id = gm.group_id WHERE gm.peer_id = ?",
-        )
-        .bind(my_id)
-        .fetch_all(&self.pool)
-        .await
-        .context("Failed to list groups")?;
+        let (my_node_id, my_endpoint_keys) = self.node_first_identity_keys(my_id).await?;
+        let membership =
+            Self::node_first_identity_predicate("gm.node_id", "gm.peer_id", my_endpoint_keys.len());
+        let statement = format!(
+            "SELECT g.group_id, g.name, g.creator_id, g.creator_node_id, g.created_at FROM groups g
+             INNER JOIN group_members gm ON g.group_id = gm.group_id
+             WHERE {membership}"
+        );
+        let mut query = sqlx::query(&statement).bind(&my_node_id).bind(&my_node_id);
+        for key in &my_endpoint_keys {
+            query = query.bind(key);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to list groups")?;
+        let self_sender = Self::node_first_identity_predicate(
+            "sender_node_id",
+            "sender_id",
+            my_endpoint_keys.len(),
+        );
+        let unread_statement = format!(
+            "SELECT COUNT(*) FROM messages
+             WHERE group_id = ? AND NOT {self_sender} AND is_read = 0"
+        );
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let group_id: String = r.get("group_id");
@@ -1379,14 +1880,20 @@ impl Database {
                 (None, None, None)
             };
             // Unread count: messages in group from someone other than me
-            let unread: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM messages WHERE group_id = ? AND sender_id <> ? AND is_read = 0"
-            ).bind(&group_id).bind(my_id).fetch_one(&self.pool).await.unwrap_or(0);
+            let mut unread_query = sqlx::query_scalar(&unread_statement)
+                .bind(&group_id)
+                .bind(&my_node_id)
+                .bind(&my_node_id);
+            for key in &my_endpoint_keys {
+                unread_query = unread_query.bind(key);
+            }
+            let unread: i64 = unread_query.fetch_one(&self.pool).await.unwrap_or(0);
 
             out.push(GroupInfo {
                 group_id,
                 name: r.get("name"),
                 creator_id: r.get("creator_id"),
+                creator_node_id: r.try_get("creator_node_id").unwrap_or_default(),
                 created_at: r.get("created_at"),
                 members: Vec::new(),
                 last_message,
@@ -1413,8 +1920,20 @@ impl Database {
         // Always return gm.peer_id (never NULL) so callers don't see phantom rows.
         // For "myself" we have no row in `peers` — fall back to `user_profile`.
         let rows = sqlx::query(
-            "SELECT gm.peer_id AS peer_id,
-                    COALESCE(NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') AS node_id,
+            "SELECT CASE
+                        WHEN COALESCE(TRIM(gm.node_id), '') <> '' THEN COALESCE(
+                            (SELECT up2.peer_id FROM user_profile up2
+                             WHERE up2.id = 1 AND up2.node_id = gm.node_id
+                               AND TRIM(COALESCE(up2.peer_id, '')) <> ''),
+                            (SELECT p2.peer_id FROM peers p2
+                             WHERE p2.node_id = gm.node_id
+                             ORDER BY p2.is_online DESC, p2.last_seen_at DESC, p2.peer_id ASC
+                             LIMIT 1),
+                            gm.peer_id
+                        )
+                        ELSE gm.peer_id
+                    END AS peer_id,
+                    COALESCE(NULLIF(gm.node_id, ''), NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') AS node_id,
                     COALESCE(NULLIF(p.username, ''), up.username, '') AS username,
                     COALESCE(NULLIF(p.department, ''), up.department, '') AS department,
                     COALESCE(NULLIF(p.software_version, ''), up.software_version, '') AS software_version,
@@ -1429,9 +1948,21 @@ impl Database {
                     COALESCE(p.last_seen_at, '') AS last_seen_at,
                     CASE WHEN up.peer_id IS NOT NULL THEN 1 ELSE 0 END AS is_self
              FROM group_members gm
-             LEFT JOIN peers p ON gm.peer_id = p.peer_id
-             LEFT JOIN peer_aliases pa ON gm.peer_id = pa.alias_peer_id
-             LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = gm.peer_id
+             LEFT JOIN peers p ON p.peer_id = CASE
+                WHEN COALESCE(TRIM(gm.node_id), '') <> '' THEN (
+                    SELECT p2.peer_id FROM peers p2
+                    WHERE p2.node_id = gm.node_id
+                    ORDER BY p2.is_online DESC, p2.last_seen_at DESC, p2.peer_id ASC
+                    LIMIT 1
+                )
+                ELSE gm.peer_id
+             END
+             LEFT JOIN peer_aliases pa
+                ON COALESCE(TRIM(gm.node_id), '') = '' AND gm.peer_id = pa.alias_peer_id
+             LEFT JOIN user_profile up ON up.id = 1 AND (
+                (COALESCE(TRIM(gm.node_id), '') <> '' AND up.node_id = gm.node_id)
+                OR (COALESCE(TRIM(gm.node_id), '') = '' AND up.peer_id = gm.peer_id)
+             )
              WHERE gm.group_id = ?"
         ).bind(group_id).fetch_all(&self.pool).await.context("Failed to get group members")?;
         let mut members: Vec<StoredPeer> = rows
@@ -1530,7 +2061,7 @@ impl Database {
         Ok(())
     }
 
-    async fn current_peer_id_for_node(&self, node_id: &str) -> Result<Option<String>> {
+    pub(crate) async fn current_peer_id_for_node(&self, node_id: &str) -> Result<Option<String>> {
         if node_id.trim().is_empty() {
             return Ok(None);
         }
@@ -1575,8 +2106,8 @@ impl Database {
         if node_id.is_empty() {
             let now = Utc::now().to_rfc3339();
             sqlx::query(
-                "INSERT OR IGNORE INTO group_members (group_id, peer_id, joined_at)
-                 VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO group_members (group_id, peer_id, node_id, joined_at)
+                 VALUES (?, ?, NULL, ?)",
             )
             .bind(group_id)
             .bind(peer_id)
@@ -1627,19 +2158,50 @@ impl Database {
              LEFT JOIN peer_aliases pa ON pa.alias_peer_id = gm.peer_id
              LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = gm.peer_id
              WHERE gm.group_id = ?
-               AND COALESCE(NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') = ?",
+               AND (
+                    gm.node_id = ?
+                    OR (COALESCE(TRIM(gm.node_id), '') = ''
+                        AND COALESCE(NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') = ?)
+               )",
         )
         .bind(group_id)
+        .bind(node_id)
         .bind(node_id)
         .fetch_one(&mut *tx)
         .await
         .context("Failed to load group identity join time")?;
         let joined_at = existing_joined_at.unwrap_or_else(|| Utc::now().to_rfc3339());
 
+        // Delete the old endpoint row before inserting the new endpoint. The
+        // partial UNIQUE(group_id,node_id) index makes this ordering mandatory.
         sqlx::query(
-            "INSERT INTO group_members (group_id, peer_id, joined_at)
-             VALUES (?, ?, ?)
+            "DELETE FROM group_members
+             WHERE group_id = ? AND (
+                node_id = ?
+                OR (COALESCE(TRIM(node_id), '') = '' AND peer_id IN (
+                    SELECT gm.peer_id
+                    FROM group_members gm
+                    LEFT JOIN peers p ON p.peer_id = gm.peer_id
+                    LEFT JOIN peer_aliases pa ON pa.alias_peer_id = gm.peer_id
+                    LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = gm.peer_id
+                    WHERE gm.group_id = ?
+                      AND COALESCE(NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') = ?
+                ))
+             )",
+        )
+        .bind(group_id)
+        .bind(node_id)
+        .bind(group_id)
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to remove previous group identity endpoint")?;
+
+        sqlx::query(
+            "INSERT INTO group_members (group_id, peer_id, node_id, joined_at)
+             VALUES (?, ?, ?, ?)
              ON CONFLICT(group_id, peer_id) DO UPDATE SET
+                node_id = excluded.node_id,
                 joined_at = CASE
                     WHEN excluded.joined_at < group_members.joined_at THEN excluded.joined_at
                     ELSE group_members.joined_at
@@ -1647,6 +2209,7 @@ impl Database {
         )
         .bind(group_id)
         .bind(peer_id)
+        .bind(node_id)
         .bind(&joined_at)
         .execute(&mut *tx)
         .await
@@ -1661,7 +2224,7 @@ impl Database {
                 LEFT JOIN peer_aliases pa ON pa.alias_peer_id = gm.peer_id
                 LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = gm.peer_id
                 WHERE gm.group_id = ?
-                  AND COALESCE(NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') = ?
+                  AND COALESCE(NULLIF(gm.node_id, ''), NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') = ?
              )",
         )
         .bind(group_id)
@@ -1729,7 +2292,7 @@ impl Database {
                     LEFT JOIN peer_aliases pa ON pa.alias_peer_id = gm.peer_id
                     LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = gm.peer_id
                     WHERE gm.group_id = ?
-                      AND COALESCE(NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') = ?
+                      AND COALESCE(NULLIF(gm.node_id, ''), NULLIF(p.node_id, ''), NULLIF(up.node_id, ''), NULLIF(pa.node_id, ''), '') = ?
                 )
              )",
         )
@@ -1770,34 +2333,39 @@ impl Database {
             return Ok(None);
         };
 
-        let row = if let Some(group_id) = group_id {
-            sqlx::query(
-                "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
-                 FROM messages
-                 WHERE sender_id = ? AND group_id = ? AND client_msg_id = ?
-                 ORDER BY id ASC
-                 LIMIT 1",
-            )
-            .bind(sender_id)
-            .bind(group_id)
-            .bind(client_msg_id)
-            .fetch_optional(&self.pool)
-            .await
-            .context("Failed to find group message by client_msg_id")?
+        let (sender_node_id, sender_endpoint_keys) =
+            self.node_first_identity_keys(sender_id).await?;
+        let sender_predicate = Self::node_first_identity_predicate(
+            "sender_node_id",
+            "sender_id",
+            sender_endpoint_keys.len(),
+        );
+        let group_predicate = if group_id.is_some() {
+            "group_id = ?"
         } else {
-            sqlx::query(
-                "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
-                 FROM messages
-                 WHERE sender_id = ? AND (group_id IS NULL OR group_id = '') AND client_msg_id = ?
-                 ORDER BY id ASC
-                 LIMIT 1",
-            )
-            .bind(sender_id)
+            "(group_id IS NULL OR group_id = '')"
+        };
+        let statement = format!(
+            "SELECT id, sender_id, sender_node_id, sender_name, receiver_id, receiver_node_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
+             FROM messages
+             WHERE {sender_predicate} AND {group_predicate} AND client_msg_id = ?
+             ORDER BY id ASC
+             LIMIT 1"
+        );
+        let mut query = sqlx::query(&statement)
+            .bind(&sender_node_id)
+            .bind(&sender_node_id);
+        for key in &sender_endpoint_keys {
+            query = query.bind(key);
+        }
+        if let Some(group_id) = group_id {
+            query = query.bind(group_id);
+        }
+        let row = query
             .bind(client_msg_id)
             .fetch_optional(&self.pool)
             .await
-            .context("Failed to find message by client_msg_id")?
-        };
+            .context("Failed to find message by client_msg_id")?;
 
         Ok(row.as_ref().map(chat_message_from_row))
     }
@@ -1851,11 +2419,12 @@ impl Database {
         client_msg_id: Option<&str>,
     ) -> Result<ChatMessage> {
         let timestamp = Utc::now().to_rfc3339();
+        let sender_node_id = self.trusted_node_id_for_endpoint(sender_id).await?;
         let result = sqlx::query(
-            "INSERT INTO messages (sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, group_id, client_msg_id)
-             VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO messages (sender_id, sender_node_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, group_id, client_msg_id)
+             VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT DO NOTHING"
-        ).bind(sender_id).bind(sender_name).bind(content).bind(msg_type)
+        ).bind(sender_id).bind(sender_node_id.as_deref()).bind(sender_name).bind(content).bind(msg_type)
          .bind(file_path).bind(file_name).bind(file_size).bind(&timestamp)
          .bind(if is_read { 1 } else { 0 }).bind(group_id).bind(client_msg_id)
          .execute(&self.pool).await.context("Failed to save group message")?;
@@ -1872,8 +2441,10 @@ impl Database {
         Ok(ChatMessage {
             id,
             sender_id: sender_id.to_string(),
+            sender_node_id: sender_node_id.unwrap_or_default(),
             sender_name: sender_name.to_string(),
             receiver_id: String::new(),
+            receiver_node_id: String::new(),
             content: content.to_string(),
             msg_type: msg_type.to_string(),
             file_path: file_path.map(|s| s.to_string()),
@@ -1887,15 +2458,25 @@ impl Database {
     }
 
     pub async fn get_group_unread_counts(&self, my_id: &str) -> Result<Vec<GroupUnread>> {
-        let rows = sqlx::query(
+        let (my_node_id, my_endpoint_keys) = self.node_first_identity_keys(my_id).await?;
+        let self_sender = Self::node_first_identity_predicate(
+            "sender_node_id",
+            "sender_id",
+            my_endpoint_keys.len(),
+        );
+        let statement = format!(
             "SELECT group_id, COUNT(*) as cnt FROM messages
-             WHERE group_id IS NOT NULL AND group_id <> '' AND sender_id <> ? AND is_read = 0
-             GROUP BY group_id",
-        )
-        .bind(my_id)
-        .fetch_all(&self.pool)
-        .await
-        .context("Failed to get group unread counts")?;
+             WHERE group_id IS NOT NULL AND group_id <> '' AND NOT {self_sender} AND is_read = 0
+             GROUP BY group_id"
+        );
+        let mut query = sqlx::query(&statement).bind(&my_node_id).bind(&my_node_id);
+        for key in &my_endpoint_keys {
+            query = query.bind(key);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to get group unread counts")?;
         Ok(rows
             .iter()
             .map(|r| GroupUnread {
@@ -1906,9 +2487,22 @@ impl Database {
     }
 
     pub async fn mark_group_read(&self, group_id: &str, my_id: &str) -> Result<()> {
-        sqlx::query("UPDATE messages SET is_read = 1 WHERE group_id = ? AND sender_id <> ?")
+        let (my_node_id, my_endpoint_keys) = self.node_first_identity_keys(my_id).await?;
+        let self_sender = Self::node_first_identity_predicate(
+            "sender_node_id",
+            "sender_id",
+            my_endpoint_keys.len(),
+        );
+        let statement =
+            format!("UPDATE messages SET is_read = 1 WHERE group_id = ? AND NOT {self_sender}");
+        let mut query = sqlx::query(&statement)
             .bind(group_id)
-            .bind(my_id)
+            .bind(&my_node_id)
+            .bind(&my_node_id);
+        for key in &my_endpoint_keys {
+            query = query.bind(key);
+        }
+        query
             .execute(&self.pool)
             .await
             .context("Failed to mark group read")?;
@@ -1922,9 +2516,9 @@ impl Database {
     ) -> Result<Vec<ChatMessage>> {
         let limit = normalize_message_limit(limit);
         let rows = sqlx::query(
-            "SELECT id, sender_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
+            "SELECT id, sender_id, sender_node_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM (
-                 SELECT id, sender_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
+                 SELECT id, sender_id, sender_node_id, sender_name, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
                  FROM messages WHERE group_id = ? ORDER BY id DESC LIMIT ?
              ) AS recent_messages
              ORDER BY id ASC"
@@ -1934,8 +2528,10 @@ impl Database {
             .map(|r| ChatMessage {
                 id: r.get("id"),
                 sender_id: r.get("sender_id"),
+                sender_node_id: r.try_get("sender_node_id").unwrap_or_default(),
                 sender_name: r.get("sender_name"),
                 receiver_id: String::new(),
+                receiver_node_id: String::new(),
                 content: r.get("content"),
                 msg_type: r.get("msg_type"),
                 file_path: r.get("file_path"),
@@ -2152,6 +2748,8 @@ impl Database {
                 )
                 .await?
             {
+                self.bind_verified_migration_aliases(incoming_peer_id, peer_id, node_id)
+                    .await?;
                 self.migrate_legacy_endpoint_peer(incoming_peer_id, peer_id)
                     .await?;
             } else {
@@ -2213,6 +2811,8 @@ impl Database {
                     )
                     .await?
                 {
+                    self.bind_verified_migration_aliases(&old_peer_id, peer_id, node_id)
+                        .await?;
                     log::info!(
                         "Same identity ({} {}) moved from {} to {} at {}:{} - migrating references",
                         username,
@@ -2252,6 +2852,8 @@ impl Database {
                 )
                 .await?
             {
+                self.bind_verified_migration_aliases(&old_peer_id, peer_id, node_id)
+                    .await?;
                 self.migrate_peer_references(&old_peer_id, peer_id).await?;
                 sqlx::query("DELETE FROM peers WHERE peer_id = ?")
                     .bind(&old_peer_id)
@@ -2356,6 +2958,27 @@ impl Database {
             .into_iter()
             .map(|row| row.get::<String, _>("node_id"))
             .collect())
+    }
+
+    async fn bind_verified_migration_aliases(
+        &self,
+        old_peer_id: &str,
+        new_peer_id: &str,
+        node_id: &str,
+    ) -> Result<()> {
+        let node_id = node_id.trim();
+        if node_id.is_empty() {
+            return Ok(());
+        }
+        for alias_peer_id in [old_peer_id, new_peer_id] {
+            match self.bind_peer_alias_checked(node_id, alias_peer_id).await? {
+                AliasBindOutcome::Bound => {}
+                AliasBindOutcome::Conflict { owner_node_id } => anyhow::bail!(
+                    "Peer alias {alias_peer_id} belongs to node {owner_node_id}, not {node_id}"
+                ),
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn resolve_peer_node_id(&self, identity: &str) -> Result<Option<String>> {
@@ -2643,8 +3266,17 @@ impl Database {
             }
         }
 
-        self.migrate_peer_references_in_connection(&mut tx, old_peer_id, new_peer_id)
-            .await?;
+        // A confirmed node migration only changes routing and aliases. Historical
+        // endpoint columns are immutable once a node key is available; node-first
+        // reads bridge the old and new endpoints without an O(history) rewrite.
+        // Pure legacy migrations still require the full endpoint rewrite.
+        if sender_node_id.trim().is_empty() {
+            self.migrate_peer_references_in_connection(&mut tx, old_peer_id, new_peer_id)
+                .await?;
+        } else {
+            self.migrate_peer_routes_in_connection(&mut tx, old_peer_id, new_peer_id)
+                .await?;
+        }
         sqlx::query("DELETE FROM peers WHERE peer_id = ?")
             .bind(old_peer_id)
             .execute(&mut *tx)
@@ -2724,6 +3356,39 @@ impl Database {
             && (stored_mac.trim().is_empty()
                 || mac_address.trim().is_empty()
                 || stored_mac.trim().eq_ignore_ascii_case(mac_address.trim())))
+    }
+
+    async fn legacy_peer_profiles_match(
+        &self,
+        left_peer_id: &str,
+        right_peer_id: &str,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "SELECT username, department, mac_address
+             FROM peers WHERE peer_id IN (?, ?)",
+        )
+        .bind(left_peer_id)
+        .bind(right_peer_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to compare legacy peer profiles")?;
+        if rows.len() != 2 {
+            return Ok(false);
+        }
+        let profile = |row: &SqliteRow| {
+            (
+                row.try_get::<String, _>("username").unwrap_or_default(),
+                row.try_get::<String, _>("department").unwrap_or_default(),
+                row.try_get::<String, _>("mac_address").unwrap_or_default(),
+            )
+        };
+        let left = profile(&rows[0]);
+        let right = profile(&rows[1]);
+        Ok(contact_filter::has_contact_identity(&left.0, &left.1)
+            && contact_filter::has_contact_identity(&right.0, &right.1)
+            && left.0.trim() == right.0.trim()
+            && left.1.trim() == right.1.trim()
+            && left.2.trim().eq_ignore_ascii_case(right.2.trim()))
     }
 
     #[allow(dead_code)]
@@ -2810,6 +3475,43 @@ impl Database {
         Ok(keys)
     }
 
+    async fn trusted_node_id_for_endpoint(&self, endpoint: &str) -> Result<Option<String>> {
+        let owners = self.identity_node_owners(endpoint).await?;
+        match owners.as_slice() {
+            [] => Ok(None),
+            [owner] => Ok(Some(owner.clone())),
+            _ => {
+                log::warn!(
+                    "Leaving node key empty for conflicting endpoint identity {}",
+                    endpoint
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn node_first_identity_keys(&self, identity: &str) -> Result<(String, Vec<String>)> {
+        let node_id = self
+            .trusted_node_id_for_endpoint(identity)
+            .await?
+            .unwrap_or_default();
+        let keys = self.identity_keys_for(identity).await?;
+        Ok((node_id, keys))
+    }
+
+    fn node_first_identity_predicate(
+        node_column: &str,
+        endpoint_column: &str,
+        endpoint_key_count: usize,
+    ) -> String {
+        let placeholders = Self::placeholders(endpoint_key_count);
+        format!(
+            "((? <> '' AND COALESCE(TRIM({node_column}), '') = ?)
+               OR (COALESCE(TRIM({node_column}), '') = ''
+                   AND {endpoint_column} IN ({placeholders})))"
+        )
+    }
+
     fn placeholders(count: usize) -> String {
         std::iter::repeat("?")
             .take(count.max(1))
@@ -2826,16 +3528,116 @@ impl Database {
             return Ok(());
         }
 
+        let old_owners = self.identity_node_owners(old_peer_id).await?;
+        let new_owners = self.identity_node_owners(new_peer_id).await?;
+        let route_node_id = match (old_owners.as_slice(), new_owners.as_slice()) {
+            ([old_node], [new_node]) if old_node == new_node => Some(old_node.clone()),
+            ([], []) => {
+                let old_exists: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM peers WHERE peer_id = ?)")
+                        .bind(old_peer_id)
+                        .fetch_one(&self.pool)
+                        .await
+                        .context("Failed to check legacy migration source")?;
+                let new_exists: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM peers WHERE peer_id = ?)")
+                        .bind(new_peer_id)
+                        .fetch_one(&self.pool)
+                        .await
+                        .context("Failed to check legacy migration target")?;
+                if old_exists
+                    && new_exists
+                    && !self
+                        .legacy_peer_profiles_match(old_peer_id, new_peer_id)
+                        .await?
+                {
+                    anyhow::bail!(
+                        "Refusing legacy peer migration with mismatched profiles {} -> {}",
+                        old_peer_id,
+                        new_peer_id
+                    );
+                }
+                None
+            }
+            _ => anyhow::bail!(
+                "Refusing unsafe peer reference migration {} -> {}",
+                old_peer_id,
+                new_peer_id
+            ),
+        };
+
         let mut tx = self
             .pool
             .begin()
             .await
             .context("Failed to begin peer reference migration")?;
-        self.migrate_peer_references_in_connection(&mut tx, old_peer_id, new_peer_id)
-            .await?;
+        if let Some(node_id) = route_node_id {
+            for alias_peer_id in [old_peer_id, new_peer_id] {
+                match Self::bind_peer_alias_in_connection(&mut tx, &node_id, alias_peer_id).await? {
+                    AliasBindOutcome::Bound => {}
+                    AliasBindOutcome::Conflict { owner_node_id } => anyhow::bail!(
+                        "Peer alias {alias_peer_id} belongs to node {owner_node_id}, not {node_id}"
+                    ),
+                }
+            }
+            self.migrate_peer_routes_in_connection(&mut tx, old_peer_id, new_peer_id)
+                .await?;
+        } else {
+            self.migrate_peer_references_in_connection(&mut tx, old_peer_id, new_peer_id)
+                .await?;
+        }
         tx.commit()
             .await
             .context("Failed to commit peer reference migration")?;
+        Ok(())
+    }
+
+    async fn migrate_peer_routes_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        old_peer_id: &str,
+        new_peer_id: &str,
+    ) -> Result<()> {
+        if old_peer_id == new_peer_id {
+            return Ok(());
+        }
+
+        sqlx::query("UPDATE pending_group_messages SET peer_id = ? WHERE peer_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&mut *connection)
+            .await
+            .context("Failed to migrate pending group routes")?;
+        sqlx::query("UPDATE pending_group_messages SET sender_id = ? WHERE sender_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&mut *connection)
+            .await
+            .context("Failed to migrate pending group sender routes")?;
+        sqlx::query("UPDATE pending_notifications SET peer_id = ? WHERE peer_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&mut *connection)
+            .await
+            .context("Failed to migrate pending notification routes")?;
+        Self::migrate_pending_notification_payloads_in_connection(
+            connection,
+            old_peer_id,
+            new_peer_id,
+        )
+        .await?;
+        sqlx::query("UPDATE pending_file_transfers SET peer_id = ? WHERE peer_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&mut *connection)
+            .await
+            .context("Failed to migrate pending file routes")?;
+        sqlx::query("UPDATE pending_file_transfers SET sender_id = ? WHERE sender_id = ?")
+            .bind(new_peer_id)
+            .bind(old_peer_id)
+            .execute(&mut *connection)
+            .await
+            .context("Failed to migrate pending file sender routes")?;
         Ok(())
     }
 
@@ -3029,6 +3831,29 @@ impl Database {
             return Ok(());
         }
 
+        let old_owners = self.identity_node_owners(old_peer_id).await?;
+        let new_owners = self.identity_node_owners(new_peer_id).await?;
+        let new_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM peers WHERE peer_id = ?)")
+                .bind(new_peer_id)
+                .fetch_one(&self.pool)
+                .await
+                .context("Failed to check legacy endpoint migration target")?;
+        match (old_owners.as_slice(), new_owners.as_slice()) {
+            ([old_node], [new_node]) if old_node == new_node => {}
+            ([_], []) if !new_exists => {}
+            ([], [])
+                if !new_exists
+                    || self
+                        .legacy_peer_profiles_match(old_peer_id, new_peer_id)
+                        .await? => {}
+            _ => anyhow::bail!(
+                "Refusing unsafe legacy endpoint migration {} -> {}",
+                old_peer_id,
+                new_peer_id
+            ),
+        }
+
         self.copy_peer_row(old_peer_id, new_peer_id).await?;
         self.migrate_peer_references(old_peer_id, new_peer_id)
             .await?;
@@ -3045,17 +3870,22 @@ impl Database {
     async fn copy_peer_row(&self, old_peer_id: &str, new_peer_id: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO peers (
-                peer_id, username, department, software_version, mac_address,
+                peer_id, node_id, username, department, software_version, mac_address,
                 avatar_path, avatar_hash, avatar_updated_at,
                 ip, port, is_online, first_seen_at, last_seen_at
              )
              SELECT
-                ?, username, department, software_version, mac_address,
+                ?, node_id, username, department, software_version, mac_address,
                 avatar_path, avatar_hash, avatar_updated_at,
                 ip, port, is_online, first_seen_at, last_seen_at
              FROM peers
              WHERE peer_id = ?
              ON CONFLICT(peer_id) DO UPDATE SET
+                node_id = CASE
+                    WHEN TRIM(peers.node_id) = '' THEN excluded.node_id
+                    WHEN TRIM(excluded.node_id) = '' OR peers.node_id = excluded.node_id THEN peers.node_id
+                    ELSE peers.node_id
+                END,
                 username = CASE WHEN TRIM(excluded.username) = '' THEN peers.username ELSE excluded.username END,
                 department = CASE WHEN TRIM(excluded.department) = '' THEN peers.department ELSE excluded.department END,
                 software_version = CASE WHEN excluded.software_version = '' THEN peers.software_version ELSE excluded.software_version END,
@@ -3304,15 +4134,19 @@ impl Database {
         delivered: Option<bool>,
     ) -> Result<ChatMessage> {
         let timestamp = Utc::now().to_rfc3339();
+        let sender_node_id = self.trusted_node_id_for_endpoint(sender_id).await?;
+        let receiver_node_id = self.trusted_node_id_for_endpoint(receiver_id).await?;
 
         let result = sqlx::query(
-            "INSERT INTO messages (sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            "INSERT INTO messages (sender_id, sender_node_id, sender_name, receiver_id, receiver_node_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
              ON CONFLICT DO NOTHING"
         )
         .bind(sender_id)
+        .bind(sender_node_id.as_deref())
         .bind(sender_name)
         .bind(receiver_id)
+        .bind(receiver_node_id.as_deref())
         .bind(content)
         .bind(msg_type)
         .bind(file_path)
@@ -3349,8 +4183,10 @@ impl Database {
         Ok(ChatMessage {
             id: result.last_insert_rowid(),
             sender_id: sender_id.to_string(),
+            sender_node_id: sender_node_id.unwrap_or_default(),
             sender_name: sender_name.to_string(),
             receiver_id: receiver_id.to_string(),
+            receiver_node_id: receiver_node_id.unwrap_or_default(),
             content: content.to_string(),
             msg_type: msg_type.to_string(),
             file_path: file_path.map(|s| s.to_string()),
@@ -3377,16 +4213,20 @@ impl Database {
             return Ok(None);
         }
 
-        let sender_keys = self.identity_keys_for(sender_id).await?;
-        let sender_placeholders = Self::placeholders(sender_keys.len());
+        let (sender_node_id, sender_keys) = self.node_first_identity_keys(sender_id).await?;
+        let sender_predicate =
+            Self::node_first_identity_predicate("sender_node_id", "sender_id", sender_keys.len());
         let update_sql = format!(
             "UPDATE messages
              SET delivered = ?
-             WHERE sender_id IN ({sender_placeholders})
+             WHERE {sender_predicate}
                AND (group_id IS NULL OR group_id = '')
                AND client_msg_id = ?"
         );
-        let mut update = sqlx::query(&update_sql).bind(delivered);
+        let mut update = sqlx::query(&update_sql)
+            .bind(delivered)
+            .bind(&sender_node_id)
+            .bind(&sender_node_id);
         for key in &sender_keys {
             update = update.bind(key);
         }
@@ -3401,17 +4241,19 @@ impl Database {
         }
 
         let select_sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type,
+            "SELECT id, sender_id, sender_node_id, sender_name, receiver_id, receiver_node_id, content, msg_type,
                     file_path, file_name, file_size, timestamp, is_read,
                     client_msg_id, delivered
              FROM messages
-             WHERE sender_id IN ({sender_placeholders})
+             WHERE {sender_predicate}
                AND (group_id IS NULL OR group_id = '')
                AND client_msg_id = ?
              ORDER BY id ASC
              LIMIT 1"
         );
-        let mut select = sqlx::query(&select_sql);
+        let mut select = sqlx::query(&select_sql)
+            .bind(&sender_node_id)
+            .bind(&sender_node_id);
         for key in &sender_keys {
             select = select.bind(key);
         }
@@ -3431,31 +4273,40 @@ impl Database {
     ) -> Result<Vec<ChatMessage>> {
         let limit = normalize_message_limit(limit);
         log::info!("get_conversation: peer_id={}, my_id={}", peer_id, my_id);
-        let peer_keys = self.identity_keys_for(peer_id).await?;
-        let my_keys = self.identity_keys_for(my_id).await?;
-        let peer_placeholders = Self::placeholders(peer_keys.len());
-        let my_placeholders = Self::placeholders(my_keys.len());
+        let (peer_node_id, peer_keys) = self.node_first_identity_keys(peer_id).await?;
+        let (my_node_id, my_keys) = self.node_first_identity_keys(my_id).await?;
+        let my_sender =
+            Self::node_first_identity_predicate("sender_node_id", "sender_id", my_keys.len());
+        let peer_receiver =
+            Self::node_first_identity_predicate("receiver_node_id", "receiver_id", peer_keys.len());
+        let peer_sender =
+            Self::node_first_identity_predicate("sender_node_id", "sender_id", peer_keys.len());
+        let my_receiver =
+            Self::node_first_identity_predicate("receiver_node_id", "receiver_id", my_keys.len());
         let sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
+            "SELECT id, sender_id, sender_node_id, sender_name, receiver_id, receiver_node_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM (
-                 SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
+                 SELECT id, sender_id, sender_node_id, sender_name, receiver_id, receiver_node_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
                  FROM messages
-                 WHERE (sender_id IN ({my_placeholders}) AND receiver_id IN ({peer_placeholders}))
-                    OR (sender_id IN ({peer_placeholders}) AND receiver_id IN ({my_placeholders}))
+                 WHERE ({my_sender} AND {peer_receiver})
+                    OR ({peer_sender} AND {my_receiver})
                  ORDER BY id DESC LIMIT ?
              ) AS recent_messages
              ORDER BY id ASC"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(&sql).bind(&my_node_id).bind(&my_node_id);
         for key in &my_keys {
             query = query.bind(key);
         }
+        query = query.bind(&peer_node_id).bind(&peer_node_id);
         for key in &peer_keys {
             query = query.bind(key);
         }
+        query = query.bind(&peer_node_id).bind(&peer_node_id);
         for key in &peer_keys {
             query = query.bind(key);
         }
+        query = query.bind(&my_node_id).bind(&my_node_id);
         for key in &my_keys {
             query = query.bind(key);
         }
@@ -3470,8 +4321,10 @@ impl Database {
             .map(|row| ChatMessage {
                 id: row.get("id"),
                 sender_id: row.get("sender_id"),
+                sender_node_id: row.try_get("sender_node_id").unwrap_or_default(),
                 sender_name: row.get("sender_name"),
                 receiver_id: row.get("receiver_id"),
+                receiver_node_id: row.try_get("receiver_node_id").unwrap_or_default(),
                 content: row.get("content"),
                 msg_type: row.get("msg_type"),
                 file_path: row.get("file_path"),
@@ -3492,21 +4345,30 @@ impl Database {
         peer_id: &str,
         my_id: &str,
         before_id: Option<i64>,
+        after_id: Option<i64>,
         limit: Option<i64>,
         filter: Option<&str>,
         day_start: Option<&str>,
         day_end: Option<&str>,
     ) -> Result<Vec<ChatMessage>> {
         let limit = normalize_message_limit(limit);
-        let peer_keys = self.identity_keys_for(peer_id).await?;
-        let my_keys = self.identity_keys_for(my_id).await?;
-        let peer_placeholders = Self::placeholders(peer_keys.len());
-        let my_placeholders = Self::placeholders(my_keys.len());
+        let (peer_node_id, peer_keys) = self.node_first_identity_keys(peer_id).await?;
+        let (my_node_id, my_keys) = self.node_first_identity_keys(my_id).await?;
+        let my_sender =
+            Self::node_first_identity_predicate("sender_node_id", "sender_id", my_keys.len());
+        let peer_receiver =
+            Self::node_first_identity_predicate("receiver_node_id", "receiver_id", peer_keys.len());
+        let peer_sender =
+            Self::node_first_identity_predicate("sender_node_id", "sender_id", peer_keys.len());
+        let my_receiver =
+            Self::node_first_identity_predicate("receiver_node_id", "receiver_id", my_keys.len());
         let before_clause = if before_id.is_some() {
             "AND id < ?"
         } else {
             ""
         };
+        let after_clause = if after_id.is_some() { "AND id > ?" } else { "" };
+        let inner_order = if after_id.is_some() { "ASC" } else { "DESC" };
         let filter_clause = message_filter_clause(filter);
         let day_clause = if day_start.is_some() && day_end.is_some() {
             "AND timestamp >= ? AND timestamp < ?"
@@ -3514,34 +4376,41 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
+            "SELECT id, sender_id, sender_node_id, sender_name, receiver_id, receiver_node_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM (
-                 SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
+                 SELECT id, sender_id, sender_node_id, sender_name, receiver_id, receiver_node_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
                  FROM messages
-                 WHERE ((sender_id IN ({my_placeholders}) AND receiver_id IN ({peer_placeholders}))
-                    OR (sender_id IN ({peer_placeholders}) AND receiver_id IN ({my_placeholders})))
+                 WHERE (({my_sender} AND {peer_receiver})
+                    OR ({peer_sender} AND {my_receiver}))
                    {before_clause}
+                   {after_clause}
                    {filter_clause}
                    {day_clause}
-                 ORDER BY id DESC LIMIT ?
+                 ORDER BY id {inner_order} LIMIT ?
              ) AS history_messages
              ORDER BY id ASC"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(&sql).bind(&my_node_id).bind(&my_node_id);
         for key in &my_keys {
             query = query.bind(key);
         }
+        query = query.bind(&peer_node_id).bind(&peer_node_id);
         for key in &peer_keys {
             query = query.bind(key);
         }
+        query = query.bind(&peer_node_id).bind(&peer_node_id);
         for key in &peer_keys {
             query = query.bind(key);
         }
+        query = query.bind(&my_node_id).bind(&my_node_id);
         for key in &my_keys {
             query = query.bind(key);
         }
         if let Some(before_id) = before_id {
             query = query.bind(before_id);
+        }
+        if let Some(after_id) = after_id {
+            query = query.bind(after_id);
         }
         if let (Some(day_start), Some(day_end)) = (day_start, day_end) {
             query = query.bind(day_start).bind(day_end);
@@ -3559,6 +4428,7 @@ impl Database {
         &self,
         group_id: &str,
         before_id: Option<i64>,
+        after_id: Option<i64>,
         limit: Option<i64>,
         filter: Option<&str>,
         day_start: Option<&str>,
@@ -3570,6 +4440,8 @@ impl Database {
         } else {
             ""
         };
+        let after_clause = if after_id.is_some() { "AND id > ?" } else { "" };
+        let inner_order = if after_id.is_some() { "ASC" } else { "DESC" };
         let filter_clause = message_filter_clause(filter);
         let day_clause = if day_start.is_some() && day_end.is_some() {
             "AND timestamp >= ? AND timestamp < ?"
@@ -3577,21 +4449,25 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
+            "SELECT id, sender_id, sender_node_id, sender_name, receiver_id, receiver_node_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM (
-                 SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
+                 SELECT id, sender_id, sender_node_id, sender_name, receiver_id, receiver_node_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
                  FROM messages
                  WHERE group_id = ?
                    {before_clause}
+                   {after_clause}
                    {filter_clause}
                    {day_clause}
-                 ORDER BY id DESC LIMIT ?
+                 ORDER BY id {inner_order} LIMIT ?
              ) AS history_messages
              ORDER BY id ASC"
         );
         let mut query = sqlx::query(&sql).bind(group_id);
         if let Some(before_id) = before_id {
             query = query.bind(before_id);
+        }
+        if let Some(after_id) = after_id {
+            query = query.bind(after_id);
         }
         if let (Some(day_start), Some(day_end)) = (day_start, day_end) {
             query = query.bind(day_start).bind(day_end);
@@ -3617,10 +4493,16 @@ impl Database {
     ) -> Result<Vec<ChatMessage>> {
         let pattern = format!("%{}%", query);
         let limit = normalize_search_limit(limit);
-        let peer_keys = self.identity_keys_for(peer_id).await?;
-        let my_keys = self.identity_keys_for(my_id).await?;
-        let peer_placeholders = Self::placeholders(peer_keys.len());
-        let my_placeholders = Self::placeholders(my_keys.len());
+        let (peer_node_id, peer_keys) = self.node_first_identity_keys(peer_id).await?;
+        let (my_node_id, my_keys) = self.node_first_identity_keys(my_id).await?;
+        let my_sender =
+            Self::node_first_identity_predicate("sender_node_id", "sender_id", my_keys.len());
+        let peer_receiver =
+            Self::node_first_identity_predicate("receiver_node_id", "receiver_id", peer_keys.len());
+        let peer_sender =
+            Self::node_first_identity_predicate("sender_node_id", "sender_id", peer_keys.len());
+        let my_receiver =
+            Self::node_first_identity_predicate("receiver_node_id", "receiver_id", my_keys.len());
         let filter_clause = message_filter_clause(filter);
         let day_clause = if day_start.is_some() && day_end.is_some() {
             "AND timestamp >= ? AND timestamp < ?"
@@ -3628,26 +4510,29 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
+            "SELECT id, sender_id, sender_node_id, sender_name, receiver_id, receiver_node_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM messages
-             WHERE ((sender_id IN ({my_placeholders}) AND receiver_id IN ({peer_placeholders}))
-                OR (sender_id IN ({peer_placeholders}) AND receiver_id IN ({my_placeholders})))
+             WHERE (({my_sender} AND {peer_receiver})
+                OR ({peer_sender} AND {my_receiver}))
                AND (content LIKE ? OR file_name LIKE ?)
                {filter_clause}
                {day_clause}
              ORDER BY id DESC
              LIMIT ?"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(&sql).bind(&my_node_id).bind(&my_node_id);
         for key in &my_keys {
             query = query.bind(key);
         }
+        query = query.bind(&peer_node_id).bind(&peer_node_id);
         for key in &peer_keys {
             query = query.bind(key);
         }
+        query = query.bind(&peer_node_id).bind(&peer_node_id);
         for key in &peer_keys {
             query = query.bind(key);
         }
+        query = query.bind(&my_node_id).bind(&my_node_id);
         for key in &my_keys {
             query = query.bind(key);
         }
@@ -3682,7 +4567,7 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
+            "SELECT id, sender_id, sender_node_id, sender_name, receiver_id, receiver_node_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM messages
              WHERE group_id = ?
                AND (content LIKE ? OR file_name LIKE ?)
@@ -3709,20 +4594,24 @@ impl Database {
 
     pub async fn search_messages(&self, my_id: &str, query: &str) -> Result<Vec<ChatMessage>> {
         let pattern = format!("%{}%", query);
-        let my_keys = self.identity_keys_for(my_id).await?;
-        let my_placeholders = Self::placeholders(my_keys.len());
+        let (my_node_id, my_keys) = self.node_first_identity_keys(my_id).await?;
+        let my_sender =
+            Self::node_first_identity_predicate("sender_node_id", "sender_id", my_keys.len());
+        let my_receiver =
+            Self::node_first_identity_predicate("receiver_node_id", "receiver_id", my_keys.len());
         let sql = format!(
-            "SELECT id, sender_id, sender_name, receiver_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
+            "SELECT id, sender_id, sender_node_id, sender_name, receiver_id, receiver_node_id, content, msg_type, file_path, file_name, file_size, timestamp, is_read, client_msg_id, delivered
              FROM messages
-             WHERE (sender_id IN ({my_placeholders}) OR receiver_id IN ({my_placeholders}))
+             WHERE ({my_sender} OR {my_receiver})
                AND (content LIKE ? OR file_name LIKE ?)
              ORDER BY id DESC
              LIMIT 100"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(&sql).bind(&my_node_id).bind(&my_node_id);
         for key in &my_keys {
             query = query.bind(key);
         }
+        query = query.bind(&my_node_id).bind(&my_node_id);
         for key in &my_keys {
             query = query.bind(key);
         }
@@ -3737,33 +4626,28 @@ impl Database {
     }
 
     pub async fn mark_read(&self, sender_id: &str, receiver_id: &str) -> Result<()> {
-        let sender_keys = self.identity_keys_for(sender_id).await?;
-        let receiver_keys = self.identity_keys_for(receiver_id).await?;
-        let sender_placeholders = Self::placeholders(sender_keys.len());
-        let receiver_placeholders = Self::placeholders(receiver_keys.len());
+        let (sender_node_id, sender_keys) = self.node_first_identity_keys(sender_id).await?;
+        let (receiver_node_id, receiver_keys) = self.node_first_identity_keys(receiver_id).await?;
+        let sender_predicate =
+            Self::node_first_identity_predicate("sender_node_id", "sender_id", sender_keys.len());
+        let receiver_predicate = Self::node_first_identity_predicate(
+            "receiver_node_id",
+            "receiver_id",
+            receiver_keys.len(),
+        );
         let sql = format!(
             "UPDATE messages
              SET is_read = 1
-             WHERE receiver_id IN ({receiver_placeholders})
-               AND (
-                    sender_id IN ({sender_placeholders})
-                    OR (
-                        sender_name <> ''
-                        AND sender_name = (
-                            SELECT username FROM peers
-                            WHERE peer_id IN ({sender_placeholders}) AND username <> ''
-                            LIMIT 1
-                        )
-                    )
-               )"
+             WHERE {receiver_predicate}
+               AND {sender_predicate}"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(&sql)
+            .bind(&receiver_node_id)
+            .bind(&receiver_node_id);
         for key in &receiver_keys {
             query = query.bind(key);
         }
-        for key in &sender_keys {
-            query = query.bind(key);
-        }
+        query = query.bind(&sender_node_id).bind(&sender_node_id);
         for key in &sender_keys {
             query = query.bind(key);
         }
@@ -3775,20 +4659,33 @@ impl Database {
     }
 
     pub async fn get_unread_counts(&self, my_id: &str) -> Result<Vec<UnreadCount>> {
-        let my_keys = self.identity_keys_for(my_id).await?;
-        let my_placeholders = Self::placeholders(my_keys.len());
+        let (my_node_id, my_keys) = self.node_first_identity_keys(my_id).await?;
+        let my_receiver = Self::node_first_identity_predicate(
+            "m.receiver_node_id",
+            "m.receiver_id",
+            my_keys.len(),
+        );
         let sql = format!(
             "WITH unread AS (
                  SELECT m.sender_id,
-                        COALESCE(NULLIF(p.node_id, ''), NULLIF(pa.node_id, ''), '') AS resolved_node_id,
+                        CASE
+                            WHEN COALESCE(TRIM(m.sender_node_id), '') <> ''
+                                THEN m.sender_node_id
+                            ELSE COALESCE(NULLIF(p.node_id, ''), NULLIF(pa.node_id, ''), NULLIF(up.node_id, ''), '')
+                        END AS resolved_node_id,
                         COUNT(*) AS cnt,
                         COALESCE(NULLIF(p.username, ''), NULLIF(MAX(m.sender_name), ''), m.sender_id) AS username
                  FROM messages m
                  LEFT JOIN peers p ON m.sender_id = p.peer_id
                  LEFT JOIN peer_aliases pa ON m.sender_id = pa.alias_peer_id
-                 WHERE m.receiver_id IN ({my_placeholders}) AND m.is_read = 0
+                 LEFT JOIN user_profile up ON up.id = 1 AND up.peer_id = m.sender_id
+                 WHERE {my_receiver} AND m.is_read = 0
                  GROUP BY m.sender_id,
-                          COALESCE(NULLIF(p.node_id, ''), NULLIF(pa.node_id, ''), '')
+                          CASE
+                            WHEN COALESCE(TRIM(m.sender_node_id), '') <> ''
+                                THEN m.sender_node_id
+                            ELSE COALESCE(NULLIF(p.node_id, ''), NULLIF(pa.node_id, ''), NULLIF(up.node_id, ''), '')
+                          END
              )
              SELECT COALESCE(
                         (
@@ -3809,7 +4706,7 @@ impl Database {
                           ELSE unread.sender_id
                       END"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(&sql).bind(&my_node_id).bind(&my_node_id);
         for key in &my_keys {
             query = query.bind(key);
         }
@@ -3853,6 +4750,122 @@ mod tests {
             .expect("fresh database should initialize");
         drop(db);
 
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn additive_node_columns_backfill_only_unique_persisted_mappings() {
+        let db_path = temp_db_path("node-columns-old-db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(&format!("sqlite:{}?mode=rwc", db_path_str))
+            .await
+            .expect("legacy database should open");
+        for statement in [
+            "CREATE TABLE user_profile (
+                id INTEGER PRIMARY KEY CHECK (id = 1), peer_id TEXT,
+                node_id TEXT NOT NULL DEFAULT '', username TEXT NOT NULL,
+                department TEXT NOT NULL
+             )",
+            "CREATE TABLE peers (
+                peer_id TEXT PRIMARY KEY, node_id TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL, department TEXT NOT NULL,
+                ip TEXT NOT NULL, port INTEGER NOT NULL,
+                is_online INTEGER NOT NULL DEFAULT 1,
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+             )",
+            "CREATE TABLE peer_aliases (
+                alias_peer_id TEXT PRIMARY KEY, node_id TEXT NOT NULL,
+                created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+             )",
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id TEXT NOT NULL, sender_name TEXT NOT NULL,
+                receiver_id TEXT NOT NULL, content TEXT NOT NULL,
+                msg_type TEXT NOT NULL DEFAULT 'text', file_path TEXT,
+                file_name TEXT, file_size INTEGER, timestamp TEXT NOT NULL,
+                is_read INTEGER NOT NULL DEFAULT 0, delivered INTEGER
+             )",
+            "CREATE TABLE recent_contacts (
+                peer_id TEXT PRIMARY KEY, added_at TEXT NOT NULL
+             )",
+        ] {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("legacy schema should be created");
+        }
+        sqlx::query(
+            "INSERT INTO peers
+             (peer_id, node_id, username, department, ip, port, is_online, first_seen_at, last_seen_at)
+             VALUES
+             ('safe:1', 'node-safe', 'Safe', 'Ops', '10.0.0.2', 1, 1, '1', '1'),
+             ('conflict:1', 'node-a', 'Conflict', 'Ops', '10.0.0.3', 1, 1, '1', '1')",
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy peers should persist");
+        sqlx::query(
+            "INSERT INTO peer_aliases (alias_peer_id, node_id, created_at, last_seen_at)
+             VALUES ('conflict:1', 'node-b', '1', '1')",
+        )
+        .execute(&pool)
+        .await
+        .expect("conflicting alias should persist");
+        sqlx::query(
+            "INSERT INTO messages
+             (sender_id, sender_name, receiver_id, content, timestamp)
+             VALUES ('safe:1', 'Safe', 'me', 'safe', '1'),
+                    ('conflict:1', 'Conflict', 'me', 'conflict', '2')",
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy messages should persist");
+        sqlx::query("INSERT INTO recent_contacts (peer_id, added_at) VALUES ('safe:1', '1')")
+            .execute(&pool)
+            .await
+            .expect("legacy recent contact should persist");
+        drop(pool);
+
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("legacy database should upgrade");
+        let safe_node: Option<String> =
+            sqlx::query_scalar("SELECT sender_node_id FROM messages WHERE content = 'safe'")
+                .fetch_one(&db.pool)
+                .await
+                .expect("safe message node should load");
+        let conflict_node: Option<String> =
+            sqlx::query_scalar("SELECT sender_node_id FROM messages WHERE content = 'conflict'")
+                .fetch_one(&db.pool)
+                .await
+                .expect("conflicting message node should load");
+        assert_eq!(safe_node.as_deref(), Some("node-safe"));
+        assert!(conflict_node.as_deref().unwrap_or_default().is_empty());
+        let recent_node: Option<String> =
+            sqlx::query_scalar("SELECT node_id FROM recent_contacts WHERE peer_id = 'safe:1'")
+                .fetch_one(&db.pool)
+                .await
+                .expect("recent node should load");
+        assert_eq!(recent_node.as_deref(), Some("node-safe"));
+
+        for (table, column) in [
+            ("messages", "receiver_node_id"),
+            ("group_members", "node_id"),
+            ("groups", "creator_node_id"),
+            ("pending_group_messages", "target_node_id"),
+            ("pending_notifications", "target_node_id"),
+            ("pending_file_transfers", "sender_node_id"),
+        ] {
+            let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+                .fetch_all(&db.pool)
+                .await
+                .expect("table info should load");
+            assert!(rows
+                .iter()
+                .any(|row| row.get::<String, _>("name") == column));
+        }
+        drop(db);
         let _ = std::fs::remove_file(db_path);
     }
 
@@ -4164,7 +5177,7 @@ mod tests {
         db.add_recent_contact("10.0.0.2:9527")
             .await
             .expect("old endpoint should become recent");
-        db.save_message(
+        db.save_message_dedup(
             "me",
             "Me",
             "10.0.0.2:9527",
@@ -4308,7 +5321,9 @@ mod tests {
         db.queue_pending_file_transfer(
             "group-1",
             "10.0.0.3:9527",
+            None,
             "10.0.0.2:9527",
+            None,
             "Me",
             "Ops",
             9527,
@@ -4404,7 +5419,7 @@ mod tests {
         db.add_recent_contact("10.0.0.2:9527")
             .await
             .expect("first endpoint should become recent");
-        db.save_message(
+        db.save_message_dedup(
             "me",
             "Me",
             "10.0.0.2:9527",
@@ -4481,19 +5496,31 @@ mod tests {
         )
         .await
         .expect("old endpoint should persist with node_id");
-        db.save_message(
-            "me",
-            "Me",
+        let original = db
+            .save_message(
+                "me",
+                "Me",
+                "10.0.0.2:9527",
+                "message before DHCP change",
+                "text",
+                None,
+                None,
+                None,
+                Some("node-alias-client"),
+            )
+            .await
+            .expect("message to old endpoint should save");
+        db.add_recent_contact("10.0.0.2:9527")
+            .await
+            .expect("old endpoint should become recent");
+        db.create_group(
+            "group-node-alias",
+            "Node Alias Group",
             "10.0.0.2:9527",
-            "message before DHCP change",
-            "text",
-            None,
-            None,
-            None,
-            None,
+            &["10.0.0.2:9527".to_string()],
         )
         .await
-        .expect("message to old endpoint should save");
+        .expect("old endpoint group should save");
 
         db.upsert_peer_alias("node-alice", "10.0.0.9:9527")
             .await
@@ -4516,12 +5543,55 @@ mod tests {
         .await
         .expect("new endpoint should update same node_id");
 
+        let duplicate = db
+            .save_message_dedup(
+                "me",
+                "Me",
+                "10.0.0.9:9527",
+                "duplicate after DHCP change",
+                "text",
+                None,
+                None,
+                None,
+                Some("node-alias-client"),
+            )
+            .await
+            .expect("node-keyed duplicate should resolve");
+        assert_eq!(duplicate.id, original.id);
+        db.add_recent_contact("10.0.0.9:9527")
+            .await
+            .expect("new endpoint should replace recent identity");
+        db.upsert_group_member_identity("group-node-alias", "10.0.0.9:9527", "node-alice")
+            .await
+            .expect("new endpoint should replace group identity");
+
         let messages = db
             .get_conversation("10.0.0.9:9527", "me", Some(10))
             .await
             .expect("new endpoint conversation should include old alias messages");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "message before DHCP change");
+        let receiver_node: Option<String> =
+            sqlx::query_scalar("SELECT receiver_node_id FROM messages WHERE id = ?")
+                .bind(original.id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("message node key should load");
+        assert_eq!(receiver_node.as_deref(), Some("node-alice"));
+        let recent = db
+            .list_recent_contacts()
+            .await
+            .expect("recent contacts should load");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].peer_id, "10.0.0.9:9527");
+        let member = sqlx::query(
+            "SELECT peer_id, node_id FROM group_members WHERE group_id = 'group-node-alias'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("node group member should load");
+        assert_eq!(member.get::<String, _>("peer_id"), "10.0.0.9:9527");
+        assert_eq!(member.get::<String, _>("node_id"), "node-alice");
 
         let aliases = db
             .list_peer_aliases("node-alice")
@@ -4594,7 +5664,16 @@ mod tests {
         .expect("new endpoint should update same node_id");
 
         let history = db
-            .get_conversation_history("10.0.0.9:9527", "me", None, Some(10), None, None, None)
+            .get_conversation_history(
+                "10.0.0.9:9527",
+                "me",
+                None,
+                None,
+                Some(10),
+                None,
+                None,
+                None,
+            )
             .await
             .expect("history should resolve aliases");
         assert_eq!(history.len(), 1);
@@ -5057,8 +6136,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_migration_rolls_back_every_table_on_unique_conflict() {
-        let db_path = temp_db_path("verified-migration-rollback");
+    async fn verified_node_migration_keeps_historical_endpoint_columns() {
+        let db_path = temp_db_path("verified-migration-no-history-rewrite");
         let db = Database::new(&db_path.to_string_lossy())
             .await
             .expect("database should initialize");
@@ -5127,20 +6206,21 @@ mod tests {
                 "10.0.0.100:9527",
                 "node-local",
             )
-            .await;
-        assert!(migration.is_err());
+            .await
+            .expect("verified node migration should not rewrite conflicting history");
+        assert_eq!(migration, RemoteMigrationDecision::AllowedNode);
 
         assert!(db
             .get_stored_peer("10.0.0.2:9527")
             .await
             .expect("old peer lookup should succeed")
-            .is_some());
+            .is_none());
         let aliases = db
             .list_peer_aliases("node-a")
             .await
             .expect("aliases should load");
         assert!(aliases.iter().any(|alias| alias == "10.0.0.2:9527"));
-        assert!(!aliases.iter().any(|alias| alias == "10.0.0.9:9527"));
+        assert!(aliases.iter().any(|alias| alias == "10.0.0.9:9527"));
         let group_peer_id: String = sqlx::query_scalar(
             "SELECT peer_id FROM group_members WHERE group_id = 'group-rollback'",
         )
@@ -5374,6 +6454,1144 @@ mod tests {
         assert!(members.iter().any(|member| member.node_id == "node-b"));
 
         drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn after_id_history_is_ascending_and_ignores_interleaved_rows() {
+        let db_path = temp_db_path("after-id-interleaved");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+
+        let private_anchor = db
+            .save_message(
+                "peer",
+                "Peer",
+                "me",
+                "private-anchor",
+                "text",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("private anchor should persist");
+        db.save_group_message(
+            "group-other",
+            "other",
+            "Other",
+            "interleaved-group",
+            "text",
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("interleaved group message should persist");
+        db.save_message(
+            "unrelated",
+            "Other",
+            "me",
+            "unrelated-private",
+            "text",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("unrelated private message should persist");
+        let private_next_1 = db
+            .save_message(
+                "me",
+                "Me",
+                "peer",
+                "private-next-1",
+                "text",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("first private continuation should persist");
+        let group_anchor = db
+            .save_group_message(
+                "group-target",
+                "member",
+                "Member",
+                "group-anchor",
+                "text",
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("group anchor should persist");
+        db.save_message(
+            "peer",
+            "Peer",
+            "someone-else",
+            "same-sender-other-conversation",
+            "text",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("same-sender unrelated message should persist");
+        let group_next_1 = db
+            .save_group_message(
+                "group-target",
+                "member",
+                "Member",
+                "group-next-1",
+                "text",
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("first group continuation should persist");
+        let private_next_2 = db
+            .save_message(
+                "peer",
+                "Peer",
+                "me",
+                "private-next-2",
+                "text",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("second private continuation should persist");
+        let group_next_2 = db
+            .save_group_message(
+                "group-target",
+                "member",
+                "Member",
+                "group-next-2",
+                "text",
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("second group continuation should persist");
+        db.save_message(
+            "me",
+            "Me",
+            "peer",
+            "private-next-3",
+            "text",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("third private continuation should persist");
+        db.save_group_message(
+            "group-target",
+            "member",
+            "Member",
+            "group-next-3",
+            "text",
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("third group continuation should persist");
+
+        let private_history = db
+            .get_conversation_history(
+                "peer",
+                "me",
+                None,
+                Some(private_anchor.id),
+                Some(2),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("private after_id history should load");
+        assert_eq!(
+            private_history
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![private_next_1.id, private_next_2.id]
+        );
+        assert!(private_history
+            .windows(2)
+            .all(|pair| pair[0].id < pair[1].id));
+
+        let group_history = db
+            .get_group_history(
+                "group-target",
+                None,
+                Some(group_anchor.id),
+                Some(2),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("group after_id history should load");
+        assert_eq!(
+            group_history
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![group_next_1.id, group_next_2.id]
+        );
+        assert!(group_history.windows(2).all(|pair| pair[0].id < pair[1].id));
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn client_msg_id_deduplicates_across_endpoints_of_the_same_node() {
+        let db_path = temp_db_path("node-client-id-dedup");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        let old_endpoint = "10.0.0.2:9527";
+        let current_endpoint = "10.0.0.9:9527";
+
+        db.upsert_peer_with_node_id_avatar(
+            current_endpoint,
+            "node-a",
+            "Alice",
+            "Ops",
+            "0.2.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.9",
+            9527,
+            true,
+        )
+        .await
+        .expect("current endpoint should persist");
+        db.upsert_peer_alias("node-a", old_endpoint)
+            .await
+            .expect("old endpoint should bind as alias");
+
+        let private_first = db
+            .save_message_dedup(
+                old_endpoint,
+                "Alice",
+                "me",
+                "private-original",
+                "text",
+                None,
+                None,
+                None,
+                Some("node-private-client-id"),
+            )
+            .await
+            .expect("old endpoint private message should persist");
+        let private_duplicate = db
+            .save_message_dedup(
+                current_endpoint,
+                "Alice",
+                "me",
+                "private-duplicate",
+                "text",
+                None,
+                None,
+                None,
+                Some("node-private-client-id"),
+            )
+            .await
+            .expect("current endpoint retry should resolve existing message");
+        assert_eq!(private_duplicate.id, private_first.id);
+        assert_eq!(private_duplicate.content, "private-original");
+        assert_eq!(private_duplicate.sender_node_id, "node-a");
+
+        let group_first = db
+            .save_group_message_dedup(
+                "group-node-dedup",
+                old_endpoint,
+                "Alice",
+                "group-original",
+                "text",
+                None,
+                None,
+                None,
+                false,
+                Some("node-group-client-id"),
+            )
+            .await
+            .expect("old endpoint group message should persist");
+        let group_duplicate = db
+            .save_group_message_dedup(
+                "group-node-dedup",
+                current_endpoint,
+                "Alice",
+                "group-duplicate",
+                "text",
+                None,
+                None,
+                None,
+                false,
+                Some("node-group-client-id"),
+            )
+            .await
+            .expect("current endpoint retry should resolve existing group message");
+        assert_eq!(group_duplicate.id, group_first.id);
+        assert_eq!(group_duplicate.content, "group-original");
+        assert_eq!(group_duplicate.sender_node_id, "node-a");
+
+        let cancelled = db
+            .save_group_message_dedup(
+                "group-node-dedup",
+                old_endpoint,
+                "Alice",
+                "发送已取消",
+                "text",
+                None,
+                Some("report.zip"),
+                Some(42),
+                false,
+                Some("cancel:node-group-file"),
+            )
+            .await
+            .expect("cancellation record should persist");
+        let cancelled_duplicate = db
+            .save_group_message_dedup(
+                "group-node-dedup",
+                current_endpoint,
+                "Alice",
+                "duplicate cancellation",
+                "text",
+                None,
+                Some("report.zip"),
+                Some(42),
+                false,
+                Some("cancel:node-group-file"),
+            )
+            .await
+            .expect("duplicate cancellation should resolve existing record");
+        assert_eq!(cancelled_duplicate.id, cancelled.id);
+        assert_eq!(cancelled_duplicate.content, "发送已取消");
+
+        let private_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages
+             WHERE (group_id IS NULL OR group_id = '')
+               AND client_msg_id = 'node-private-client-id'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("private count should load");
+        let group_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages
+             WHERE group_id = 'group-node-dedup'
+               AND client_msg_id = 'node-group-client-id'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("group count should load");
+        assert_eq!(private_count, 1);
+        assert_eq!(group_count, 1);
+        let cancellation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages
+             WHERE group_id = 'group-node-dedup'
+               AND client_msg_id = 'cancel:node-group-file'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("cancellation count should load");
+        assert_eq!(cancellation_count, 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn common_migration_only_updates_same_node_routes_and_rejects_unsafe_owners() {
+        let db_path = temp_db_path("common-node-route-migration");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        let old_endpoint = "10.0.0.2:9527";
+        let current_endpoint = "10.0.0.9:9527";
+
+        db.upsert_peer_with_node_id_avatar(
+            current_endpoint,
+            "node-a",
+            "Alice",
+            "Ops",
+            "0.2.0",
+            "aa:bb:cc",
+            "",
+            "",
+            0,
+            "10.0.0.9",
+            9527,
+            true,
+        )
+        .await
+        .expect("current endpoint should persist");
+        db.upsert_peer_alias("node-a", old_endpoint)
+            .await
+            .expect("old endpoint should bind as alias");
+
+        sqlx::query(
+            "INSERT INTO messages
+             (sender_id, sender_node_id, sender_name, receiver_id, content, msg_type, timestamp, is_read)
+             VALUES (?, 'node-a', 'Alice', 'me', 'history-incoming', 'text', '1', 0)",
+        )
+        .bind(old_endpoint)
+        .execute(&db.pool)
+        .await
+        .expect("incoming history should persist");
+        sqlx::query(
+            "INSERT INTO messages
+             (sender_id, sender_name, receiver_id, receiver_node_id, content, msg_type, timestamp, is_read)
+             VALUES ('me', 'Me', ?, 'node-a', 'history-outgoing', 'text', '2', 0)",
+        )
+        .bind(old_endpoint)
+        .execute(&db.pool)
+        .await
+        .expect("outgoing history should persist");
+        sqlx::query(
+            "INSERT INTO groups (group_id, name, creator_id, creator_node_id, created_at)
+             VALUES ('route-group', 'Route Group', ?, 'node-a', '1')",
+        )
+        .bind(old_endpoint)
+        .execute(&db.pool)
+        .await
+        .expect("group should persist");
+        sqlx::query(
+            "INSERT INTO group_members (group_id, peer_id, node_id, joined_at)
+             VALUES ('route-group', ?, 'node-a', '1')",
+        )
+        .bind(old_endpoint)
+        .execute(&db.pool)
+        .await
+        .expect("group member should persist");
+        sqlx::query(
+            "INSERT INTO recent_contacts (peer_id, node_id, added_at)
+             VALUES (?, 'node-a', '1')",
+        )
+        .bind(old_endpoint)
+        .execute(&db.pool)
+        .await
+        .expect("recent contact should persist");
+        sqlx::query(
+            "INSERT INTO pending_group_messages
+             (group_id, peer_id, target_node_id, sender_id, sender_node_id,
+              sender_name, content, msg_type, original_timestamp, created_at)
+             VALUES ('route-group', ?, 'node-a', ?, 'node-a',
+                     'Alice', 'queued-group', 'text', '1', '1')",
+        )
+        .bind(old_endpoint)
+        .bind(old_endpoint)
+        .execute(&db.pool)
+        .await
+        .expect("pending group route should persist");
+        let notification_payload = serde_json::json!({
+            "sender_id": old_endpoint,
+            "sender_node_id": "node-a",
+            "receiver_id": old_endpoint,
+            "receiver_node_id": "node-a",
+            "content": "payload-body",
+            "msg_type": "text"
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO pending_notifications
+             (peer_id, target_node_id, kind, payload, created_at)
+             VALUES (?, 'node-a', 'text', ?, '1')",
+        )
+        .bind(old_endpoint)
+        .bind(&notification_payload)
+        .execute(&db.pool)
+        .await
+        .expect("pending notification should persist");
+        sqlx::query(
+            "INSERT INTO pending_file_transfers
+             (group_id, peer_id, target_node_id, sender_id, sender_node_id,
+              sender_name, sender_department, sender_port, file_path, file_name,
+              file_size, file_kind, client_msg_id, created_at)
+             VALUES ('route-group', ?, 'node-a', ?, 'node-a',
+                     'Alice', 'Ops', 9527, '/tmp/route-file', 'route-file',
+                     1, 'file', 'route-file-id', '1')",
+        )
+        .bind(old_endpoint)
+        .bind(old_endpoint)
+        .execute(&db.pool)
+        .await
+        .expect("pending file route should persist");
+
+        db.migrate_peer_references(old_endpoint, current_endpoint)
+            .await
+            .expect("same-node route migration should succeed");
+
+        let historical_ids: (String, String, String, String, String) = (
+            sqlx::query_scalar("SELECT sender_id FROM messages WHERE content = 'history-incoming'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            sqlx::query_scalar(
+                "SELECT receiver_id FROM messages WHERE content = 'history-outgoing'",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            sqlx::query_scalar("SELECT creator_id FROM groups WHERE group_id = 'route-group'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            sqlx::query_scalar("SELECT peer_id FROM group_members WHERE group_id = 'route-group'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            sqlx::query_scalar("SELECT peer_id FROM recent_contacts LIMIT 1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            historical_ids,
+            (
+                old_endpoint.to_string(),
+                old_endpoint.to_string(),
+                old_endpoint.to_string(),
+                old_endpoint.to_string(),
+                old_endpoint.to_string(),
+            )
+        );
+
+        let pending_group = sqlx::query(
+            "SELECT peer_id, target_node_id, sender_id, sender_node_id
+             FROM pending_group_messages WHERE content = 'queued-group'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("pending group route should load");
+        assert_eq!(pending_group.get::<String, _>("peer_id"), current_endpoint);
+        assert_eq!(
+            pending_group.get::<String, _>("sender_id"),
+            current_endpoint
+        );
+        assert_eq!(pending_group.get::<String, _>("target_node_id"), "node-a");
+        assert_eq!(pending_group.get::<String, _>("sender_node_id"), "node-a");
+
+        let pending_notification =
+            sqlx::query("SELECT peer_id, target_node_id, payload FROM pending_notifications")
+                .fetch_one(&db.pool)
+                .await
+                .expect("pending notification should load");
+        assert_eq!(
+            pending_notification.get::<String, _>("peer_id"),
+            current_endpoint
+        );
+        assert_eq!(
+            pending_notification.get::<String, _>("target_node_id"),
+            "node-a"
+        );
+        let migrated_payload: serde_json::Value =
+            serde_json::from_str(&pending_notification.get::<String, _>("payload"))
+                .expect("payload should remain valid JSON");
+        assert_eq!(migrated_payload["sender_id"], current_endpoint);
+        assert_eq!(migrated_payload["receiver_id"], current_endpoint);
+        assert_eq!(migrated_payload["sender_node_id"], "node-a");
+        assert_eq!(migrated_payload["receiver_node_id"], "node-a");
+
+        let pending_file = sqlx::query(
+            "SELECT peer_id, target_node_id, sender_id, sender_node_id
+             FROM pending_file_transfers WHERE client_msg_id = 'route-file-id'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("pending file route should load");
+        assert_eq!(pending_file.get::<String, _>("peer_id"), current_endpoint);
+        assert_eq!(pending_file.get::<String, _>("sender_id"), current_endpoint);
+        assert_eq!(pending_file.get::<String, _>("target_node_id"), "node-a");
+        assert_eq!(pending_file.get::<String, _>("sender_node_id"), "node-a");
+
+        for (old_id, old_node, new_id, new_node, marker) in [
+            (
+                "10.0.0.3:9527",
+                "node-b",
+                "10.0.0.4:9527",
+                "node-c",
+                "different",
+            ),
+            ("10.0.0.5:9527", "node-d", "10.0.0.6:9527", "", "mixed"),
+        ] {
+            db.upsert_peer_with_node_id_avatar(
+                old_id,
+                old_node,
+                marker,
+                "Ops",
+                "0.2.0",
+                "",
+                "",
+                "",
+                0,
+                old_id.split(':').next().unwrap(),
+                9527,
+                true,
+            )
+            .await
+            .expect("old unsafe endpoint should persist");
+            if !new_node.is_empty() {
+                db.upsert_peer_with_node_id_avatar(
+                    new_id,
+                    new_node,
+                    marker,
+                    "Ops",
+                    "0.2.0",
+                    "",
+                    "",
+                    "",
+                    0,
+                    new_id.split(':').next().unwrap(),
+                    9527,
+                    true,
+                )
+                .await
+                .expect("new unsafe endpoint should persist");
+            }
+            let content = format!("{marker}-node-history");
+            sqlx::query(
+                "INSERT INTO messages
+                 (sender_id, sender_node_id, sender_name, receiver_id, content, msg_type, timestamp, is_read)
+                 VALUES (?, ?, ?, 'me', ?, 'text', '3', 0)",
+            )
+            .bind(old_id)
+            .bind(old_node)
+            .bind(marker)
+            .bind(&content)
+            .execute(&db.pool)
+            .await
+            .expect("unsafe history should persist");
+            assert!(db.migrate_peer_references(old_id, new_id).await.is_err());
+            let persisted_sender: String =
+                sqlx::query_scalar("SELECT sender_id FROM messages WHERE content = ?")
+                    .bind(&content)
+                    .fetch_one(&db.pool)
+                    .await
+                    .expect("unsafe history should load");
+            assert_eq!(persisted_sender, old_id);
+        }
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn group_unread_and_read_state_use_node_identity_for_self() {
+        let db_path = temp_db_path("group-unread-node-self");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        let old_self = "10.0.0.2:9527";
+        let current_self = "10.0.0.9:9527";
+
+        db.save_user_profile(old_self, "Me", "Ops", "0.2.0", "aa:bb:cc")
+            .await
+            .expect("old profile should persist");
+        let node_id = db
+            .ensure_user_node_id()
+            .await
+            .expect("local node should be generated");
+        db.save_user_profile(current_self, "Me", "Ops", "0.2.0", "aa:bb:cc")
+            .await
+            .expect("new profile endpoint should persist");
+        db.create_group(
+            "group-unread-node",
+            "Unread Node Group",
+            current_self,
+            &[current_self.to_string()],
+        )
+        .await
+        .expect("group should persist");
+
+        let own = db
+            .save_group_message_dedup(
+                "group-unread-node",
+                old_self,
+                "Me",
+                "own message from old endpoint",
+                "text",
+                None,
+                None,
+                None,
+                false,
+                Some("own-old-endpoint"),
+            )
+            .await
+            .expect("own historical endpoint message should persist");
+        assert_eq!(own.sender_node_id, node_id);
+        let other = db
+            .save_group_message_dedup(
+                "group-unread-node",
+                "10.0.0.3:9527",
+                "Other",
+                "incoming message",
+                "text",
+                None,
+                None,
+                None,
+                false,
+                Some("incoming-message"),
+            )
+            .await
+            .expect("incoming message should persist");
+
+        let unread = db
+            .get_group_unread_counts(current_self)
+            .await
+            .expect("group unread counts should load");
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].group_id, "group-unread-node");
+        assert_eq!(unread[0].count, 1);
+        let groups = db
+            .list_groups(current_self)
+            .await
+            .expect("groups should load");
+        assert_eq!(groups[0].unread_count, 1);
+
+        db.mark_group_read("group-unread-node", current_self)
+            .await
+            .expect("group should be marked read");
+        let states = sqlx::query("SELECT id, is_read FROM messages WHERE id IN (?, ?)")
+            .bind(own.id)
+            .bind(other.id)
+            .fetch_all(&db.pool)
+            .await
+            .expect("message read states should load");
+        let state_by_id = states
+            .into_iter()
+            .map(|row| (row.get::<i64, _>("id"), row.get::<bool, _>("is_read")))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(state_by_id.get(&own.id), Some(&false));
+        assert_eq!(state_by_id.get(&other.id), Some(&true));
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn pending_file_node_ids_round_trip_and_empty_hints_fall_back() {
+        let db_path = temp_db_path("pending-file-node-round-trip");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+
+        let explicit_target = "10.0.0.21:9527";
+        let explicit_sender = "10.0.0.22:9527";
+        db.queue_pending_file_transfer(
+            "group-explicit",
+            explicit_target,
+            Some("  node-target-explicit  "),
+            explicit_sender,
+            Some(" node-sender-explicit "),
+            "Sender",
+            "Ops",
+            9527,
+            "/tmp/explicit-file",
+            "explicit-file",
+            42,
+            "file",
+            Some("explicit-file-id"),
+        )
+        .await
+        .expect("explicit node pending file should persist");
+
+        let raw_explicit = sqlx::query(
+            "SELECT target_node_id, sender_node_id
+             FROM pending_file_transfers WHERE client_msg_id = 'explicit-file-id'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("explicit pending file nodes should load");
+        assert_eq!(
+            raw_explicit.get::<String, _>("target_node_id"),
+            "node-target-explicit"
+        );
+        assert_eq!(
+            raw_explicit.get::<String, _>("sender_node_id"),
+            "node-sender-explicit"
+        );
+
+        db.upsert_peer_alias("node-target-explicit", explicit_target)
+            .await
+            .expect("explicit target route should bind");
+        db.upsert_peer_alias("node-sender-explicit", explicit_sender)
+            .await
+            .expect("explicit sender route should bind");
+        let explicit_round_trip = db
+            .get_pending_file_transfers(explicit_target)
+            .await
+            .expect("explicit pending file should round trip");
+        assert_eq!(explicit_round_trip.len(), 1);
+        assert_eq!(
+            explicit_round_trip[0].target_node_id,
+            "node-target-explicit"
+        );
+        assert_eq!(
+            explicit_round_trip[0].sender_node_id,
+            "node-sender-explicit"
+        );
+
+        let fallback_target = "10.0.0.31:9527";
+        let fallback_sender = "10.0.0.32:9527";
+        db.upsert_peer_alias("node-target-fallback", fallback_target)
+            .await
+            .expect("fallback target route should bind");
+        db.upsert_peer_alias("node-sender-fallback", fallback_sender)
+            .await
+            .expect("fallback sender route should bind");
+        db.queue_pending_file_transfer(
+            "group-fallback",
+            fallback_target,
+            Some("   "),
+            fallback_sender,
+            None,
+            "Sender",
+            "Ops",
+            9527,
+            "/tmp/fallback-file",
+            "fallback-file",
+            84,
+            "file",
+            Some("fallback-file-id"),
+        )
+        .await
+        .expect("fallback node pending file should persist");
+
+        let fallback_round_trip = db
+            .get_pending_file_transfers(fallback_target)
+            .await
+            .expect("fallback pending file should round trip");
+        assert_eq!(fallback_round_trip.len(), 1);
+        assert_eq!(
+            fallback_round_trip[0].target_node_id,
+            "node-target-fallback"
+        );
+        assert_eq!(
+            fallback_round_trip[0].sender_node_id,
+            "node-sender-fallback"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn mismatched_legacy_profiles_are_not_merged() {
+        let db_path = temp_db_path("legacy-profile-conflict");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        let old_peer_id = "10.0.0.41:9527";
+        let new_peer_id = "10.0.0.42:9527";
+
+        db.upsert_peer(old_peer_id, "Alice", "Ops", "10.0.0.41", 9527, true)
+            .await
+            .expect("old legacy peer should persist");
+        db.upsert_peer(new_peer_id, "Bob", "Finance", "10.0.0.42", 9527, true)
+            .await
+            .expect("conflicting legacy peer should persist");
+        db.save_message(
+            old_peer_id,
+            "Alice",
+            "me",
+            "legacy-profile-history",
+            "text",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("legacy history should persist");
+        db.queue_pending_notification(
+            old_peer_id,
+            "text",
+            r#"{"sender_id":"me","receiver_id":"10.0.0.41:9527","msg_type":"text"}"#,
+        )
+        .await
+        .expect("legacy pending route should persist");
+
+        assert!(db
+            .migrate_peer_references(old_peer_id, new_peer_id)
+            .await
+            .is_err());
+        assert!(db
+            .migrate_legacy_endpoint_peer(old_peer_id, new_peer_id)
+            .await
+            .is_err());
+
+        assert!(db
+            .get_stored_peer(old_peer_id)
+            .await
+            .expect("old peer lookup should succeed")
+            .is_some());
+        assert!(db
+            .get_stored_peer(new_peer_id)
+            .await
+            .expect("new peer lookup should succeed")
+            .is_some());
+        let historical_sender: String = sqlx::query_scalar(
+            "SELECT sender_id FROM messages WHERE content = 'legacy-profile-history'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("legacy history should load");
+        let pending_peer: String =
+            sqlx::query_scalar("SELECT peer_id FROM pending_notifications LIMIT 1")
+                .fetch_one(&db.pool)
+                .await
+                .expect("legacy pending route should load");
+        assert_eq!(historical_sender, old_peer_id);
+        assert_eq!(pending_peer, old_peer_id);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn canonical_identity_conflict_does_not_block_database_startup() {
+        let db_path = temp_db_path("canonical-identity-conflict");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+        sqlx::query(
+            "INSERT INTO peers (
+                peer_id, node_id, username, department, software_version, mac_address,
+                avatar_path, avatar_hash, avatar_updated_at, ip, port, is_online,
+                first_seen_at, last_seen_at
+             ) VALUES
+                ('10.0.0.51:9527', 'node-canonical', 'Canonical', 'Ops', '0.2.0',
+                 'cc:cc:cc', '', '', 0, '10.0.0.51', 9527, 1, '1', '2'),
+                ('legacy-conflict-id', 'node-legacy', 'Legacy', 'Finance', '0.2.0',
+                 'dd:dd:dd', '', '', 0, '10.0.0.51', 9527, 1, '1', '3')",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("conflicting peer rows should persist");
+        drop(db);
+
+        let reopened = Database::new(&db_path_str)
+            .await
+            .expect("canonical identity conflict must not block database startup");
+        let rows = sqlx::query("SELECT peer_id, node_id FROM peers ORDER BY peer_id")
+            .fetch_all(&reopened.pool)
+            .await
+            .expect("conflicting peers should remain readable");
+        assert_eq!(rows.len(), 2);
+        let identities = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("peer_id"),
+                    row.get::<String, _>("node_id"),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            identities.get("10.0.0.51:9527").map(String::as_str),
+            Some("node-canonical")
+        );
+        assert_eq!(
+            identities.get("legacy-conflict-id").map(String::as_str),
+            Some("node-legacy")
+        );
+
+        drop(reopened);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn cancelled_group_file_cleanup_is_scoped_to_group_client_and_sender_node() {
+        let db_path = temp_db_path("cancelled-group-file-cleanup");
+        let db = Database::new(&db_path.to_string_lossy())
+            .await
+            .expect("database should initialize");
+        let old_sender = "10.0.0.61:9527";
+        let current_sender = "10.0.0.62:9527";
+        db.upsert_peer_alias("node-sender", old_sender)
+            .await
+            .expect("old sender route should bind");
+        db.upsert_peer_alias("node-sender", current_sender)
+            .await
+            .expect("current sender route should bind");
+        db.upsert_peer_alias("node-other-sender", "10.0.0.63:9527")
+            .await
+            .expect("other sender route should bind");
+
+        for (target, client_msg_id, sender_id, sender_node_id, file_path) in [
+            (
+                "10.0.0.71:9527",
+                "cancel-client",
+                old_sender,
+                "node-sender",
+                "/tmp/cancel-cache",
+            ),
+            (
+                "10.0.0.72:9527",
+                "cancel-client",
+                old_sender,
+                "node-sender",
+                "/tmp/cancel-cache",
+            ),
+            (
+                "10.0.0.73:9527",
+                "keep-client",
+                old_sender,
+                "node-sender",
+                "/tmp/keep-cache",
+            ),
+            (
+                "10.0.0.74:9527",
+                "cancel-client",
+                "10.0.0.63:9527",
+                "node-other-sender",
+                "/tmp/other-sender-cache",
+            ),
+        ] {
+            db.queue_pending_file_transfer(
+                "group-cancel",
+                target,
+                None,
+                sender_id,
+                Some(sender_node_id),
+                "Sender",
+                "Ops",
+                9527,
+                file_path,
+                "payload.bin",
+                42,
+                "file",
+                Some(client_msg_id),
+            )
+            .await
+            .expect("pending file should persist");
+        }
+
+        let removed_paths = db
+            .delete_cancelled_group_file_transfers(
+                "group-cancel",
+                current_sender,
+                Some("node-sender"),
+                "cancel-client",
+            )
+            .await
+            .expect("cancelled sender queue should be removed through node alias");
+        assert_eq!(removed_paths, vec!["/tmp/cancel-cache".to_string()]);
+
+        let cancelled_sender_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pending_file_transfers
+             WHERE group_id = 'group-cancel'
+               AND client_msg_id = 'cancel-client'
+               AND sender_node_id = 'node-sender'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("cancelled rows should be counted");
+        let kept_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_file_transfers")
+            .fetch_one(&db.pool)
+            .await
+            .expect("remaining rows should be counted");
+        assert_eq!(cancelled_sender_rows, 0);
+        assert_eq!(kept_rows, 2);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn client_message_unique_indexes_are_node_first_and_survive_reopen() {
+        let db_path = temp_db_path("node-first-client-dedup");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_str)
+            .await
+            .expect("database should initialize");
+        let insert_sql = "INSERT INTO messages (
+                sender_id, sender_node_id, sender_name, receiver_id, content,
+                msg_type, timestamp, is_read, client_msg_id
+             ) VALUES (?, ?, 'Sender', 'receiver', 'body', 'text', ?, 0, ?)
+             ON CONFLICT DO NOTHING";
+        let cases = [
+            ("10.0.0.81:9527", "node-a", "1", "different-node-client", 1),
+            ("10.0.0.81:9527", "node-b", "2", "different-node-client", 1),
+            ("10.0.0.82:9527", "node-same", "3", "same-node-client", 1),
+            ("10.0.0.83:9527", "node-same", "4", "same-node-client", 0),
+            ("10.0.0.84:9527", "", "5", "legacy-client", 1),
+            ("10.0.0.84:9527", "", "6", "legacy-client", 0),
+        ];
+        for (sender_id, sender_node_id, timestamp, client_msg_id, expected_rows) in cases {
+            let result = sqlx::query(insert_sql)
+                .bind(sender_id)
+                .bind(sender_node_id)
+                .bind(timestamp)
+                .bind(client_msg_id)
+                .execute(&db.pool)
+                .await
+                .expect("dedup insert should complete");
+            assert_eq!(result.rows_affected(), expected_rows);
+        }
+
+        for (client_msg_id, expected_count) in [
+            ("different-node-client", 2_i64),
+            ("same-node-client", 1_i64),
+            ("legacy-client", 1_i64),
+        ] {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE client_msg_id = ?")
+                    .bind(client_msg_id)
+                    .fetch_one(&db.pool)
+                    .await
+                    .expect("message count should load");
+            assert_eq!(count, expected_count);
+        }
+        drop(db);
+
+        let reopened = Database::new(&db_path_str)
+            .await
+            .expect("database should reopen after node-first convergence");
+        for (client_msg_id, expected_count) in [
+            ("different-node-client", 2_i64),
+            ("same-node-client", 1_i64),
+            ("legacy-client", 1_i64),
+        ] {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE client_msg_id = ?")
+                    .bind(client_msg_id)
+                    .fetch_one(&reopened.pool)
+                    .await
+                    .expect("message count should survive reopen");
+            assert_eq!(count, expected_count);
+        }
+
+        drop(reopened);
         let _ = std::fs::remove_file(db_path);
     }
 }

@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import type { ChatMessage } from "../types";
 import { openFile, openFolder, saveTempFile } from "../api";
 import { WebviewWindow } from "@tauri-apps/api/window";
+import { open as openExternal } from "@tauri-apps/api/shell";
 import { convertFileSrc } from "@tauri-apps/api/tauri";
 import { makeSearchHitId } from "./messageUtils";
 import { decodeEchoEmojiTokens, emojiAssetSrc, splitInlineEmojis } from "./emojiCatalog";
@@ -27,6 +28,9 @@ export interface ForwardCardItem {
   file_size?: number | null;
   file_data?: string;
   mime?: string | null;
+  thumbnail_data?: string;
+  thumbnail_mime?: string | null;
+  attachment_state?: "embedded" | "thumbnail" | "omitted";
   attachment_error?: string | null;
 }
 
@@ -162,11 +166,25 @@ function renderTextWithLinks(text: string): ReactNode {
     if (match.index > cursor) {
       parts.push(...renderInlineEmojis(text.slice(cursor, match.index), `text-${cursor}`));
     }
+    const matchedLabel = match[0];
+    const trailing = matchedLabel.match(/[.,!?;:，。！？；：、)\]}>]+$/)?.[0] ?? "";
+    const label = trailing ? matchedLabel.slice(0, -trailing.length) : matchedLabel;
+    const url = label.toLowerCase().startsWith("www.") ? `https://${label}` : label;
     parts.push(
-      <span key={`url-${index++}`} className="message-url">
-        {match[0]}
-      </span>
+      <button
+        key={`url-${index++}`}
+        type="button"
+        className="message-url"
+        title={`打开 ${label}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          void openExternal(url).catch((error) => console.error("Failed to open URL:", error));
+        }}
+      >
+        {label}
+      </button>
     );
+    if (trailing) parts.push(trailing);
     cursor = match.index + match[0].length;
     match = pattern.exec(text);
   }
@@ -258,15 +276,6 @@ function isForwardImage(item: ForwardCardItem): boolean {
   return isImageFile(item.file_name ?? null);
 }
 
-function base64ToBytes(base64: string): number[] {
-  const binary = atob(base64);
-  const bytes = new Array<number>(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
 async function copyTextToClipboard(text: string) {
   try {
     if (navigator.clipboard?.writeText) {
@@ -345,7 +354,7 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
     setSavingIndex(index);
     try {
       const fileName = item.file_name || "file";
-      const path = await saveTempFile(base64ToBytes(item.file_data), fileName);
+      const path = await saveTempFile(item.file_data, fileName);
       setSavedPaths((prev) => ({ ...prev, [index]: path }));
     } catch (error) {
       console.error("Failed to save forwarded attachment:", error);
@@ -391,9 +400,9 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
                   </div>
                   {isForwardAttachment(item) ? (
                     <div className="rounded-lg border border-gray-700 bg-gray-900/40 overflow-hidden">
-                      {item.file_data && isForwardImage(item) ? (
+                      {(item.thumbnail_data || (item.file_data && isForwardImage(item))) ? (
                         <img
-                          src={`data:${item.mime || "image/*"};base64,${item.file_data}`}
+                          src={`data:${item.thumbnail_mime || item.mime || "image/*"};base64,${item.thumbnail_data || item.file_data}`}
                           alt=""
                           className="w-full max-h-56 object-contain bg-black/20"
                         />
@@ -402,14 +411,14 @@ function ForwardCard({ data, isOwn }: { data: ForwardCardData; isOwn: boolean })
                         <div className="flex-1 min-w-0">
                           <p className="text-sm text-gray-200 truncate">{item.file_name || (item.msg_type === "sticker" ? "图片" : "文件")}</p>
                           {item.file_size ? <p className="text-xs text-gray-500">{formatFileSize(item.file_size)}</p> : null}
-                          {!item.file_data ? <p className="text-xs text-red-300">{item.attachment_error || "文件不可下载"}</p> : null}
+                          {item.attachment_error ? <p className="text-xs text-amber-300">{item.attachment_error}</p> : null}
                         </div>
                         <button
                           disabled={!item.file_data || savingIndex !== null}
                           onClick={() => downloadForwardAttachment(item, i)}
                           className="flex-shrink-0 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 px-3 py-1.5 text-xs text-white"
                         >
-                          {savedPaths[i] ? "打开" : savingIndex === i ? "保存中" : "下载"}
+                          {savedPaths[i] ? "打开" : savingIndex === i ? "保存中" : item.file_data ? "下载" : "未附带"}
                         </button>
                         {savedPaths[i] ? (
                           <button
