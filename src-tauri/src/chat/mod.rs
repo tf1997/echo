@@ -132,6 +132,33 @@ async fn wire_receiver_matches_local_identity(
         .unwrap_or(false)
 }
 
+/// Whether a `group_renamed` / `group_dissolved` control message may be applied.
+/// Only the group creator is authorized. Prefers node_id comparison; falls back
+/// to endpoint when either side is a legacy (node-less) identity. If we don't
+/// know the group locally, allow it so first-time syncs and legacy peers are not
+/// broken (compatibility rule 2).
+async fn group_sender_is_creator(
+    db: &Database,
+    my_id: &str,
+    group_id: &str,
+    sender_id: &str,
+    sender_node_id: &str,
+) -> bool {
+    let groups = match db.list_groups(my_id).await {
+        Ok(groups) => groups,
+        Err(_) => return true,
+    };
+    let Some(group) = groups.iter().find(|g| g.group_id == group_id) else {
+        return true;
+    };
+    let creator_node_id = group.creator_node_id.trim();
+    let sender_node_id = sender_node_id.trim();
+    if !creator_node_id.is_empty() && !sender_node_id.is_empty() {
+        return creator_node_id == sender_node_id;
+    }
+    group.creator_id == sender_id
+}
+
 pub(crate) fn peer_supports_message_ack(software_version: &str) -> bool {
     let normalized = software_version
         .trim()
@@ -1656,11 +1683,41 @@ impl ChatServer {
                                     .trim_start_matches("群名已修改为「")
                                     .trim_end_matches('」')
                             });
-                            let _ = db.rename_group(gid, new_name).await;
-                            info!("Group {} renamed to {}", gid, new_name);
+                            if group_sender_is_creator(
+                                db.as_ref(),
+                                &my_id,
+                                gid,
+                                &msg.sender_id,
+                                &group_sender_node_id,
+                            )
+                            .await
+                            {
+                                let _ = db.rename_group(gid, new_name).await;
+                                info!("Group {} renamed to {}", gid, new_name);
+                            } else {
+                                warn!(
+                                    "Ignoring group_renamed for {} from non-creator {}",
+                                    gid, msg.sender_id
+                                );
+                            }
                         } else if msg.msg_type == "group_dissolved" {
-                            let _ = db.remove_group_member(gid, &my_id).await;
-                            info!("Group {} dissolved — removed", gid);
+                            if group_sender_is_creator(
+                                db.as_ref(),
+                                &my_id,
+                                gid,
+                                &msg.sender_id,
+                                &group_sender_node_id,
+                            )
+                            .await
+                            {
+                                let _ = db.remove_group_member(gid, &my_id).await;
+                                info!("Group {} dissolved — removed", gid);
+                            } else {
+                                warn!(
+                                    "Ignoring group_dissolved for {} from non-creator {}",
+                                    gid, msg.sender_id
+                                );
+                            }
                         } else if msg.msg_type == "group_member_left" {
                             // sender_id is the leaving member's peer_id
                             let _ = db
@@ -2257,8 +2314,8 @@ impl ChatServer {
                                 emit_contact_updated(&app_handle, &msg.sender_id);
                             }
                         }
-                        _ => {
-                            // Text or other message types
+                        "text" | "sticker" | "file" | "forward_card" | "nudge" | "rps" => {
+                            // Displayable content types
                             info!("Received message from {}: {}", msg.sender_name, msg.content);
 
                             if let Some(ref gid) = msg.group_id {
@@ -2364,6 +2421,15 @@ impl ChatServer {
                                 file_size: msg.file_size,
                                 timestamp: chrono::Utc::now().to_rfc3339(),
                             });
+                        }
+                        other => {
+                            // Unknown control/signal type from a newer peer. Drop
+                            // it rather than displaying its raw payload as a chat
+                            // message (compatibility rule 4).
+                            warn!(
+                                "Ignoring unknown msg_type '{}' from {}",
+                                other, msg.sender_id
+                            );
                         }
                     }
                 }

@@ -100,11 +100,20 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
     };
   }, []);
 
+  const profileRefreshAttemptedRef = useRef("");
   useEffect(() => {
-    if (!profilePeer) return;
+    if (!profilePeer) {
+      profileRefreshAttemptedRef.current = "";
+      return;
+    }
     const peer = profilePeer;
     const missingMetadata = !peer.software_version || !peer.mac_address;
     if (!missingMetadata || !peer.ip || !peer.port) return;
+    // One refresh attempt per opened profile — if the peer still reports no
+    // metadata, don't loop on the new object identity and re-probe forever.
+    const attemptKey = peer.node_id || peer.id;
+    if (profileRefreshAttemptedRef.current === attemptKey) return;
+    profileRefreshAttemptedRef.current = attemptKey;
 
     let cancelled = false;
     queueMicrotask(() => {
@@ -297,13 +306,13 @@ export function Sidebar({ peers, selectedPeerId, selectedPeer, onSelectPeer, myI
     if (recentPeerId && selectedPeerId === recentPeerId) return true;
     return false;
   }, [selectedPeer, selectedPeerEndpoint, selectedPeerId]);
-  const recentGroups = groups
+  const recentGroups = useMemo(() => groups
     .filter((group) => !!group.last_message_at || (group.unread_count || 0) > 0)
     .sort((a, b) => {
       const aTime = a.last_message_at ? new Date(a.last_message_at).getTime() : 0;
       const bTime = b.last_message_at ? new Date(b.last_message_at).getTime() : 0;
       return bTime - aTime;
-    });
+    }), [groups]);
 
   const recentTotalUnread =
     recentContacts.reduce((sum, contact) => sum + (unreadMap.get(contact.peer_id) ?? 0), 0) +

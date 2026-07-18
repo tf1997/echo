@@ -1403,6 +1403,9 @@ export function ChatWindow({ peer, messages, myId, myNodeId, myName = "", conver
     setContextHighlightId(null);
     setGroupMemberQuery("");
     setGroupInviteQuery("");
+    setSelectMode(false);
+    setSelectedIds(new Set());
+    setForwardModal(null);
     pendingJumpMessageIdRef.current = null;
     nearBottomRef.current = true;
     pendingScrollRef.current = true;

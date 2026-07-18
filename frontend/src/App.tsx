@@ -202,6 +202,7 @@ function areMessageListsEqual(left: ChatMessage[], right: ChatMessage[]) {
       a.id !== b.id ||
       a.sender_id !== b.sender_id ||
       a.sender_node_id !== b.sender_node_id ||
+      a.sender_name !== b.sender_name ||
       a.receiver_id !== b.receiver_id ||
       a.receiver_node_id !== b.receiver_node_id ||
       a.content !== b.content ||
@@ -496,13 +497,19 @@ function App() {
   }, [promptAndDownloadUpdate]);
 
   useEffect(() => {
+    let disposed = false;
     let unlistenUpdate: (() => void) | undefined;
     listen<UpdateCheckResult>("update-available", (event) => {
       handleBackgroundUpdateAvailable(event.payload);
     }).then((fn) => {
+      if (disposed) {
+        fn();
+        return;
+      }
       unlistenUpdate = fn;
     });
     return () => {
+      disposed = true;
       unlistenUpdate?.();
     };
   }, [handleBackgroundUpdateAvailable]);

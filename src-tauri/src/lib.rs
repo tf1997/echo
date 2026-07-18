@@ -855,7 +855,6 @@ pub fn run() {
             commands::dissolve_group,
             commands::get_group_unread_counts,
             commands::mark_group_read,
-            commands::deliver_pending,
             updater::check_for_updates_command,
             updater::download_update_command,
             updater::restart_after_update_command,

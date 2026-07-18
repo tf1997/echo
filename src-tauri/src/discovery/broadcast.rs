@@ -217,13 +217,13 @@ impl LanDiscovery {
         // Scanner thread (unicast subnet probe)
         let scanner_socket = Arc::clone(&socket);
         let scanner_cancel = Arc::clone(&cancel);
-        let scanner_id = config.peer_id;
+        let scanner_my_info = base_announce.clone();
         let scanner_subnets = Arc::clone(&scan_subnets);
         let scanner_peers = Arc::clone(&peers);
         let scanner_handle = thread::spawn(move || {
             Self::scanner_loop(
                 scanner_socket,
-                scanner_id,
+                scanner_my_info,
                 scanner_subnets,
                 scanner_peers,
                 scanner_cancel,
@@ -400,12 +400,13 @@ impl LanDiscovery {
     /// Subnet scanner: periodically probes configured /24 subnets via unicast UDP.
     fn scanner_loop(
         socket: Arc<UdpSocket>,
-        my_id: String,
+        my_info: AnnouncePacket,
         subnets: Arc<RwLock<Vec<String>>>,
         peers: Arc<RwLock<HashMap<String, Peer>>>,
         cancel: Arc<AtomicBool>,
         discovery_port: u16,
     ) {
+        let my_id = my_info.id.clone();
         loop {
             let delay = random_secs(SCAN_INTERVAL_MIN_SECS, SCAN_INTERVAL_MAX_SECS);
             if sleep_cancelable(&cancel, Duration::from_secs(delay)) {
@@ -416,23 +417,14 @@ impl LanDiscovery {
                 if sleep_while_quiet(&cancel) {
                     return;
                 }
-                continue;
+                // Quiet hours just ended — scan now instead of sleeping
+                // another full 25-45 min interval first.
             }
 
-            // Rebuild lightweight probe data without known peers.
-            let my_info = AnnouncePacket {
-                id: my_id.clone(),
-                node_id: String::new(),
-                username: String::new(),
-                department: String::new(),
-                software_version: String::new(),
-                mac_address: String::new(),
-                avatar_hash: String::new(),
-                avatar_updated_at: 0,
-                ip: String::new(),
-                port: 0,
-                known_peers: Vec::new(),
-            };
+            // Probe with our real identity so the receiver's contact-identity
+            // filter (which rejects empty username/department or port 0) accepts
+            // the probe and replies with a unicast announce. known_peers is left
+            // out to keep the datagram small.
             let base_data = Self::build_announce_data(&my_info, &peers, false);
 
             let prefixes = subnets.read().unwrap().clone();
@@ -495,7 +487,9 @@ impl LanDiscovery {
         _discovery_port: u16,
         relay_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<PeerEntry>>>,
     ) {
-        let mut buf = [0u8; 4096];
+        // Max UDP payload; unicast responses embed known-peer lists that can
+        // exceed a few KB, so size the buffer to avoid truncating handshakes.
+        let mut buf = [0u8; 65535];
 
         loop {
             if cancel.load(Ordering::Relaxed) {
